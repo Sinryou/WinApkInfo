@@ -84,6 +84,7 @@ def parse_aapt2_output(text: str) -> dict:
         "locales": [],
         "icons": {},  # density -> path
         "raw": text.strip(),
+        "architectures": [],   # 新增：支持架构
     }
 
     # --- 基本信息 ---
@@ -187,6 +188,15 @@ def parse_aapt2_output(text: str) -> dict:
     for dens, path_ in re.findall(r"application-icon-([0-9]+):'([^']+)'", text):
         info["icons"][dens] = path_
 
+    # --- 支持架构 ---
+    archs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("native-code:") or line.startswith("alt-native-code:"):
+            found = re.findall(r"'([^']+)'", line)
+            archs.extend(found)
+    info["architectures"] = archs
+
     return info
 
 
@@ -219,7 +229,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("APK 信息查看器（aapt2）")
-        self.resize(900, 680)
+        self.resize(900, 700)
         self.setup_ui()
 
     def setup_ui(self):
@@ -242,12 +252,14 @@ class MainWindow(QtWidgets.QWidget):
         self.le_ver = QtWidgets.QLineEdit(); self.le_ver.setReadOnly(True)
         self.le_sdk = QtWidgets.QLineEdit(); self.le_sdk.setReadOnly(True)
         self.le_launch = QtWidgets.QLineEdit(); self.le_launch.setReadOnly(True)
+        self.le_arch = QtWidgets.QLineEdit(); self.le_arch.setReadOnly(True)  # 新增架构显示
 
         form.addRow("APP 名称（优先中文）：", self.le_app_name)
         form.addRow("APK 包名：", self.le_pkg)
         form.addRow("版本号（name / code）：", self.le_ver)
         form.addRow("SDK（min / target / compile）：", self.le_sdk)
         form.addRow("启动 Activity：", self.le_launch)
+        form.addRow("支持架构：", self.le_arch)   # 加入表单
         layout.addLayout(form)
 
         # 多行信息分组：权限、特性、语言/密度、其它
@@ -328,10 +340,7 @@ class MainWindow(QtWidgets.QWidget):
     def fill_info(self, info: dict):
         # 顶部字段
         self.le_app_name.setText(info.get("app_name", ""))
-
-        pkg = info.get("package_name", "")
-        self.le_pkg.setText(pkg)
-
+        self.le_pkg.setText(info.get("package_name", ""))
         version = f"{info.get('version_name','')} / {info.get('version_code','')}".strip(" /")
         self.le_ver.setText(version)
 
@@ -341,8 +350,10 @@ class MainWindow(QtWidgets.QWidget):
             c=info.get("compile_sdk_version", "?") or "?",
         )
         self.le_sdk.setText(sdk)
-
         self.le_launch.setText(info.get("launchable_activity", ""))
+
+        archs = info.get("architectures", [])
+        self.le_arch.setText(", ".join(archs) if archs else "(未检测到)")
 
         # 权限
         perms = info.get("permissions", [])
@@ -420,6 +431,7 @@ class MainWindow(QtWidgets.QWidget):
         lines.append(f"版本: {self.le_ver.text()}")
         lines.append(f"SDK: {self.le_sdk.text()}")
         lines.append(f"启动 Activity: {self.le_launch.text()}")
+        lines.append(f"支持架构: {self.le_arch.text()}")
         lines.append("")
         lines.append("[权限]")
         lines.append(self.te_permissions["edit"].toPlainText() or "(无)")
