@@ -487,6 +487,8 @@ class MainWindow(QtWidgets.QWidget):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }" \
+    "QGroupBox { font-size: 16px; font-family: Microsoft Yahei; }")
     w = MainWindow()
     w.show()
     sys.exit(app.exec_())
