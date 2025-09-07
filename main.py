@@ -68,7 +68,7 @@ def run_aapt2_dump_badging(apk_path: str) -> str:
     # Windows 控制台编码兼容：优先 utf-8，失败再回退到 gbk
     try:
         out = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=subprocess.CREATE_NO_WINDOW
         )
     except subprocess.CalledProcessError as e:
         # 即使非0，也尽量取输出
