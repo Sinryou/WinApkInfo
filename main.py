@@ -5,10 +5,40 @@ import re
 import shlex
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+
+def load_sdk_versions():
+    """尝试读取同级目录下 android_sdk_versions.json"""
+    sdk_map = {}
+    here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    sdk_file = here / "android_sdk_versions.json"
+    if not sdk_file.exists():
+        return
+    try:
+        with open(sdk_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 建立 {apiLevel: (版本, codename)} 映射
+        for item in data:
+            api = str(item.get("apiLevel"))
+            version = item.get("version", "")
+            codename = item.get("codename") or ""
+            # 去掉"Android "前缀
+            if version.startswith("Android "):
+                version = version.replace("Android ", "", 1)
+            # codename 去空格
+            codename = codename.replace(" ", "") if codename else ""
+            # 拼接成 "8.0 Pie" 或 "14 UpsideDownCake"
+            if codename:
+                sdk_map[api] = f"{version} {codename}"
+            else:
+                sdk_map[api] = version
+        return sdk_map
+    except Exception as e:
+        print("读取 android_sdk_versions.json 出错:", e)
 
 def find_aapt2() -> str:
     """
@@ -229,7 +259,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("APK 信息查看器（aapt2）")
-        self.resize(900, 700)
+        self.resize(1050, 700)
         self.setup_ui()
 
     def setup_ui(self):
@@ -344,10 +374,17 @@ class MainWindow(QtWidgets.QWidget):
         version = f"{info.get('version_name','')} / {info.get('version_code','')}".strip(" /")
         self.le_ver.setText(version)
 
+        sdk_map = load_sdk_versions()
+        sdk_map = sdk_map if sdk_map is not None else {}
+        def fmt_sdk(api_level: str) -> str:
+            if not api_level or api_level == "?":
+                return "?"
+            return f"{api_level}({sdk_map[api_level]})" if api_level in sdk_map else api_level
+
         sdk = "min:{m}  target:{t}  compile:{c}".format(
-            m=info.get("min_sdk", "?") or "?",
-            t=info.get("target_sdk", "?") or "?",
-            c=info.get("compile_sdk_version", "?") or "?",
+            m=fmt_sdk(info.get("min_sdk", "?") or "?"),
+            t=fmt_sdk(info.get("target_sdk", "?") or "?"),
+            c=fmt_sdk(info.get("compile_sdk_version", "?") or "?"),
         )
         self.le_sdk.setText(sdk)
         self.le_launch.setText(info.get("launchable_activity", ""))
