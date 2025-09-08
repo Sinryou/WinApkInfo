@@ -2,11 +2,14 @@
 import os
 import sys
 import re
+import io
 import shlex
 import shutil
 import subprocess
 import json
 from pathlib import Path
+import zipfile
+from PIL import Image
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -86,6 +89,166 @@ def run_aapt2_dump_badging(apk_path: str) -> str:
         text = data.decode(errors="ignore")
     return text
 
+def run_aapt2_dump_resource(apk_path: str, resource_address: str, context_lines: int = 10) -> str:
+    """
+    运行 `aapt2 dump resources "<apk>"` 并返回 stdout 文本。
+    """
+    aapt2_path = find_aapt2()
+    cmd = [aapt2_path, "dump", "resources", apk_path]
+
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        data = out.stdout or out.stderr
+    except subprocess.CalledProcessError as e:
+        data = e.stdout or e.stderr
+
+    data = out.stdout or out.stderr
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
+        try:
+            text = data.decode(enc, errors="ignore")
+            break
+        except Exception:
+            continue
+    if text is None:
+        text = data.decode(errors="ignore")
+
+    # 模拟 grep -iC10
+    lines = text.splitlines()
+    filtered = []
+    for i, line in enumerate(lines):
+        if resource_address in line.lower():
+            start = max(i - 1, 0)
+            end = min(i + context_lines + 1, len(lines))
+            filtered.extend(lines[start:end])
+    return "\n".join(filtered)
+
+def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str) -> str:
+    """
+    运行 `aapt2 dump xmltree "<apk>"` 并返回 stdout 文本。
+    """
+    aapt2_path = find_aapt2()
+    cmd = [aapt2_path, "dump", "xmltree", apk_path, "--file", inner_file_path]
+
+    # Windows 控制台编码兼容：优先 utf-8，失败再回退到 gbk
+    try:
+        out = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except subprocess.CalledProcessError as e:
+        # 即使非0，也尽量取输出
+        out = e
+
+    data = out.stdout or out.stderr
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
+        try:
+            text = data.decode(enc, errors="ignore")
+            break
+        except Exception:
+            continue
+    if text is None:
+        text = data.decode(errors="ignore")
+    return text
+
+def get_resource_info(output: str, res_id: str):
+    """
+    根据资源ID解析 aapt2 dump resources 输出，返回资源类型及对应值
+    
+    参数：
+        output: str, aapt2 dump resources 的完整输出
+        res_id: str, 资源 ID，例如 "0x7f06005c"
+    
+    返回：
+        dict: {
+            "type": "color" / "image" / "xml" / "unknown",
+            "value": 颜色代码 / 最高分辨率图片路径 / XML路径 / None
+        }
+    """
+    pattern = re.compile(
+        rf"resource {res_id} (.*?)resource 0x",
+        re.DOTALL
+    )
+
+    match = pattern.search(output)
+    if not match:
+        return {"type": "unknown", "value": None}
+
+    content = match.group(1)
+
+    if "#" in content:
+        # 颜色匹配
+        color_match = re.search(r"\(\)\s*(#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}))", content)
+        if color_match:
+            return {"type": "color", "value": color_match.group(1)}
+    
+    if "type=PNG" in content:
+        # 图片匹配
+        lines = content.splitlines()
+        dpi_order = ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
+        dpi_map = {}
+        for line in lines:
+            dpi_match = re.search(r"\((.*?)\) \(file\) (.*?) type=PNG", line)
+            if dpi_match:
+                dpi, path = dpi_match.groups()
+                dpi_map[dpi] = path
+        if dpi_map:
+            for dpi in reversed(dpi_order):
+                if dpi in dpi_map:
+                    return {"type": "image", "value": dpi_map[dpi]}
+
+    return {"type": "unknown", "value": None}
+
+def parse_android_color(color_str: str):
+    """
+    把 Android 格式 #AARRGGBB 转成 Pillow 可用的 (R, G, B, A)
+    """
+    color_str = color_str.lstrip('#')
+    if len(color_str) == 8:  # AARRGGBB
+        a = int(color_str[0:2], 16)
+        r = int(color_str[2:4], 16)
+        g = int(color_str[4:6], 16)
+        b = int(color_str[6:8], 16)
+        return (r, g, b, a)
+    elif len(color_str) == 6:  # RRGGBB
+        r = int(color_str[0:2], 16)
+        g = int(color_str[2:4], 16)
+        b = int(color_str[4:6], 16)
+        return (r, g, b, 255)
+    else:
+        raise ValueError("不合法的颜色格式: " + color_str)
+
+def load_resource(apk, res_path_or_color, size):
+    """
+    根据输入判断是颜色还是图片：
+    - 颜色：返回一个填充颜色的 Image
+    - 图片：从 APK 中读取并缩放
+    """
+    if res_path_or_color["type"] == "color":  # 颜色
+        color = parse_android_color(res_path_or_color["value"])
+        return Image.new("RGBA", (size, size), color)
+    else:  # 文件
+        with apk.open(res_path_or_color["value"]) as f:
+            img = Image.open(f).convert("RGBA")
+        return img.resize((size, size), Image.LANCZOS)
+
+def extract_icon_bytes(apk_path, foreground, background, size=512):
+    """
+    自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流
+    """
+    with zipfile.ZipFile(apk_path, 'r') as apk:
+        # 加载前景
+        foreground_img = load_resource(apk, foreground, size)
+        # 加载背景
+        background_img = load_resource(apk, background, size)
+    
+    # 合成 (背景在下，前景在上)
+    final_img = Image.alpha_composite(background_img, foreground_img)
+    
+    # 转字节流
+    output = io.BytesIO()
+    final_img.save(output, format="PNG")
+    return output.getvalue()
 
 def parse_aapt2_output(text: str) -> dict:
     """
@@ -275,6 +438,16 @@ class MainWindow(QtWidgets.QWidget):
         file_row.addWidget(btn_browse)
         layout.addLayout(file_row)
 
+        # 在顶部表单之前加图标显示
+        self.icon_label = QtWidgets.QLabel()
+        self.icon_label.setFixedSize(96, 96)
+        self.icon_label.setScaledContents(True)
+
+        icon_row = QtWidgets.QHBoxLayout()
+        icon_row.addWidget(self.icon_label)
+        icon_row.addStretch(1)
+        layout.addLayout(icon_row)
+
         # 基本信息（表单）
         form = QtWidgets.QFormLayout()
         self.le_app_name = QtWidgets.QLineEdit(); self.le_app_name.setReadOnly(True)
@@ -305,6 +478,17 @@ class MainWindow(QtWidgets.QWidget):
         grid.addWidget(self.te_locales["group"], 1, 0)
         grid.addWidget(self.te_other["group"], 1, 1)
         layout.addLayout(grid)
+
+        # 在底部按钮上方加重命名功能
+        rename_group = QtWidgets.QGroupBox("APK 重命名")
+        rename_layout = QtWidgets.QHBoxLayout(rename_group)
+        self.rename_preview = QtWidgets.QLineEdit()
+        self.rename_preview.setReadOnly(True)
+        btn_rename = QtWidgets.QPushButton("执行重命名")
+        btn_rename.clicked.connect(self.do_rename)
+        rename_layout.addWidget(self.rename_preview, stretch=1)
+        rename_layout.addWidget(btn_rename)
+        layout.addWidget(rename_group)
 
         # 原始输出
         raw_group = QtWidgets.QGroupBox("aapt2 原始输出")
@@ -461,6 +645,63 @@ class MainWindow(QtWidgets.QWidget):
 
         self.te_other["edit"].setPlainText("\n".join(other) if other else "(无)")
 
+        # 提取图标
+        apk_path = self.apk_path_edit.text().strip()
+        pix = None
+        if apk_path and os.path.isfile(apk_path):
+            try:
+                icons = info.get("icons", {})
+                if icons:
+                    # 选择最大 density 的 icon
+                    best = max(icons.items(), key=lambda x: int(x[0]))
+                    icon_path = best[1]
+                    if icon_path.endswith(('.xml')):
+                        aapt2_xml_output = run_aapt2_dump_xmltree(apk_path, icon_path)
+                        # 匹配 background 和 foreground 的资源地址
+                        bg_match = re.search(r"E: background.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
+                        fg_match = re.search(r"E: foreground.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
+
+                        background_addr = bg_match.group(1) if bg_match else None
+                        foreground_addr = fg_match.group(1) if fg_match else None
+
+                        if not background_addr or not foreground_addr:
+                            raise ValueError("未找到 background 或 foreground 资源地址")
+
+                        # 提取背景和前景资源
+                        foreground_res = run_aapt2_dump_resource(apk_path, foreground_addr)
+                        foreground = get_resource_info(foreground_res, foreground_addr)
+
+                        if foreground["type"] == "unknown":
+                            raise ValueError("前景或背景资源类型无法提取图标")
+
+                        background_res = run_aapt2_dump_resource(apk_path, background_addr)
+                        background = get_resource_info(background_res, background_addr)
+
+                        if background["type"] == "unknown":
+                            raise ValueError("前景或背景资源类型无法提取图标")
+
+                        data = extract_icon_bytes(apk_path, foreground, background)
+                        pix = QtGui.QPixmap()
+                        pix.loadFromData(data)
+
+                    elif icon_path.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                        with zipfile.ZipFile(apk_path, "r") as zf:
+                            with zf.open(icon_path) as f:
+                                data = f.read()
+                        pix = QtGui.QPixmap()
+                        pix.loadFromData(data)
+            except Exception as e:
+                print("提取图标失败:", e)
+
+        self.icon_label.setPixmap(pix if pix else QtGui.QPixmap())
+
+        # 生成重命名预览
+        app_name = self.le_app_name.text().strip() or "App"
+        # ver_text = self.le_ver.text().strip().replace(" / ", ".")
+        ver_text = info.get('version_name','').strip() or "0.0"
+        new_name = re.sub(r'[\\/:*?"<>|]', "_", f"{app_name}_{ver_text}.apk")
+        self.rename_preview.setText(new_name)
+
     def copy_summary(self):
         lines = []
         lines.append(f"APP 名称: {self.le_app_name.text()}")
@@ -484,6 +725,22 @@ class MainWindow(QtWidgets.QWidget):
         cb.setText(summary)
         QtWidgets.QMessageBox.information(self, "已复制", "已复制摘要到剪贴板。")
 
+    def do_rename(self):
+        old_path = self.apk_path_edit.text().strip()
+        new_name = self.rename_preview.text().strip()
+        if not old_path or not os.path.isfile(old_path):
+            QtWidgets.QMessageBox.warning(self, "提示", "未选择有效的 APK 文件。")
+            return
+        if not new_name:
+            QtWidgets.QMessageBox.warning(self, "提示", "没有生成新的文件名。")
+            return
+        new_path = str(Path(old_path).with_name(new_name))
+        try:
+            os.rename(old_path, new_path)
+            QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
+            self.apk_path_edit.setText(new_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", f"重命名失败: {e}")
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
