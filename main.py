@@ -62,7 +62,7 @@ def find_aapt2() -> str:
     找不到则抛出 FileNotFoundError。
     """
     here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # 支持 PyInstaller
-    candidates = [here / "aapt2", here / "aapt2.exe"]
+    candidates = [here / "aapt2", here / "aapt2.exe", here / "tools" / "aapt2.exe"]
     for c in candidates:
         if c.exists() and os.access(str(c), os.X_OK):
             return str(c)
