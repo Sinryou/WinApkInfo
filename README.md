@@ -7,7 +7,7 @@ APK-Info目前有一些带混淆的APK包貌似无法解析，故有了此软件
 
 ## 界面
 
-<img src="https://github.com/Sinryou/WinApkInfo/blob/master/example/WinApkInfo_UI.png" width="500" alt="界面图片"/><br/>
+<img src="https://github.com/Sinryou/WinApkInfo/blob/main/example/WinApkInfo_UI.png" width="500" alt="界面图片"/><br/>
 
 ## 功能
 
