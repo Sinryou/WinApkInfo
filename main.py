@@ -581,6 +581,10 @@ class MainWindow(QtWidgets.QWidget):
 
         # 底部按钮
         btn_row = QtWidgets.QHBoxLayout()
+        self.btn_about = QtWidgets.QPushButton(" 关于 ")
+        self.btn_about.setIcon(QtGui.QIcon(local_resource_path("resources/info.png")))
+        self.btn_about.clicked.connect(self.show_about)
+        btn_row.addWidget(self.btn_about)
         self.btn_refresh = QtWidgets.QPushButton("重新解析")
         self.btn_refresh.clicked.connect(self.reparse_current)
         btn_copy = QtWidgets.QPushButton("复制摘要")
@@ -815,9 +819,21 @@ class MainWindow(QtWidgets.QWidget):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "错误", f"保存失败: {e}")
 
+    def show_about(self):
+        QtWidgets.QMessageBox.about(
+            self,
+            "About",
+            "<b>APK 信息查看器</b><br><br>"
+            "基于 PyQt5 + aapt2 的图形化<br>"
+            "解析 APK 文件信息的工具程序<br><br>"
+            '更多信息: <a href="https://github.com/Sinryou/WinApkInfo">项目主页</a><br>'
+            "版本: 1.0.1<br>"
+            "Copyright (c) 2025 Sinryou.<br>At MIT License."
+        )
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }" \
+    app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }"
     "QGroupBox { font-size: 16px; font-family: Microsoft Yahei; }")
     w = MainWindow()
     w.show()
