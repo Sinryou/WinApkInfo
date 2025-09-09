@@ -12,6 +12,7 @@ import zipfile
 from PIL import Image
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import QLabel
 
 
 def local_resource_path(relative_path):
@@ -404,7 +405,7 @@ def parse_aapt2_output(text: str) -> dict:
     return info
 
 class IconWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(QtGui.QPixmap)
+    finished = QtCore.pyqtSignal(QtGui.QPixmap, bytes)  # 多发一个图标字节流
 
     def __init__(self, apk_path, icon_path, parent=None):
         super().__init__(parent)
@@ -413,6 +414,7 @@ class IconWorker(QtCore.QThread):
 
     def run(self):
         pix = QtGui.QPixmap()
+        data = b""
         try:
             if self.icon_path.endswith(('.png', '.jpg', '.jpeg', '.webp')):
                 with zipfile.ZipFile(self.apk_path, "r") as zf:
@@ -446,13 +448,12 @@ class IconWorker(QtCore.QThread):
                     raise ValueError("背景资源类型无法提取图标")
 
                 data = extract_icon_bytes(self.apk_path, foreground, background)
-                pix = QtGui.QPixmap()
                 pix.loadFromData(data)
 
         except Exception as e:
             print("子线程提取图标失败:", e)
 
-        self.finished.emit(pix)
+        self.finished.emit(pix, data)
 
 class DropLineEdit(QtWidgets.QLineEdit):
     fileDropped = QtCore.pyqtSignal(str)
@@ -482,7 +483,6 @@ class DropLineEdit(QtWidgets.QLineEdit):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.icon_thread = None
         self.setWindowTitle("APK 信息查看器（aapt2）")
         self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
         self.resize(1050, 700)
@@ -506,10 +506,27 @@ class MainWindow(QtWidgets.QWidget):
         self.icon_label.setFixedSize(96, 96)
         self.icon_label.setScaledContents(True)
 
+        # 新增导出按钮
+        self.btn_export_icon = QtWidgets.QPushButton("导出图标")
+        self.btn_export_icon.setVisible(False)  # 默认隐藏
+        self.btn_export_icon.clicked.connect(self.export_icon)
+
+        # 设置图标和按钮的水平布局
         icon_row = QtWidgets.QHBoxLayout()
+        icon_row.addWidget(QLabel("APP图标："))
+        icon_row.addSpacing(15)
         icon_row.addWidget(self.icon_label)
+        icon_row.addSpacing(50)
+        icon_row.addWidget(self.btn_export_icon)
+
+        # 右侧可伸缩空白（保证整体布局自适应）
         icon_row.addStretch(1)
+
+        # 添加到主布局
         layout.addLayout(icon_row)
+
+        # 用于保存当前图标数据
+        self._current_icon_bytes = None
 
         # 基本信息（表单）
         form = QtWidgets.QFormLayout()
@@ -709,6 +726,7 @@ class MainWindow(QtWidgets.QWidget):
         self.te_other["edit"].setPlainText("\n".join(other) if other else "(无)")
 
         # 提取图标
+        self.btn_export_icon.setVisible(False)
         apk_path = self.apk_path_edit.text().strip()
         pix = None
         if apk_path and os.path.isfile(apk_path):
@@ -721,12 +739,10 @@ class MainWindow(QtWidgets.QWidget):
 
                     self.icon_label.setPixmap(QtGui.QPixmap())  # 先清空
                     self.icon_thread = IconWorker(self.apk_path_edit.text().strip(), icon_path)
-                    self.icon_thread.finished.connect(self.icon_label.setPixmap)
+                    self.icon_thread.finished.connect(self.on_icon_loaded)
                     self.icon_thread.start()
             except Exception as e:
                 print("提取图标失败:", e)
-
-        self.icon_label.setPixmap(pix if pix else QtGui.QPixmap())
 
         # 生成重命名预览
         app_name = self.le_app_name.text().strip() or "App"
@@ -774,6 +790,30 @@ class MainWindow(QtWidgets.QWidget):
             self.apk_path_edit.setText(new_path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "错误", f"重命名失败: {e}")
+
+    def on_icon_loaded(self, pix: QtGui.QPixmap, data: bytes):
+        self.icon_label.setPixmap(pix)
+        if pix and not pix.isNull():
+            self._current_icon_bytes = data
+            self.btn_export_icon.setVisible(True)
+        else:
+            self._current_icon_bytes = None
+            self.btn_export_icon.setVisible(False)
+
+    def export_icon(self):
+        if not self._current_icon_bytes:
+            QtWidgets.QMessageBox.warning(self, "提示", "当前没有可导出的图标。")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "保存图标", "app_icon.png", "PNG 图片 (*.png)"
+        )
+        if path:
+            try:
+                with open(path, "wb") as f:
+                    f.write(self._current_icon_bytes)
+                QtWidgets.QMessageBox.information(self, "完成", f"图标已保存到:\n{path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "错误", f"保存失败: {e}")
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
