@@ -14,11 +14,22 @@ from PIL import Image
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
+def local_resource_path(relative_path):
+    """兼容打包前后路径"""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
+    return os.path.join(base_path, relative_path)
+
+_sdk_versions_cache = None
+
 def load_sdk_versions():
     """尝试读取同级目录下 android_sdk_versions.json"""
+    global _sdk_versions_cache
+    if _sdk_versions_cache is not None:
+        return _sdk_versions_cache
     sdk_map = {}
-    here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    sdk_file = here / "android_sdk_versions.json"
+    # here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    # sdk_file = here / "android_sdk_versions.json"
+    sdk_file = Path(local_resource_path("resources/android_sdk_versions.json"))
     if not sdk_file.exists():
         return
     try:
@@ -39,6 +50,7 @@ def load_sdk_versions():
                 sdk_map[api] = f"{version} {codename}"
             else:
                 sdk_map[api] = version
+        _sdk_versions_cache = sdk_map
         return sdk_map
     except Exception as e:
         print("读取 android_sdk_versions.json 出错:", e)
@@ -391,6 +403,56 @@ def parse_aapt2_output(text: str) -> dict:
 
     return info
 
+class IconWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(QtGui.QPixmap)
+
+    def __init__(self, apk_path, icon_path, parent=None):
+        super().__init__(parent)
+        self.apk_path = apk_path
+        self.icon_path = icon_path
+
+    def run(self):
+        pix = QtGui.QPixmap()
+        try:
+            if self.icon_path.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                with zipfile.ZipFile(self.apk_path, "r") as zf:
+                    with zf.open(self.icon_path) as f:
+                        data = f.read()
+                pix.loadFromData(data)
+
+            elif self.icon_path.endswith('.xml'):
+                aapt2_xml_output = run_aapt2_dump_xmltree(self.apk_path, self.icon_path)
+                # 匹配 background 和 foreground 的资源地址
+                bg_match = re.search(r"E: background.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
+                fg_match = re.search(r"E: foreground.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
+
+                background_addr = bg_match.group(1) if bg_match else None
+                foreground_addr = fg_match.group(1) if fg_match else None
+
+                if not background_addr or not foreground_addr:
+                    raise ValueError("未找到 background 或 foreground 资源地址")
+
+                # 提取背景和前景资源
+                foreground_res = run_aapt2_dump_resource(self.apk_path, foreground_addr)
+                foreground = get_resource_info(foreground_res, foreground_addr)
+
+                if foreground["type"] == "unknown":
+                    raise ValueError("前景资源类型无法提取图标")
+
+                background_res = run_aapt2_dump_resource(self.apk_path, background_addr)
+                background = get_resource_info(background_res, background_addr)
+
+                if background["type"] == "unknown":
+                    raise ValueError("背景资源类型无法提取图标")
+
+                data = extract_icon_bytes(self.apk_path, foreground, background)
+                pix = QtGui.QPixmap()
+                pix.loadFromData(data)
+
+        except Exception as e:
+            print("子线程提取图标失败:", e)
+
+        self.finished.emit(pix)
 
 class DropLineEdit(QtWidgets.QLineEdit):
     fileDropped = QtCore.pyqtSignal(str)
@@ -420,7 +482,9 @@ class DropLineEdit(QtWidgets.QLineEdit):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
+        self.icon_thread = None
         self.setWindowTitle("APK 信息查看器（aapt2）")
+        self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
         self.resize(1050, 700)
         self.setup_ui()
 
@@ -654,41 +718,11 @@ class MainWindow(QtWidgets.QWidget):
                     # 选择最大 density 的 icon
                     best = max(icons.items(), key=lambda x: int(x[0]))
                     icon_path = best[1]
-                    if icon_path.endswith(('.xml')):
-                        aapt2_xml_output = run_aapt2_dump_xmltree(apk_path, icon_path)
-                        # 匹配 background 和 foreground 的资源地址
-                        bg_match = re.search(r"E: background.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
-                        fg_match = re.search(r"E: foreground.*?A: .*?=@(0x[0-9a-fA-F]+)", aapt2_xml_output, re.DOTALL)
 
-                        background_addr = bg_match.group(1) if bg_match else None
-                        foreground_addr = fg_match.group(1) if fg_match else None
-
-                        if not background_addr or not foreground_addr:
-                            raise ValueError("未找到 background 或 foreground 资源地址")
-
-                        # 提取背景和前景资源
-                        foreground_res = run_aapt2_dump_resource(apk_path, foreground_addr)
-                        foreground = get_resource_info(foreground_res, foreground_addr)
-
-                        if foreground["type"] == "unknown":
-                            raise ValueError("前景或背景资源类型无法提取图标")
-
-                        background_res = run_aapt2_dump_resource(apk_path, background_addr)
-                        background = get_resource_info(background_res, background_addr)
-
-                        if background["type"] == "unknown":
-                            raise ValueError("前景或背景资源类型无法提取图标")
-
-                        data = extract_icon_bytes(apk_path, foreground, background)
-                        pix = QtGui.QPixmap()
-                        pix.loadFromData(data)
-
-                    elif icon_path.endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                        with zipfile.ZipFile(apk_path, "r") as zf:
-                            with zf.open(icon_path) as f:
-                                data = f.read()
-                        pix = QtGui.QPixmap()
-                        pix.loadFromData(data)
+                    self.icon_label.setPixmap(QtGui.QPixmap())  # 先清空
+                    self.icon_thread = IconWorker(self.apk_path_edit.text().strip(), icon_path)
+                    self.icon_thread.finished.connect(self.icon_label.setPixmap)
+                    self.icon_thread.start()
             except Exception as e:
                 print("提取图标失败:", e)
 
