@@ -102,7 +102,6 @@ def run_aapt2_dump_resource(apk_path: str, resource_address: str, context_lines:
     except subprocess.CalledProcessError as e:
         data = e.stdout or e.stderr
 
-    data = out.stdout or out.stderr
     text = None
     for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
         try:
