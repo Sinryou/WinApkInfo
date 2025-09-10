@@ -3,7 +3,7 @@
 
 一个图形化小工具，用于快速查看解析 Android APK 的基本信息，预览、导出应用图标，并根据APK名称及版本号快速重命名文件，功能以简洁简单为主。
 
-APK-Info目前有一些带混淆的APK包貌似无法解析，故有了此软件，本软件是APK-Info的PyQT5实现。
+[APK-Info](https://github.com/Enyby/APK-Info "跳转仓库")目前有一些带混淆的APK包貌似无法解析，故有了此软件，本软件是APK-Info的PyQT5实现。
 
 ## 界面
 
