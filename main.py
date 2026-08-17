@@ -455,6 +455,27 @@ class IconWorker(QtCore.QThread):
 
         self.finished.emit(pix, data)
 
+class ApkInfoWorker(QtCore.QThread):
+    """后台线程：运行 aapt2 dump badging，避免阻塞 UI"""
+    resultReady = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, apk_path, parent=None):
+        super().__init__(parent)
+        self.apk_path = apk_path
+
+    def run(self):
+        try:
+            output = run_aapt2_dump_badging(self.apk_path)
+        except FileNotFoundError as e:
+            self.failed.emit(str(e))
+            return
+        except Exception as e:
+            self.failed.emit(f"执行 aapt2 失败：\n{e}")
+            return
+        self.resultReady.emit(output)
+
+
 class DropLineEdit(QtWidgets.QLineEdit):
     fileDropped = QtCore.pyqtSignal(str)
 
@@ -615,18 +636,30 @@ class MainWindow(QtWidgets.QWidget):
         if not path or not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
-        try:
-            output = run_aapt2_dump_badging(path)
-        except FileNotFoundError as e:
-            QtWidgets.QMessageBox.critical(self, "错误", str(e))
-            return
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", f"执行 aapt2 失败：\n{e}")
-            return
+        self.set_busy(True)
+        self._apk_worker = ApkInfoWorker(path)
+        self._apk_worker.resultReady.connect(self.on_apk_info_ready)
+        self._apk_worker.failed.connect(self.on_apk_info_failed)
+        self._apk_worker.start()
 
+    def set_busy(self, busy: bool):
+        self.btn_refresh.setEnabled(not busy)
+        self.btn_export_icon.setEnabled(not busy)
+        if busy:
+            self.setCursor(QtCore.Qt.WaitCursor)
+            self.te_raw.setPlainText("正在解析 APK，请稍候…")
+        else:
+            self.unsetCursor()
+
+    def on_apk_info_ready(self, output: str):
         self.te_raw.setPlainText(output)
         info = parse_aapt2_output(output)
         self.fill_info(info)
+        self.set_busy(False)
+
+    def on_apk_info_failed(self, message: str):
+        QtWidgets.QMessageBox.critical(self, "错误", message)
+        self.set_busy(False)
 
     def reparse_current(self):
         text = self.te_raw.toPlainText()
