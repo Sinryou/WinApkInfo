@@ -3,13 +3,14 @@ import os
 import sys
 import re
 import io
+import math
 import shlex
 import shutil
 import subprocess
 import json
 from pathlib import Path
 import zipfile
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QLabel
@@ -345,7 +346,8 @@ def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int
         return (None, None, None)
     root_m = re.search(r"E:\s*(\S+)", xml_out)
     if root_m and root_m.group(1) == "vector":
-        return (None, None, None)  # 纯矢量，无法继续解析
+        # 纯矢量 drawable：交由 rasterize_vector_layer 栅格化
+        return ("vector", xml_path, None)
     m = re.search(
         r"A: [^=\n]*?drawable\(0x[0-9a-fA-F]+\)\s*=\s*(?:\(type\s+0x01\)\s*)?@?(0x[0-9a-fA-F]+)",
         xml_out,
@@ -379,7 +381,16 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
 
     支持混淆包的解引用链：字符串值指向文件、无扩展名文件按魔数识别、
     <scale> 包装继续跟随 android:drawable 引用；深度受限防止循环。
+    另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）。
     """
+    rid = (res_id or "").lower()
+    if rid.startswith("0x01"):
+        # 框架资源（android 包）：资源表里没有，走内置颜色表
+        if rid in _FRAMEWORK_COLOR_MAP:
+            return ("color", _FRAMEWORK_COLOR_MAP[rid], None)
+        if rid.startswith("0x0106"):  # 框架 color 类型
+            return ("color", "#00000000", None)  # 未知框架颜色按透明处理
+        return (None, None, None)
     info = get_resource_info(extract_resource_entry(full_res, res_id))
     kind, value = info["type"], info["value"]
     if kind in ("color", "image"):
@@ -457,19 +468,706 @@ def parse_android_color(color_str: str):
     else:
         raise ValueError("不合法的颜色格式: " + color_str)
 
-def load_resource(apk, res_path_or_color, size):
+# ---------------- Vector Drawable 栅格化 ----------------
+
+# Android 框架（android 包）中常见的颜色资源，用于解析 0x01xxxxxx 引用
+# （TS 等混淆包的自适应图标背景会直接引用 @android:color/transparent）
+_FRAMEWORK_COLOR_MAP = {
+    "0x0106000b": "#00000000",  # android:color/transparent
+    "0x0106000c": "#ff000000",  # android:color/black
+    "0x0106000d": "#ffffffff",  # android:color/white
+    "0x0106000e": "#ff444444",  # android:color/darker_gray
+    "0x0106000f": "#ff888888",  # android:color/gray
+    "0x01060010": "#ffcccccc",  # android:color/lighter_gray
+}
+
+_VECTOR_CAPS = {"butt": 0, "round": 1, "square": 2, "0x00000000": 0, "0x00000001": 1, "0x00000002": 2}
+
+
+def _parse_vector_elements(xml_out):
+    """把 aapt2 dump xmltree 输出解析为 [{indent, tag, attrs}] 元素列表。"""
+    elems = []
+    for line in (xml_out or "").splitlines():
+        m = re.match(r"^(\s*)E:\s+(\S+)\s*\(", line)
+        if m:
+            elems.append({"indent": len(m.group(1)), "tag": m.group(2), "attrs": {}})
+            continue
+        m = re.match(r"^(\s*)A:\s+[^=]*?(\w+)\(0x[0-9a-fA-F]+\)=(.*)$", line)
+        if m and elems:
+            name, raw = m.group(2), m.group(3).strip()
+            if raw.startswith('"'):
+                value = raw[1:raw.find('"', 1)]
+            elif raw.startswith("'"):
+                value = raw[1:raw.find("'", 1)]
+            else:
+                # 形如 108.000000dp / 30% / #aarrggbb / 0x00000011
+                value = raw.split(" ", 1)[0].split("(", 1)[0]
+            elems[-1]["attrs"][name] = value
+    return elems
+
+
+def _attr_float(attrs, name, default=None):
+    v = attrs.get(name)
+    if v is None:
+        return default
+    m = re.match(r"^([-+0-9.eE]+)", v)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return default
+    return default
+
+
+def _tokenize_path_data(d):
+    """SVG pathData 词法切分，返回 [(cmd, 0.0) | (None, float)] 序列。"""
+    tokens = []
+    i, n = 0, len(d)
+    while i < n:
+        c = d[i]
+        if c in " \t\r\n,":
+            i += 1
+            continue
+        if c in "MmZzLlHhVvCcSsQqTtAa":
+            tokens.append((c, 0.0))
+            i += 1
+            continue
+        if c.isdigit() or c in "+-.":
+            j = i + (1 if c in "+-." else 0)
+            while j < n and (d[j].isdigit() or d[j] == "."):
+                j += 1
+            if j < n and d[j] in "eE":
+                k = j + 1
+                if k < n and d[k] in "+-":
+                    k += 1
+                if k < n and d[k].isdigit():
+                    j = k
+                    while j < n and d[j].isdigit():
+                        j += 1
+            tokens.append((None, float(d[i:j])))
+            i = j
+            continue
+        i += 1
+    return tokens
+
+
+_ARITY = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
+
+
+def _parse_path_commands(tokens):
+    """把 tokens 解析为 [(cmd, [args])] 命令列表（展开隐式重复参数）。"""
+    cmds = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if tokens[i][0] is None:
+            i += 1
+            continue
+        cmd = tokens[i][0]
+        i += 1
+        if cmd in "Zz":
+            cmds.append(("Z", []))
+            continue
+        nargs = _ARITY[cmd.upper()]
+        first = []
+        while i < n and len(first) < nargs and tokens[i][0] is None:
+            first.append(tokens[i][1])
+            i += 1
+        if len(first) < nargs:
+            continue
+        cmds.append((cmd, first))
+        if nargs == 0:
+            continue
+        # 隐式重复：后续相同参数个数的数字串（M/m 的额外对子按隐式 L/l 处理）
+        while i < n and tokens[i][0] is None:
+            args = []
+            while i < n and len(args) < nargs and tokens[i][0] is None:
+                args.append(tokens[i][1])
+                i += 1
+            if len(args) < nargs:
+                break
+            next_cmd = cmd
+            if cmd in "Mm":
+                next_cmd = "L" if cmd == "M" else "l"
+            cmds.append((next_cmd, args))
+    return cmds
+
+
+def _bezier_points(p0, p1, p2, p3, step):
+    ext = max(abs(p1[0] - p0[0]), abs(p2[0] - p0[0]), abs(p3[0] - p0[0]),
+              abs(p1[1] - p0[1]), abs(p2[1] - p0[1]), abs(p3[1] - p0[1]))
+    n = max(2, int(math.ceil(ext / step)))
+    pts = []
+    for k in range(1, n + 1):
+        t = k / n
+        mt = 1.0 - t
+        x = mt * mt * mt * p0[0] + 3 * mt * mt * t * p1[0] + 3 * mt * t * t * p2[0] + t * t * t * p3[0]
+        y = mt * mt * mt * p0[1] + 3 * mt * mt * t * p1[1] + 3 * mt * t * t * p2[1] + t * t * t * p3[1]
+        pts.append((x, y))
+    return pts
+
+
+def _quad_points(p0, p1, p2, step):
+    ext = max(abs(p1[0] - p0[0]), abs(p2[0] - p0[0]), abs(p1[1] - p0[1]), abs(p2[1] - p0[1]))
+    n = max(2, int(math.ceil(ext / step)))
+    pts = []
+    for k in range(1, n + 1):
+        t = k / n
+        mt = 1.0 - t
+        x = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0]
+        y = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]
+        pts.append((x, y))
+    return pts
+
+
+def _arc_points(x0, y0, rx, ry, phi_deg, large, sweep, x1, y1, step):
+    """SVG 椭圆弧 → 折线点列（标准中心参数化）。"""
+    rx, ry = abs(rx), abs(ry)
+    if rx < 1e-9 or ry < 1e-9:
+        return [(x1, y1)]
+    phi = math.radians(phi_deg % 360.0)
+    cosp, sinp = math.cos(phi), math.sin(phi)
+    dx, dy = (x0 - x1) / 2.0, (y0 - y1) / 2.0
+    x1p = cosp * dx + sinp * dy
+    y1p = -sinp * dx + cosp * dy
+    lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
+    if lam > 1.0:
+        s = math.sqrt(lam)
+        rx *= s
+        ry *= s
+    num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+    den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+    if den <= 0:
+        return [(x1, y1)]
+    coef = math.sqrt(max(0.0, num / den))
+    if large == sweep:
+        coef = -coef
+    cxp = coef * (rx * y1p / ry)
+    cyp = coef * (-ry * x1p / rx)
+    cx = cosp * cxp - sinp * cyp + (x0 + x1) / 2.0
+    cy = sinp * cxp + cosp * cyp + (y0 + y1) / 2.0
+    theta1 = math.atan2((y1p - cyp) / ry, (x1p - cxp) / rx)
+    theta2 = math.atan2((-y1p - cyp) / ry, (-x1p - cxp) / rx)
+    dtheta = theta2 - theta1
+    if not sweep and dtheta > 0:
+        dtheta -= 2 * math.pi
+    if sweep and dtheta < 0:
+        dtheta += 2 * math.pi
+    n = max(2, int(math.ceil(abs(dtheta) * max(rx, ry) / step)))
+    pts = []
+    for k in range(1, n + 1):
+        t = theta1 + dtheta * k / n
+        x = cx + rx * math.cos(t) * cosp - ry * math.sin(t) * sinp
+        y = cy + rx * math.cos(t) * sinp + ry * math.sin(t) * cosp
+        pts.append((x, y))
+    return pts
+
+
+def _flatten_subpaths(cmds, step):
+    """命令列表 → 子路径点列 [[(x,y), ...], ...]（隐式闭合由填充阶段处理）。"""
+    subpaths = []
+    cur = [0.0, 0.0]
+    start = [0.0, 0.0]
+    sub = None
+    last_cmd = None
+    last_ctrl = None
+    for cmd, args in cmds:
+        c = cmd
+        if c in "Zz":
+            if sub is not None:
+                sub.append((start[0], start[1]))
+                subpaths.append(sub)
+                sub = None
+            cur = [start[0], start[1]]
+            last_cmd = c
+            last_ctrl = None
+            continue
+        if c in "Mm":
+            if sub is not None:
+                sub.append((start[0], start[1]))
+                subpaths.append(sub)
+                sub = None
+            x, y = args[0], args[1]
+            if c == "m":
+                x += cur[0]
+                y += cur[1]
+            cur = [x, y]
+            start = [x, y]
+            sub = [(x, y)]
+            last_cmd = c
+            last_ctrl = None
+            continue
+        if sub is None:
+            sub = [(cur[0], cur[1])]
+        rel = c.islower()
+        base = c.upper()
+        if base == "L":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                sub.append((x, y))
+                cur = [x, y]
+        elif base == "H":
+            for k in range(0, len(args), 1):
+                x = args[k]
+                if rel:
+                    x += cur[0]
+                sub.append((x, cur[1]))
+                cur = [x, cur[1]]
+        elif base == "V":
+            for k in range(0, len(args), 1):
+                y = args[k]
+                if rel:
+                    y += cur[1]
+                sub.append((cur[0], y))
+                cur = [cur[0], y]
+        elif base == "C":
+            for k in range(0, len(args), 6):
+                x1, y1, x2, y2, x, y = args[k:k + 6]
+                if rel:
+                    x1 += cur[0]; y1 += cur[1]; x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
+                sub.extend(_bezier_points(tuple(cur), (x1, y1), (x2, y2), (x, y), step))
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+        elif base == "S":
+            for k in range(0, len(args), 4):
+                x2, y2, x, y = args[k:k + 4]
+                if rel:
+                    x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
+                if last_cmd in ("C", "S") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur
+                sub.extend(_bezier_points(tuple(cur), (x1, y1), (x2, y2), (x, y), step))
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+        elif base == "Q":
+            for k in range(0, len(args), 4):
+                x1, y1, x, y = args[k:k + 4]
+                if rel:
+                    x1 += cur[0]; y1 += cur[1]; x += cur[0]; y += cur[1]
+                sub.extend(_quad_points(tuple(cur), (x1, y1), (x, y), step))
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+        elif base == "T":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                if last_cmd in ("Q", "T") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur
+                sub.extend(_quad_points(tuple(cur), (x1, y1), (x, y), step))
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+        elif base == "A":
+            for k in range(0, len(args), 7):
+                rx, ry, rot, large, sweep, x, y = args[k:k + 7]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                sub.extend(_arc_points(cur[0], cur[1], rx, ry, rot, large != 0, sweep != 0, x, y, step))
+                cur = [x, y]
+                last_ctrl = None
+        last_cmd = c
+    if sub is not None:
+        subpaths.append(sub)
+    return subpaths
+
+
+def _mat_mul(m1, m2):
+    """仿射矩阵相乘（结果 = 先应用 m2，再应用 m1）。"""
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (a1 * a2 + c1 * b2, b1 * a2 + d1 * b2,
+            a1 * c2 + c1 * d2, b1 * c2 + d1 * d2,
+            a1 * e2 + c1 * f2 + e1, b1 * e2 + d1 * f2 + f1)
+
+
+def _mat_apply(m, x, y):
+    a, b, c, d, e, f = m
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
+def _group_matrix(tx, ty, px, py, rot_deg, sx, sy):
+    """VectorDrawable group 变换：T(translate+pivot) ∘ R(rot) ∘ S(scale) ∘ T(-pivot)。"""
+    r = math.radians(rot_deg)
+    cosr, sinr = math.cos(r), math.sin(r)
+    R = (cosr, sinr, -sinr, cosr, 0.0, 0.0)
+    S = (sx, 0.0, 0.0, sy, 0.0, 0.0)
+    Tm = (1.0, 0.0, 0.0, 1.0, -px, -py)
+    Tp = (1.0, 0.0, 0.0, 1.0, tx + px, ty + py)
+    return _mat_mul(Tp, _mat_mul(R, _mat_mul(S, Tm)))
+
+
+def _fill_mask(mask, subpaths, fill_rule="nonzero"):
+    """扫描线填充 'L' 掩码（支持 nonzero / evenodd 填充规则）。"""
+    w, h = mask.size
+    px = mask.load()
+    edges = []
+    y_min, y_max = None, None
+    for pts in subpaths:
+        n = len(pts)
+        if n < 3:
+            continue
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            if y1 != y2:
+                edges.append((x1, y1, x2, y2))
+                lo, hi = (y1, y2) if y1 < y2 else (y2, y1)
+                y_min = lo if y_min is None else min(y_min, lo)
+                y_max = hi if y_max is None else max(y_max, hi)
+    if not edges:
+        return
+    y_lo = max(0, int(math.floor(y_min)))
+    y_hi = min(h, int(math.ceil(y_max)))
+    for y in range(y_lo, y_hi):
+        yy = y + 0.5
+        xs = []
+        for (x1, y1, x2, y2) in edges:
+            if (y1 <= yy < y2) or (y2 <= yy < y1):
+                t = (yy - y1) / (y2 - y1)
+                xs.append((x1 + t * (x2 - x1), 1 if y2 > y1 else -1))
+        if not xs:
+            continue
+        xs.sort(key=lambda p: p[0])
+        acc = 0
+        start_x = None
+        for x, wnd in xs:
+            if fill_rule == "evenodd":
+                if acc == 0:
+                    start_x = x
+                acc ^= 1
+            else:
+                if acc == 0:
+                    start_x = x
+                acc += wnd
+            if acc == 0 and start_x is not None:
+                a = max(0, int(math.ceil(start_x - 0.5)))
+                b = min(w, int(math.floor(x + 0.5)))
+                for xx in range(a, b):
+                    px[xx, y] = 255
+                start_x = None
+
+
+def _parse_gradient(xml_out):
+    """解析 aapt2 拆分出来的 <gradient> drawable（$xxx__0.xml），失败返回 None。"""
+    elems = _parse_vector_elements(xml_out)
+    if not elems or elems[0]["tag"] != "gradient":
+        return None
+    attrs = elems[0]["attrs"]
+    grad = {
+        "type": int(_attr_float(attrs, "type", 0.0) or 0),  # 0=linear 1=radial 2=sweep
+        "startX": _attr_float(attrs, "startX", 0.0),
+        "startY": _attr_float(attrs, "startY", 0.0),
+        "endX": _attr_float(attrs, "endX", 0.0),
+        "endY": _attr_float(attrs, "endY", 0.0),
+        "centerX": _attr_float(attrs, "centerX", 0.0),
+        "centerY": _attr_float(attrs, "centerY", 0.0),
+        "radius": _attr_float(attrs, "gradientRadius", 0.0),
+        "angle": _attr_float(attrs, "angle", 0.0),
+        "stops": [],
+    }
+    for el in elems[1:]:
+        if el["tag"] != "item":
+            continue
+        a = el["attrs"]
+        if "color" not in a:
+            continue
+        try:
+            c = parse_android_color(a["color"])
+        except ValueError:
+            continue
+        grad["stops"].append((_attr_float(a, "offset", 0.0), c))
+    if not grad["stops"]:
+        return None
+    grad["stops"].sort(key=lambda s: s[0])
+    if grad["stops"][0][0] > 0:
+        grad["stops"].insert(0, (0.0, grad["stops"][0][1]))
+    if grad["stops"][-1][0] < 1:
+        grad["stops"].append((1.0, grad["stops"][-1][1]))
+    return grad
+
+
+def _sample_gradient_stops(stops, t):
+    if t <= stops[0][0]:
+        return stops[0][1]
+    if t >= stops[-1][0]:
+        return stops[-1][1]
+    for i in range(1, len(stops)):
+        o2, c2 = stops[i]
+        if t <= o2:
+            o1, c1 = stops[i - 1]
+            span = o2 - o1
+            k = 0.0 if span <= 0 else (t - o1) / span
+            return (
+                int(c1[0] + (c2[0] - c1[0]) * k),
+                int(c1[1] + (c2[1] - c1[1]) * k),
+                int(c1[2] + (c2[2] - c1[2]) * k),
+                int(c1[3] + (c2[3] - c1[3]) * k),
+            )
+    return stops[-1][1]
+
+
+def _render_gradient(W, H, grad, m):
+    """按 viewport 坐标渲染 W×H 渐变图（m 把 viewport 坐标映射到像素坐标）。"""
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    px = img.load()
+    stops = grad["stops"]
+    gt = grad["type"]
+    if gt == 0:  # linear
+        sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
+        ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
+        dx, dy = ex - sx, ey - sy
+        dd = dx * dx + dy * dy
+        if dd < 1e-9:  # 无起点终点，退回角度方向
+            a = math.radians(grad["angle"])
+            dx, dy = math.cos(a), -math.sin(a)
+            dd = 1.0
+        for y in range(H):
+            for x in range(W):
+                t = ((x - sx) * dx + (y - sy) * dy) / dd
+                px[x, y] = _sample_gradient_stops(stops, t)
+    elif gt == 1:  # radial
+        cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+        det = m[0] * m[3] - m[1] * m[2]
+        r_px = grad["radius"] * math.sqrt(abs(det)) if det else grad["radius"]
+        for y in range(H):
+            for x in range(W):
+                t = math.hypot(x - cx, y - cy) / r_px if r_px > 1e-9 else 0.0
+                px[x, y] = _sample_gradient_stops(stops, t)
+    else:  # sweep
+        cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+        inv = 1.0 / (2.0 * math.pi)
+        for y in range(H):
+            for x in range(W):
+                t = (math.atan2(y - cy, x - cx) + math.pi) * inv
+                px[x, y] = _sample_gradient_stops(stops, t)
+    return img
+
+
+def _resolve_vector_fill(apk_path, full_res, color_value):
     """
-    根据输入判断是颜色还是图片：
+    解析 vector 的 fillColor / strokeColor 属性值（可能带资源引用）。
+    返回 ("color", (r,g,b,a))、("gradient", grad_dict) 或 None。
+    """
+    v = (color_value or "").strip()
+    if v.startswith("#"):
+        try:
+            return ("color", parse_android_color(v))
+        except ValueError:
+            return None
+    ref = v[1:] if v.startswith("@") else v
+    ref = ref.lower()
+    if not ref.startswith("0x"):
+        return None
+    if ref.startswith("0x01"):
+        if ref in _FRAMEWORK_COLOR_MAP:
+            return ("color", parse_android_color(_FRAMEWORK_COLOR_MAP[ref]))
+        return None
+    if not full_res:
+        full_res = run_aapt2_dump_resource(apk_path)
+    info = get_resource_info(extract_resource_entry(full_res, ref))
+    if info["type"] == "color":
+        try:
+            return ("color", parse_android_color(info["value"]))
+        except ValueError:
+            return None
+    if info["type"] in ("vector", "string_file", "image") and info["value"]:
+        # 可能是 aapt2 拆分出来的渐变 drawable（$xxx__0.xml）
+        grad = _parse_gradient(run_aapt2_dump_xmltree(apk_path, info["value"]))
+        if grad:
+            return ("gradient", grad)
+    return None
+
+
+def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
+    stroke = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(stroke)
+    col = (color[0], color[1], color[2], int(round(color[3] * alpha)))
+    r = wpx / 2.0
+    for pts in subpaths:
+        if len(pts) < 2:
+            continue
+        d.line([(round(p[0]), round(p[1])) for p in pts], fill=col, width=wpx, joint="curve")
+        if cap == 1:  # round
+            for p in (pts[0], pts[-1]):
+                d.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=col)
+    layer.alpha_composite(stroke)
+
+
+def rasterize_vector_layer(apk_path, xml_path, size, full_res=None):
+    """
+    把 Android VectorDrawable（aapt2 dump xmltree 输出）栅格化为 size×size RGBA 图像。
+    支持 vector / group / path、填充与描边、nonzero/evenodd 填充规则、
+    以及带资源引用的填充（含 aapt2 拆分出来的 <gradient> 渐变）。
+    """
+    xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
+    if not xml_out.strip():
+        return None
+    elems = _parse_vector_elements(xml_out)
+    root = None
+    for el in elems:
+        if el["tag"] == "vector":
+            root = el
+            break
+    if root is None:
+        return None
+    attrs = root["attrs"]
+    vw = _attr_float(attrs, "viewportWidth", _attr_float(attrs, "width", 108.0))
+    vh = _attr_float(attrs, "viewportHeight", _attr_float(attrs, "height", 108.0))
+    if vw <= 0 or vh <= 0:
+        vw = vh = 108.0
+    ss = 2  # 超采样，最后 LANCZOS 缩小抗锯齿
+    W = size * ss
+    H = size * ss
+    sx = W / vw
+    sy = H / vh
+    step = max(0.5, max(vw, vh) / 160.0)
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    vec_alpha = _attr_float(attrs, "alpha", 1.0)
+    stack = []  # (indent, 累计矩阵, 累计 alpha)
+    for el in elems:
+        tag = el["tag"]
+        indent = el["indent"]
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if tag == "vector":
+            stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
+            continue
+        if tag == "group":
+            if not stack:
+                continue
+            a = el["attrs"]
+            m = _group_matrix(
+                _attr_float(a, "translateX", 0.0), _attr_float(a, "translateY", 0.0),
+                _attr_float(a, "pivotX", 0.0), _attr_float(a, "pivotY", 0.0),
+                _attr_float(a, "rotation", 0.0),
+                _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
+            )
+            pm, pa = stack[-1][1], stack[-1][2]
+            stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
+            continue
+        if tag == "path":
+            if not stack:
+                continue
+            pm, pa = stack[-1][1], stack[-1][2]
+            a = el["attrs"]
+            path_data = a.get("pathData")
+            if not path_data:
+                continue
+            cmds = _parse_path_commands(_tokenize_path_data(path_data))
+            subpaths = _flatten_subpaths(cmds, step)
+            if not subpaths:
+                continue
+            m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
+            tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
+            fill_rule = "evenodd" if str(a.get("fillType", "")).lower() == "evenodd" else "nonzero"
+            if "fillColor" in a:
+                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"])
+                if fill is not None:
+                    falpha = pa * _attr_float(a, "fillAlpha", 1.0)
+                    if fill[0] == "color":
+                        ca = int(round(fill[1][3] * falpha))
+                        if ca > 0:
+                            mask = Image.new("L", (W, H), 0)
+                            _fill_mask(mask, tsubs, fill_rule)
+                            tint = Image.new("RGBA", (W, H), (fill[1][0], fill[1][1], fill[1][2], ca))
+                            layer.alpha_composite(
+                                Image.composite(tint, Image.new("RGBA", (W, H), (0, 0, 0, 0)), mask)
+                            )
+                    else:  # gradient 填充
+                        mask = Image.new("L", (W, H), 0)
+                        _fill_mask(mask, tsubs, fill_rule)
+                        gimg = _render_gradient(W, H, fill[1], m)
+                        if falpha < 0.999:
+                            gimg = gimg.point(lambda v: int(round(v * falpha)))
+                        layer.alpha_composite(
+                            Image.composite(gimg, Image.new("RGBA", (W, H), (0, 0, 0, 0)), mask)
+                        )
+            if "strokeColor" in a:
+                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"])
+                if sc is not None and sc[0] == "color":
+                    stroke_color = sc[1]
+                    sw = _attr_float(a, "strokeWidth", 0.0)
+                    sa = pa * _attr_float(a, "strokeAlpha", 1.0)
+                    if sw > 0 and sa > 0:
+                        wpx = max(1, int(round(sw * min(sx, sy))))
+                        cap = _VECTOR_CAPS.get(str(a.get("strokeLineCap", "butt")).lower(), 0)
+                        _draw_stroke(layer, tsubs, stroke_color, sa, wpx, cap)
+    return layer.resize((size, size), Image.LANCZOS)
+
+
+def _trim_to_content(img, size):
+    """
+    裁掉图标四周的"空边"并放大铺满画布，消除纯色背景（如白色）导致的白边：
+    - 四角透明 → 按 alpha 内容包围盒裁剪；
+    - 四角为统一纯色 → 按与纯色差异的包围盒裁剪；
+    - 四角颜色不同（设计铺满画布）→ 原样返回。
+    内容已基本铺满（≥97%）时不裁剪。
+    """
+    w, h = img.size
+    corners = [img.getpixel(p) for p in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+    if all(c[3] < 16 for c in corners):
+        bbox = img.split()[3].getbbox()
+        pad_color = None  # 透明垫边
+    else:
+        base = corners[0]
+        if not all(c[3] >= 240 and all(abs(c[i] - base[i]) <= 8 for i in range(3)) for c in corners):
+            return img  # 角落颜色不一，设计铺满画布
+        solid = Image.new("RGB", (w, h), base[:3])
+        diff = ImageChops.difference(img.convert("RGB"), solid)
+        r, g, b = diff.split()
+        mask = ImageChops.lighter(
+            ImageChops.lighter(r.point(lambda v: 255 if v > 12 else 0),
+                               g.point(lambda v: 255 if v > 12 else 0)),
+            b.point(lambda v: 255 if v > 12 else 0),
+        )
+        bbox = mask.getbbox()
+        pad_color = base
+    if not bbox:
+        return img
+    minx, miny, maxx, maxy = bbox
+    if (maxx - minx) >= w * 0.97 and (maxy - miny) >= h * 0.97:
+        return img
+    pad = max(2, int(min(w, h) * 0.01))
+    box = (max(0, minx - pad), max(0, miny - pad), min(w, maxx + pad), min(h, maxy + pad))
+    crop = img.crop(box)
+    cw, ch = crop.size
+    if abs(cw - ch) <= max(cw, ch) * 0.15:
+        return crop.resize((size, size), Image.LANCZOS)
+    scale = min(size / cw, size / ch)
+    nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
+    small = crop.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), pad_color if pad_color is not None and pad_color[3] >= 240 else (0, 0, 0, 0))
+    canvas.alpha_composite(small, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
+
+def load_resource(apk_path, res_path_or_color, size, full_res=None):
+    """
+    根据输入判断是颜色、矢量还是图片：
     - 颜色：返回一个填充颜色的 Image
+    - 矢量：栅格化 VectorDrawable XML
     - 图片：从 APK 中读取并缩放
     """
-    if res_path_or_color["type"] == "color":  # 颜色
+    typ = res_path_or_color["type"]
+    if typ == "color":  # 颜色
         color = parse_android_color(res_path_or_color["value"])
         return Image.new("RGBA", (size, size), color)
-    else:  # 文件
+    if typ == "vector":  # 矢量 drawable
+        img = rasterize_vector_layer(apk_path, res_path_or_color["value"], size, full_res)
+        if img is not None:
+            return img
+        raise ValueError(f"矢量图标栅格化失败: {res_path_or_color['value']}")
+    # 位图文件
+    with zipfile.ZipFile(apk_path, "r") as apk:
         with apk.open(res_path_or_color["value"]) as f:
             img = Image.open(f).convert("RGBA")
-        return img.resize((size, size), Image.LANCZOS)
+    return img.resize((size, size), Image.LANCZOS)
 
 def _place_by_gravity(size: int, w: int, h: int, gravity: int):
     """按 Android gravity 位把 w×h 的图放到 size×size 画布上的 (x, y)。"""
@@ -488,18 +1186,17 @@ def _place_by_gravity(size: int, w: int, h: int, gravity: int):
     return x, y
 
 
-def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None):
+def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None, full_res=None):
     """
     自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流。
 
     fg_scale: (width%, height%, gravity)，来自 <scale> 包装 drawable；
               None 表示前景按整层尺寸渲染。
     """
-    with zipfile.ZipFile(apk_path, 'r') as apk:
-        # 加载前景
-        foreground_img = load_resource(apk, foreground, size)
-        # 加载背景
-        background_img = load_resource(apk, background, size)
+    # 加载前景
+    foreground_img = load_resource(apk_path, foreground, size, full_res)
+    # 加载背景
+    background_img = load_resource(apk_path, background, size, full_res)
 
     if fg_scale:
         w_pct, h_pct, gravity = fg_scale
@@ -513,6 +1210,9 @@ def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None
 
     # 合成 (背景在下，前景在上)
     final_img = Image.alpha_composite(background_img, foreground_img)
+
+    # 裁掉纯色/透明空边，避免生成的图标带白边
+    # final_img = _trim_to_content(final_img, size)
 
     # 转字节流
     output = io.BytesIO()
@@ -700,12 +1400,13 @@ class IconWorker(QtCore.QThread):
         if fg_addr and bg_addr:
             fg_kind, fg_val, fg_scale = resolve_icon_layer(self.apk_path, full_res, fg_addr)
             bg_kind, bg_val, _bg_scale = resolve_icon_layer(self.apk_path, full_res, bg_addr)
-            if fg_kind in ("image", "color") and bg_kind in ("image", "color"):
+            if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
                 return extract_icon_bytes(
                     self.apk_path,
                     {"type": fg_kind, "value": fg_val},
                     {"type": bg_kind, "value": bg_val},
                     fg_scale=fg_scale,
+                    full_res=full_res,
                 )
 
         fallback = find_mipmap_fallback(full_res, self.icon_path)
