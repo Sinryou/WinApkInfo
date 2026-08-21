@@ -4,13 +4,20 @@ import sys
 import re
 import io
 import math
-import shlex
+import tempfile
 import shutil
 import subprocess
 import json
+import logging
+import threading
 from pathlib import Path
 import zipfile
 from PIL import Image, ImageChops, ImageDraw
+
+try:
+    import numpy as np
+except ImportError:  # numpy 可选：缺失时栅格化回退纯 Python 实现
+    np = None
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QLabel
@@ -24,6 +31,62 @@ else:
     _SUBPROCESS_FLAGS = 0
 
 
+class Aapt2Error(RuntimeError):
+    """aapt2 执行失败（非零退出），message 为解码后的 stderr/stdout 文本。"""
+
+
+def _decode_output(data: bytes) -> str:
+    """按严格优先级解码 aapt2 输出：utf-8-sig → gbk → cp936，最后宽松兜底。
+
+    utf-8-sig 必须排在 utf-8 前面：`bytes.decode("utf-8")` 不会剥离 BOM
+    （会把 U+FEFF 留在字符串开头），utf-8-sig 则同时兼容带/不带 BOM 的
+    UTF-8 文本。旧实现用 errors="ignore" 逐个尝试，decode 永不抛异常，
+    回退链实际是死代码；严格解码才能让回退真正生效。
+    """
+    for enc in ("utf-8-sig", "gbk", "cp936"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+class _Aapt2OutputCache:
+    """按 (apk 路径, mtime_ns, 子命令, 参数) 缓存 aapt2 dump 输出。
+
+    图标解析链路会对同一 APK 反复执行 dump（每个 XML 层一次 xmltree、
+    full_res 缺省时多次 resources），缓存可避免重复起子进程。
+    键含 mtime，APK 被替换后自动失效；有界容量 + 线程锁。
+    """
+
+    def __init__(self, capacity=32):
+        self._capacity = capacity
+        self._cache = {}
+        self._order = []
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            return self._cache.get(key)
+
+    def put(self, key, value):
+        with self._lock:
+            if key not in self._cache:
+                self._order.append(key)
+            self._cache[key] = value
+            while len(self._order) > self._capacity:
+                old = self._order.pop(0)
+                self._cache.pop(old, None)
+
+
+_aapt2_cache = _Aapt2OutputCache()
+
+
+def _aapt2_cache_key(apk_path: str, kind: str, arg=None):
+    mtime = os.stat(apk_path).st_mtime_ns
+    return (os.path.abspath(apk_path), mtime, kind, arg)
+
+
 def local_resource_path(relative_path):
     """兼容打包前后路径"""
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -32,7 +95,7 @@ def local_resource_path(relative_path):
 _sdk_versions_cache = None
 
 def load_sdk_versions():
-    """尝试读取同级目录下 android_sdk_versions.json"""
+    """尝试读取 resources/android_sdk_versions.json（结果缓存，失败也缓存空表）。"""
     global _sdk_versions_cache
     if _sdk_versions_cache is not None:
         return _sdk_versions_cache
@@ -41,7 +104,8 @@ def load_sdk_versions():
     # sdk_file = here / "android_sdk_versions.json"
     sdk_file = Path(local_resource_path("resources/android_sdk_versions.json"))
     if not sdk_file.exists():
-        return
+        _sdk_versions_cache = sdk_map
+        return sdk_map
     try:
         with open(sdk_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -61,9 +125,10 @@ def load_sdk_versions():
             else:
                 sdk_map[api] = version
         _sdk_versions_cache = sdk_map
-        return sdk_map
     except Exception as e:
-        print("读取 android_sdk_versions.json 出错:", e)
+        logging.warning("读取 android_sdk_versions.json 出错: %s", e)
+        _sdk_versions_cache = sdk_map
+    return sdk_map
 
 def find_aapt2() -> str:
     """
@@ -86,29 +151,25 @@ def find_aapt2() -> str:
 def run_aapt2_dump_badging(apk_path: str) -> str:
     """
     运行 `aapt2 dump badging "<apk>"` 并返回 stdout 文本。
+    非零退出时抛出 Aapt2Error（含解码后的 stderr），不再把错误当正常输出返回。
     """
     aapt2_path = find_aapt2()
     cmd = [aapt2_path, "dump", "badging", apk_path]
 
-    # Windows 控制台编码兼容：优先 utf-8，失败再回退到 gbk
-    try:
-        out = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=_SUBPROCESS_FLAGS
-        )
-    except subprocess.CalledProcessError as e:
-        # 即使非0，也尽量取输出
-        out = e
+    key = _aapt2_cache_key(apk_path, "badging")
+    cached = _aapt2_cache.get(key)
+    if cached is not None:
+        return cached
 
-    data = out.stdout or out.stderr
-    text = None
-    for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
-        try:
-            text = data.decode(enc, errors="ignore")
-            break
-        except Exception:
-            continue
-    if text is None:
-        text = data.decode(errors="ignore")
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS
+    )
+    if proc.returncode != 0:
+        err = (_decode_output(proc.stderr or proc.stdout)).strip() or f"aapt2 退出码 {proc.returncode}"
+        raise Aapt2Error(err)
+
+    text = _decode_output(proc.stdout)
+    _aapt2_cache.put(key, text)
     return text
 
 def run_aapt2_dump_resource(apk_path: str) -> str:
@@ -124,32 +185,74 @@ def run_aapt2_dump_resource(apk_path: str) -> str:
     aapt2_path = find_aapt2()
     cmd = [aapt2_path, "dump", "resources", apk_path]
 
-    try:
-        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=_SUBPROCESS_FLAGS)
-        data = out.stdout or out.stderr
-    except subprocess.CalledProcessError as e:
-        data = e.stdout or e.stderr
+    key = _aapt2_cache_key(apk_path, "resources")
+    cached = _aapt2_cache.get(key)
+    if cached is not None:
+        return cached
 
-    text = None
-    for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
-        try:
-            text = data.decode(enc, errors="ignore")
-            break
-        except Exception:
-            continue
-    if text is None:
-        text = data.decode(errors="ignore")
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS)
+    if proc.returncode != 0:
+        # 图标链路保持宽松：dump 失败时返回错误文本，由上层走位图回退
+        return _decode_output(proc.stderr or proc.stdout)
+
+    text = _decode_output(proc.stdout)
+    _aapt2_cache.put(key, text)
     return text
 
 
-def extract_resource_entry(full_output: str, res_id: str) -> str:
+def _entry_span(lines, start):
+    """返回资源条目 [start, end) 行区间：到下一个 `resource 0x` 或 `type ... id=` 分节行前。"""
+    end = start + 1
+    while end < len(lines):
+        s = lines[end].strip()
+        if s.startswith("resource 0x") or re.match(r"^type\s+\w+\s+id=", s):
+            break
+        end += 1
+    return start, end
+
+
+class _ResourceIndex:
+    """一次性解析 `aapt2 dump resources` 全量输出，提供 O(1) 的条目查询。
+
+    图标解析链路会对同一份全量输出做多次线性扫描（每个资源 id 一次、
+    每条文件路径一次），对大型 APK 是全量文本的重复开销。
+    """
+
+    __slots__ = ("by_id", "by_file")
+
+    def __init__(self, full_output: str):
+        self.by_id = {}
+        self.by_file = {}
+        lines = (full_output or "").splitlines()
+        n = len(lines)
+        i = 0
+        while i < n:
+            m = re.match(r"resource\s+(0x[0-9a-fA-F]+)(?:\s+\S+)?", lines[i].strip())
+            if not m:
+                i += 1
+                continue
+            rid = m.group(1).lower()
+            a, b = _entry_span(lines, i)
+            entry = "\n".join(lines[a:b])
+            self.by_id[rid] = entry
+            for line in lines[a:b]:
+                fm = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
+                if fm:
+                    self.by_file.setdefault(fm.group(2), entry)
+            i = b
+
+
+def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
     """
     从 `aapt2 dump resources` 全量输出中精确截取某个资源条目。
 
     条目以 `resource 0x{id} <pkg>/<name>` 行开始，到下一个 `resource 0x` 行
     或 `type <type> id=..` 分节行之前结束（含其所有密度变体行）。
-    找不到返回空字符串。
+    找不到返回空字符串。传入 index（_ResourceIndex）时 O(1) 查询。
     """
+    if index is not None:
+        return index.by_id.get(res_id.lower(), "")
+
     lines = full_output.splitlines()
     rid = res_id.lower()
     start = None
@@ -161,13 +264,8 @@ def extract_resource_entry(full_output: str, res_id: str) -> str:
     if start is None:
         return ""
 
-    end = start + 1
-    while end < len(lines):
-        s = lines[end].strip()
-        if s.startswith("resource 0x") or re.match(r"^type\s+\w+\s+id=", s):
-            break
-        end += 1
-    return "\n".join(lines[start:end])
+    a, b = _entry_span(lines, start)
+    return "\n".join(lines[a:b])
 
 def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str) -> str:
     """
@@ -176,25 +274,20 @@ def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str) -> str:
     aapt2_path = find_aapt2()
     cmd = [aapt2_path, "dump", "xmltree", apk_path, "--file", inner_file_path]
 
-    # Windows 控制台编码兼容：优先 utf-8，失败再回退到 gbk
-    try:
-        out = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, creationflags=_SUBPROCESS_FLAGS
-        )
-    except subprocess.CalledProcessError as e:
-        # 即使非0，也尽量取输出
-        out = e
+    key = _aapt2_cache_key(apk_path, "xmltree", inner_file_path)
+    cached = _aapt2_cache.get(key)
+    if cached is not None:
+        return cached
 
-    data = out.stdout or out.stderr
-    text = None
-    for enc in ("utf-8", "utf-8-sig", "gbk", "cp936"):
-        try:
-            text = data.decode(enc, errors="ignore")
-            break
-        except Exception:
-            continue
-    if text is None:
-        text = data.decode(errors="ignore")
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS
+    )
+    if proc.returncode != 0:
+        # 图标链路保持宽松：dump 失败时返回错误文本，由上层走位图回退
+        return _decode_output(proc.stderr or proc.stdout)
+
+    text = _decode_output(proc.stdout)
+    _aapt2_cache.put(key, text)
     return text
 
 # ---------------- 资源条目解析 ----------------
@@ -228,27 +321,46 @@ def _pick_best_density(variants: dict):
     return None
 
 
+_sniff_cache = {}
+_sniff_cache_lock = threading.Lock()
+
+
 def _sniff_file_kind(apk_path: str, inner_path: str):
     """
     用魔数识别 APK 内文件类型（AndResGuard 等混淆后文件没有扩展名）。
-    返回 "image" / "xml" / None。
+    返回 "image" / "xml" / None。结果按 (apk 路径, mtime, 文件路径) 缓存，
+    避免同一次提取链路里反复打开同一个 zip（不持有 ZipFile 句柄，
+    以免影响 Windows 上的重命名操作）。
     """
+    try:
+        key = (os.path.abspath(apk_path), os.stat(apk_path).st_mtime_ns, inner_path)
+    except OSError:
+        return None
+    with _sniff_cache_lock:
+        if key in _sniff_cache:
+            return _sniff_cache[key]
     try:
         with zipfile.ZipFile(apk_path, "r") as zf:
             head = zf.open(inner_path).read(16)
     except Exception:
         return None
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image"
-    if head[:4] == b"\x89PNG":
-        return "image"
-    if head[:2] == b"\xff\xd8":
-        return "image"
-    if head[:4] == b"GIF8":
-        return "image"
-    if head[:4] == b"\x03\x00\x08\x00":  # Android 二进制 XML 头
-        return "xml"
-    return None
+        kind = "image"
+    elif head[:4] == b"\x89PNG":
+        kind = "image"
+    elif head[:2] == b"\xff\xd8":
+        kind = "image"
+    elif head[:4] == b"GIF8":
+        kind = "image"
+    elif head[:4] == b"\x03\x00\x08\x00":  # Android 二进制 XML 头
+        kind = "xml"
+    else:
+        kind = None
+    with _sniff_cache_lock:
+        if len(_sniff_cache) > 512:
+            _sniff_cache.clear()
+        _sniff_cache[key] = kind
+    return kind
 
 
 def get_resource_info(entry_text: str) -> dict:
@@ -335,7 +447,7 @@ def find_adaptive_layer_addr(xml_output: str, layer: str):
     return None
 
 
-def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int):
+def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int, index=None):
     """
     若 xml_path 指向 <scale>/<layer-list> 等包装 drawable，且其 android:drawable
     引用了另一个资源，则跟随引用继续解析（<scale> 的缩放参数一并带回）。
@@ -364,13 +476,13 @@ def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int
             float(sh.group(1)) if sh else 100.0,
             int(sg.group(1), 16) if sg else 0x11,  # 默认居中
         )
-    kind, value, scale2 = resolve_icon_layer(apk_path, full_res, m.group(1), depth + 1)
+    kind, value, scale2 = resolve_icon_layer(apk_path, full_res, m.group(1), depth + 1, index)
     if not kind:
         return (None, None, None)
     return (kind, value, scale or scale2)
 
 
-def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0):
+def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0, index=None):
     """
     把一个图标层资源完整解析成可渲染形态：
         ("color", "#AARRGGBB", None)
@@ -382,6 +494,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
     支持混淆包的解引用链：字符串值指向文件、无扩展名文件按魔数识别、
     <scale> 包装继续跟随 android:drawable 引用；深度受限防止循环。
     另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）。
+    index 为 _ResourceIndex 时条目查询 O(1)。
     """
     rid = (res_id or "").lower()
     if rid.startswith("0x01"):
@@ -391,7 +504,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
         if rid.startswith("0x0106"):  # 框架 color 类型
             return ("color", "#00000000", None)  # 未知框架颜色按透明处理
         return (None, None, None)
-    info = get_resource_info(extract_resource_entry(full_res, res_id))
+    info = get_resource_info(extract_resource_entry(full_res, res_id, index))
     kind, value = info["type"], info["value"]
     if kind in ("color", "image"):
         return (kind, value, None)
@@ -402,27 +515,44 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
         if ext in _BITMAP_EXTS:
             return ("image", value, None)
         if ext == ".xml":
-            return _resolve_xml_wrapper(apk_path, full_res, value, depth)
+            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
         sniffed = _sniff_file_kind(apk_path, value)
         if sniffed == "image":
             return ("image", value, None)
         if sniffed == "xml":
-            return _resolve_xml_wrapper(apk_path, full_res, value, depth)
+            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
         return (None, None, None)
     if kind == "vector" and value:
-        kind2, value2, scale2 = _resolve_xml_wrapper(apk_path, full_res, value, depth)
+        kind2, value2, scale2 = _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
         if kind2:
             return (kind2, value2, scale2)
         return ("vector", value, None)
     return (None, None, None)
 
 
-def find_mipmap_fallback(full_res: str, icon_xml_path: str):
+def _collect_bitmap_variants(entry_text: str) -> dict:
+    """从资源条目文本收集 {density: 位图路径}。"""
+    variants = {}
+    for line in (entry_text or "").splitlines():
+        m = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
+        if m and m.group(2).lower().endswith(_BITMAP_EXTS):
+            variants[_density_of(m.group(1))] = m.group(2)
+    return variants
+
+
+def find_mipmap_fallback(full_res: str, icon_xml_path: str, index=None):
     """
     自适应图标（.xml）无法整体栅格化时的回退：
     找到包含该 icon xml 的资源条目（通常是 mipmap/ic_launcher），
     返回其最高密度的位图变体路径（即 8.0 之前使用的传统回退图标）。
+    传入 index（_ResourceIndex）时 O(1) 查询。
     """
+    if index is not None:
+        entry = index.by_file.get(icon_xml_path)
+        if entry is None:
+            return None
+        return _pick_best_density(_collect_bitmap_variants(entry))
+
     lines = full_res.splitlines()
     target = None
     for i, line in enumerate(lines):
@@ -435,19 +565,8 @@ def find_mipmap_fallback(full_res: str, icon_xml_path: str):
     start = target
     while start > 0 and not lines[start - 1].strip().startswith("resource 0x"):
         start -= 1
-    end = target + 1
-    while end < len(lines):
-        s = lines[end].strip()
-        if s.startswith("resource 0x") or re.match(r"^type\s+\w+\s+id=", s):
-            break
-        end += 1
-
-    variants = {}
-    for line in lines[start:end]:
-        m = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
-        if m and m.group(2).lower().endswith(_BITMAP_EXTS):
-            variants[_density_of(m.group(1))] = m.group(2)
-    return _pick_best_density(variants)
+    a, b = _entry_span(lines, start)
+    return _pick_best_density(_collect_bitmap_variants("\n".join(lines[a:b])))
 
 def parse_android_color(color_str: str):
     """
@@ -803,12 +922,9 @@ def _group_matrix(tx, ty, px, py, rot_deg, sx, sy):
     return _mat_mul(Tp, _mat_mul(R, _mat_mul(S, Tm)))
 
 
-def _fill_mask(mask, subpaths, fill_rule="nonzero"):
-    """扫描线填充 'L' 掩码（支持 nonzero / evenodd 填充规则）。"""
-    w, h = mask.size
-    px = mask.load()
+def _collect_edges(subpaths):
+    """收集多边形边 [(x1, y1, x2, y2)]（跳过水平边）。"""
     edges = []
-    y_min, y_max = None, None
     for pts in subpaths:
         n = len(pts)
         if n < 3:
@@ -818,11 +934,18 @@ def _fill_mask(mask, subpaths, fill_rule="nonzero"):
             x2, y2 = pts[(i + 1) % n]
             if y1 != y2:
                 edges.append((x1, y1, x2, y2))
-                lo, hi = (y1, y2) if y1 < y2 else (y2, y1)
-                y_min = lo if y_min is None else min(y_min, lo)
-                y_max = hi if y_max is None else max(y_max, hi)
+    return edges
+
+
+def _fill_mask_py(mask, subpaths, fill_rule="nonzero"):
+    """纯 Python 扫描线填充 'L' 掩码（支持 nonzero / evenodd）。numpy 缺失时的回退。"""
+    w, h = mask.size
+    px = mask.load()
+    edges = _collect_edges(subpaths)
     if not edges:
         return
+    y_min = min(min(e[1], e[3]) for e in edges)
+    y_max = max(max(e[1], e[3]) for e in edges)
     y_lo = max(0, int(math.floor(y_min)))
     y_hi = min(h, int(math.ceil(y_max)))
     for y in range(y_lo, y_hi):
@@ -852,6 +975,69 @@ def _fill_mask(mask, subpaths, fill_rule="nonzero"):
                 for xx in range(a, b):
                     px[xx, y] = 255
                 start_x = None
+
+
+def _build_fill_mask(W, H, subpaths, fill_rule="nonzero"):
+    """生成 L 模式填充掩码 Image，支持 nonzero / evenodd 填充规则。
+
+    numpy 可用时向量化（快一个数量级以上），否则回退 _fill_mask_py。
+    扫描线判定用半开规则（y1 <= yy < y2 或 y2 <= yy < y1），与纯 Python 版一致。
+    """
+    if np is None:
+        mask = Image.new("L", (W, H), 0)
+        _fill_mask_py(mask, subpaths, fill_rule)
+        return mask
+
+    arr = np.zeros((H, W), dtype=np.uint8)
+    edges = _collect_edges(subpaths)
+    if not edges:
+        return Image.fromarray(arr, "L")
+
+    x1 = np.array([e[0] for e in edges], dtype=np.float64)
+    y1 = np.array([e[1] for e in edges], dtype=np.float64)
+    x2 = np.array([e[2] for e in edges], dtype=np.float64)
+    y2 = np.array([e[3] for e in edges], dtype=np.float64)
+    y_lo = max(0, int(math.floor(min(y1.min(), y2.min()))))
+    y_hi = min(H, int(math.ceil(max(y1.max(), y2.max()))))
+    if y_lo >= y_hi:
+        return Image.fromarray(arr, "L")
+
+    ys = np.arange(y_lo, y_hi) + 0.5
+    # 每条边在每个扫描线是否相交（半开规则）
+    cross = ((y1 <= ys[:, None]) & (ys[:, None] < y2)) | ((y2 <= ys[:, None]) & (ys[:, None] < y1))
+    t = (ys[:, None] - y1[None, :]) / (y2[None, :] - y1[None, :])
+    xs = np.where(cross, x1[None, :] + t * (x2[None, :] - x1[None, :]), np.nan)
+    wnd = np.where(y2 > y1, 1.0, -1.0)
+
+    for r in range(len(ys)):
+        row = xs[r]
+        keep = ~np.isnan(row)
+        if not keep.any():
+            continue
+        row = row[keep]
+        y = y_lo + r
+        if fill_rule == "evenodd":
+            row.sort()
+            starts = row[0::2]
+            ends = row[1::2]
+        else:
+            wrow = wnd[keep]
+            order = np.argsort(row, kind="stable")
+            row = row[order]
+            acc = np.cumsum(wrow[order])
+            inside = acc != 0
+            if not inside.any():
+                continue
+            # bool 数组直接 np.diff 得到的是异或（bool），必须转整型才能区分 +/-1
+            trans = np.diff(np.concatenate(([0], inside.astype(np.int8), [0])))
+            starts = row[np.flatnonzero(trans == 1)]
+            ends = row[np.flatnonzero(trans == -1)]
+        for a, b in zip(starts, ends):
+            ia = max(0, int(math.ceil(a - 0.5)))
+            ib = min(W, int(math.floor(b + 0.5)))
+            if ia < ib:
+                arr[y, ia:ib] = 255
+    return Image.fromarray(arr, "L")
 
 
 def _parse_gradient(xml_out):
@@ -913,8 +1099,54 @@ def _sample_gradient_stops(stops, t):
     return stops[-1][1]
 
 
+def _sample_gradient_stops_vec(stops, t):
+    """_sample_gradient_stops 的向量化版本：t 为 (H, W) 数组，返回 (H, W, 4) float。"""
+    offsets = np.array([s[0] for s in stops], dtype=np.float64)
+    colors = np.array([s[1] for s in stops], dtype=np.float64)  # (K, 4)
+    if len(stops) < 2:
+        return np.broadcast_to(colors[0], t.shape + (4,)).copy()
+    t = np.clip(t, offsets[0], offsets[-1])
+    idx = np.clip(np.searchsorted(offsets, t, side="right") - 1, 0, len(stops) - 2)
+    span = offsets[idx + 1] - offsets[idx]
+    k = np.divide(t - offsets[idx], span, out=np.zeros_like(t), where=span > 0)
+    k = k[..., None]
+    return colors[idx] + (colors[idx + 1] - colors[idx]) * k
+
+
 def _render_gradient(W, H, grad, m):
-    """按 viewport 坐标渲染 W×H 渐变图（m 把 viewport 坐标映射到像素坐标）。"""
+    """按 viewport 坐标渲染 W×H 渐变图（m 把 viewport 坐标映射到像素坐标）。
+
+    numpy 可用时整图向量化，否则回退逐像素的 _render_gradient_py。
+    """
+    if np is None:
+        return _render_gradient_py(W, H, grad, m)
+    stops = grad["stops"]
+    gt = grad["type"]
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
+    if gt == 0:  # linear
+        sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
+        ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
+        dx, dy = ex - sx, ey - sy
+        dd = dx * dx + dy * dy
+        if dd < 1e-9:  # 无起点终点，退回角度方向
+            a = math.radians(grad["angle"])
+            dx, dy = math.cos(a), -math.sin(a)
+            dd = 1.0
+        t = ((xx - sx) * dx + (yy - sy) * dy) / dd
+    elif gt == 1:  # radial
+        cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+        det = m[0] * m[3] - m[1] * m[2]
+        r_px = grad["radius"] * math.sqrt(abs(det)) if det else grad["radius"]
+        t = np.hypot(xx - cx, yy - cy) / r_px if r_px > 1e-9 else np.zeros_like(xx)
+    else:  # sweep
+        cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+        t = (np.arctan2(yy - cy, xx - cx) + math.pi) / (2.0 * math.pi)
+    rgba = _sample_gradient_stops_vec(stops, t)
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA")
+
+
+def _render_gradient_py(W, H, grad, m):
+    """纯 Python 逐像素渲染渐变（numpy 缺失时的回退，语义与向量化版一致）。"""
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     px = img.load()
     stops = grad["stops"]
@@ -950,7 +1182,7 @@ def _render_gradient(W, H, grad, m):
     return img
 
 
-def _resolve_vector_fill(apk_path, full_res, color_value):
+def _resolve_vector_fill(apk_path, full_res, color_value, index=None):
     """
     解析 vector 的 fillColor / strokeColor 属性值（可能带资源引用）。
     返回 ("color", (r,g,b,a))、("gradient", grad_dict) 或 None。
@@ -971,7 +1203,7 @@ def _resolve_vector_fill(apk_path, full_res, color_value):
         return None
     if not full_res:
         full_res = run_aapt2_dump_resource(apk_path)
-    info = get_resource_info(extract_resource_entry(full_res, ref))
+    info = get_resource_info(extract_resource_entry(full_res, ref, index))
     if info["type"] == "color":
         try:
             return ("color", parse_android_color(info["value"]))
@@ -1000,7 +1232,7 @@ def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
     layer.alpha_composite(stroke)
 
 
-def rasterize_vector_layer(apk_path, xml_path, size, full_res=None):
+def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
     """
     把 Android VectorDrawable（aapt2 dump xmltree 输出）栅格化为 size×size RGBA 图像。
     支持 vector / group / path、填充与描边、nonzero/evenodd 填充规则、
@@ -1029,6 +1261,7 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None):
     sy = H / vh
     step = max(0.5, max(vw, vh) / 160.0)
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    transparent = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # 每路径复用的透明底图
     vec_alpha = _attr_float(attrs, "alpha", 1.0)
     stack = []  # (indent, 累计矩阵, 累计 alpha)
     for el in elems:
@@ -1068,29 +1301,23 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None):
             tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
             fill_rule = "evenodd" if str(a.get("fillType", "")).lower() == "evenodd" else "nonzero"
             if "fillColor" in a:
-                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"])
+                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
                 if fill is not None:
                     falpha = pa * _attr_float(a, "fillAlpha", 1.0)
                     if fill[0] == "color":
                         ca = int(round(fill[1][3] * falpha))
                         if ca > 0:
-                            mask = Image.new("L", (W, H), 0)
-                            _fill_mask(mask, tsubs, fill_rule)
+                            mask = _build_fill_mask(W, H, tsubs, fill_rule)
                             tint = Image.new("RGBA", (W, H), (fill[1][0], fill[1][1], fill[1][2], ca))
-                            layer.alpha_composite(
-                                Image.composite(tint, Image.new("RGBA", (W, H), (0, 0, 0, 0)), mask)
-                            )
+                            layer.alpha_composite(Image.composite(tint, transparent, mask))
                     else:  # gradient 填充
-                        mask = Image.new("L", (W, H), 0)
-                        _fill_mask(mask, tsubs, fill_rule)
+                        mask = _build_fill_mask(W, H, tsubs, fill_rule)
                         gimg = _render_gradient(W, H, fill[1], m)
                         if falpha < 0.999:
                             gimg = gimg.point(lambda v: int(round(v * falpha)))
-                        layer.alpha_composite(
-                            Image.composite(gimg, Image.new("RGBA", (W, H), (0, 0, 0, 0)), mask)
-                        )
+                        layer.alpha_composite(Image.composite(gimg, transparent, mask))
             if "strokeColor" in a:
-                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"])
+                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
                 if sc is not None and sc[0] == "color":
                     stroke_color = sc[1]
                     sw = _attr_float(a, "strokeWidth", 0.0)
@@ -1147,7 +1374,7 @@ def _trim_to_content(img, size):
     canvas.alpha_composite(small, ((size - nw) // 2, (size - nh) // 2))
     return canvas
 
-def load_resource(apk_path, res_path_or_color, size, full_res=None):
+def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None):
     """
     根据输入判断是颜色、矢量还是图片：
     - 颜色：返回一个填充颜色的 Image
@@ -1159,7 +1386,7 @@ def load_resource(apk_path, res_path_or_color, size, full_res=None):
         color = parse_android_color(res_path_or_color["value"])
         return Image.new("RGBA", (size, size), color)
     if typ == "vector":  # 矢量 drawable
-        img = rasterize_vector_layer(apk_path, res_path_or_color["value"], size, full_res)
+        img = rasterize_vector_layer(apk_path, res_path_or_color["value"], size, full_res, index)
         if img is not None:
             return img
         raise ValueError(f"矢量图标栅格化失败: {res_path_or_color['value']}")
@@ -1170,23 +1397,31 @@ def load_resource(apk_path, res_path_or_color, size, full_res=None):
     return img.resize((size, size), Image.LANCZOS)
 
 def _place_by_gravity(size: int, w: int, h: int, gravity: int):
-    """按 Android gravity 位把 w×h 的图放到 size×size 画布上的 (x, y)。"""
-    if gravity & 0x01:      # CENTER_HORIZONTAL
+    """按 Android gravity 位把 w×h 的图放到 size×size 画布上的 (x, y)。
+
+    gravity 是位掩码：横向 0x07（LEFT=0x03 / CENTER_HORIZONTAL=0x01 /
+    RIGHT=0x05），纵向 0x70（TOP=0x30 / CENTER_VERTICAL=0x10 / BOTTOM=0x50）。
+    必须按掩码比较：直接 `gravity & 0x01` 会把 LEFT(0x03) 误判为居中，
+    `gravity & 0x05` 会把 LEFT/TOP 误判为 RIGHT/BOTTOM（0x03&0x05=1）。
+    """
+    hg = gravity & 0x07
+    vg = gravity & 0x70
+    if hg == 0x01:      # CENTER_HORIZONTAL
         x = (size - w) // 2
-    elif gravity & 0x05:    # RIGHT
+    elif hg == 0x05:    # RIGHT
         x = size - w
-    else:                   # LEFT
+    else:               # LEFT
         x = 0
-    if gravity & 0x10:      # CENTER_VERTICAL
+    if vg == 0x10:      # CENTER_VERTICAL
         y = (size - h) // 2
-    elif gravity & 0x50:    # BOTTOM
+    elif vg == 0x50:    # BOTTOM
         y = size - h
-    else:                   # TOP
+    else:               # TOP
         y = 0
     return x, y
 
 
-def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None, full_res=None):
+def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None, full_res=None, index=None):
     """
     自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流。
 
@@ -1194,9 +1429,9 @@ def extract_icon_bytes(apk_path, foreground, background, size=512, fg_scale=None
               None 表示前景按整层尺寸渲染。
     """
     # 加载前景
-    foreground_img = load_resource(apk_path, foreground, size, full_res)
+    foreground_img = load_resource(apk_path, foreground, size, full_res, index)
     # 加载背景
-    background_img = load_resource(apk_path, background, size, full_res)
+    background_img = load_resource(apk_path, background, size, full_res, index)
 
     if fg_scale:
         w_pct, h_pct, gravity = fg_scale
@@ -1361,14 +1596,24 @@ def parse_aapt2_output(text: str) -> dict:
 
     return info
 
+class _Cancelled(Exception):
+    """内部取消信号：线程被 requestInterruption 时抛出让 run() 静默退出。"""
+
+
 class IconWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(QtGui.QPixmap, bytes)  # 多发一个图标字节流
+    # 注意：不要命名为 finished——会遮蔽 QThread 内建 finished 信号，
+    # 破坏 thread.finished.connect(deleteLater) 等惯用法。
+    iconReady = QtCore.pyqtSignal(QtGui.QPixmap, bytes)  # 成功时发射（字节流供导出）
     failed = QtCore.pyqtSignal(str)  # 提取失败时发出，供 UI 可见提示
 
     def __init__(self, apk_path, icon_path, parent=None):
         super().__init__(parent)
         self.apk_path = apk_path
         self.icon_path = icon_path
+
+    def _check_cancel(self):
+        if self.isInterruptionRequested():
+            raise _Cancelled
 
     @staticmethod
     def _load_pixmap(pix: QtGui.QPixmap, data: bytes) -> bool:
@@ -1391,15 +1636,26 @@ class IconWorker(QtCore.QThread):
            两层都可栅格化时合成完整图标；
         2) 任一层是纯矢量、或结构不是标准 adaptive-icon 时，回退到
            icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
+
+        `dump resources` 只在确实需要时执行（旧实现在拿到 fg/bg 地址前
+        就 dump，非自适应图标也白白跑一次全量输出）。
         """
-        full_res = run_aapt2_dump_resource(self.apk_path)
+        self._check_cancel()
         xml_out = run_aapt2_dump_xmltree(self.apk_path, self.icon_path)
 
         fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
         bg_addr = find_adaptive_layer_addr(xml_out, "background")
+
+        full_res = None
+        index = None
         if fg_addr and bg_addr:
-            fg_kind, fg_val, fg_scale = resolve_icon_layer(self.apk_path, full_res, fg_addr)
-            bg_kind, bg_val, _bg_scale = resolve_icon_layer(self.apk_path, full_res, bg_addr)
+            full_res = run_aapt2_dump_resource(self.apk_path)
+            self._check_cancel()
+            # 一次性索引全量输出，后续所有资源条目查询 O(1)
+            index = _ResourceIndex(full_res)
+            fg_kind, fg_val, fg_scale = resolve_icon_layer(self.apk_path, full_res, fg_addr, index=index)
+            bg_kind, bg_val, _bg_scale = resolve_icon_layer(self.apk_path, full_res, bg_addr, index=index)
+            self._check_cancel()
             if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
                 return extract_icon_bytes(
                     self.apk_path,
@@ -1407,9 +1663,16 @@ class IconWorker(QtCore.QThread):
                     {"type": bg_kind, "value": bg_val},
                     fg_scale=fg_scale,
                     full_res=full_res,
+                    index=index,
                 )
 
-        fallback = find_mipmap_fallback(full_res, self.icon_path)
+        # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
+        self._check_cancel()
+        if full_res is None:
+            full_res = run_aapt2_dump_resource(self.apk_path)
+            self._check_cancel()
+            index = _ResourceIndex(full_res)
+        fallback = find_mipmap_fallback(full_res, self.icon_path, index)
         if fallback:
             with zipfile.ZipFile(self.apk_path, "r") as zf:
                 img = Image.open(zf.open(fallback)).convert("RGBA")
@@ -1423,6 +1686,7 @@ class IconWorker(QtCore.QThread):
         pix = QtGui.QPixmap()
         data = b""
         try:
+            self._check_cancel()
             if self.icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
                 with zipfile.ZipFile(self.apk_path, "r") as zf:
                     data = zf.open(self.icon_path).read()
@@ -1438,11 +1702,14 @@ class IconWorker(QtCore.QThread):
             else:
                 raise ValueError(f"不支持的图标类型: {self.icon_path}")
 
+        except _Cancelled:
+            return  # 用户取消/窗口关闭：静默退出，不覆盖 UI 状态
         except Exception as e:
-            print("子线程提取图标失败:", e)
+            logging.exception("子线程提取图标失败: %s", e)
             self.failed.emit(str(e))
+            return  # 失败后不再 emit iconReady，避免清掉 failed 设置的提示
 
-        self.finished.emit(pix, data)
+        self.iconReady.emit(pix, data)
 
 class ApkInfoWorker(QtCore.QThread):
     """后台线程：运行 aapt2 dump badging，避免阻塞 UI"""
@@ -1482,9 +1749,13 @@ class DropLineEdit(QtWidgets.QLineEdit):
         e.ignore()
 
     def dropEvent(self, e: QtGui.QDropEvent):
+        if not e.mimeData().hasUrls():
+            e.ignore()
+            return
         for url in e.mimeData().urls():
             local = url.toLocalFile()
             if local.lower().endswith(".apk"):
+                e.acceptProposedAction()
                 self.setText(local)
                 self.fileDropped.emit(local)
                 break
@@ -1496,6 +1767,12 @@ class MainWindow(QtWidgets.QWidget):
         self.setWindowTitle("APK 信息查看器（aapt2）")
         self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
         self.resize(1050, 700)
+        self._busy = False
+        # 线程对象必须长期持有引用：若线程仍在运行时 Python 引用被替换/回收，
+        # PyQt 会在 QThread 析构时报 "QThread: Destroyed while thread is still running"。
+        self._apk_workers = []
+        self._icon_workers = []
+        self._icon_gen = 0  # 图标提取代数，用于丢弃过期结果
         self.setup_ui()
 
     def setup_ui(self):
@@ -1505,10 +1782,10 @@ class MainWindow(QtWidgets.QWidget):
         file_row = QtWidgets.QHBoxLayout()
         self.apk_path_edit = DropLineEdit()
         self.apk_path_edit.fileDropped.connect(self.process_apk)
-        btn_browse = QtWidgets.QPushButton("打开 APK")
-        btn_browse.clicked.connect(self.browse_apk)
+        self.btn_browse = QtWidgets.QPushButton("打开 APK")
+        self.btn_browse.clicked.connect(self.browse_apk)
         file_row.addWidget(self.apk_path_edit, stretch=1)
-        file_row.addWidget(btn_browse)
+        file_row.addWidget(self.btn_browse)
         layout.addLayout(file_row)
 
         # 在顶部表单之前加图标显示
@@ -1625,20 +1902,65 @@ class MainWindow(QtWidgets.QWidget):
         if not path or not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
+        if self._busy:
+            QtWidgets.QMessageBox.information(self, "提示", "正在解析 APK，请稍候再试。")
+            return
         self.set_busy(True)
-        self._apk_worker = ApkInfoWorker(path)
-        self._apk_worker.resultReady.connect(self.on_apk_info_ready)
-        self._apk_worker.failed.connect(self.on_apk_info_failed)
-        self._apk_worker.start()
+        self._prune_workers()
+        worker = ApkInfoWorker(path)
+        self._apk_workers.append(worker)
+        worker.resultReady.connect(self.on_apk_info_ready)
+        worker.failed.connect(self.on_apk_info_failed)
+        worker.start()
 
     def set_busy(self, busy: bool):
+        self._busy = busy
         self.btn_refresh.setEnabled(not busy)
         self.btn_export_icon.setEnabled(not busy)
+        self.btn_browse.setEnabled(not busy)
+        self.apk_path_edit.setEnabled(not busy)
         if busy:
             self.setCursor(QtCore.Qt.WaitCursor)
             self.te_raw.setPlainText("正在解析 APK，请稍候…")
         else:
             self.unsetCursor()
+
+    def _prune_workers(self):
+        """清理已结束的线程对象；运行中的保留引用，防止 QThread 被 GC 时崩溃。"""
+        for lst in (self._apk_workers, self._icon_workers):
+            for t in [t for t in lst if not t.isRunning()]:
+                t.deleteLater()
+                lst.remove(t)
+
+    def _start_icon_worker(self, apk_path: str, icon_path: str):
+        """启动图标提取线程；先取消并等待仍在运行的旧线程，避免结果乱序。"""
+        for t in self._icon_workers:
+            if t.isRunning():
+                t.requestInterruption()
+        for t in [t for t in self._icon_workers if t.isRunning()]:
+            t.wait(5000)
+        self._prune_workers()
+
+        self._icon_gen += 1
+        gen = self._icon_gen
+        worker = IconWorker(apk_path, icon_path)
+        self._icon_workers.append(worker)
+        worker.iconReady.connect(lambda pix, data, g=gen: self.on_icon_loaded(pix, data, g))
+        worker.failed.connect(lambda msg, g=gen: self.on_icon_failed(msg, g))
+        worker.start()
+
+    def closeEvent(self, event):
+        """关闭窗口前停止并等待所有后台线程，避免 QThread 运行中被销毁。"""
+        threads = self._apk_workers + self._icon_workers
+        for t in threads:
+            if t.isRunning():
+                t.requestInterruption()
+        for t in threads:
+            if not t.wait(8000):
+                # aapt2 子进程阻塞时的兜底：应用即将退出，强制结束线程
+                t.terminate()
+                t.wait(2000)
+        event.accept()
 
     def on_apk_info_ready(self, output: str):
         self.te_raw.setPlainText(output)
@@ -1754,7 +2076,6 @@ class MainWindow(QtWidgets.QWidget):
         # 提取图标
         self.btn_export_icon.setVisible(False)
         apk_path = self.apk_path_edit.text().strip()
-        pix = None
         if apk_path and os.path.isfile(apk_path):
             try:
                 icons = info.get("icons", {})
@@ -1764,12 +2085,9 @@ class MainWindow(QtWidgets.QWidget):
                     icon_path = best[1]
 
                     self.icon_label.clear()  # 先清空（含上次失败提示文本）
-                    self.icon_thread = IconWorker(self.apk_path_edit.text().strip(), icon_path)
-                    self.icon_thread.finished.connect(self.on_icon_loaded)
-                    self.icon_thread.failed.connect(self.on_icon_failed)
-                    self.icon_thread.start()
+                    self._start_icon_worker(apk_path, icon_path)
             except Exception as e:
-                print("提取图标失败:", e)
+                logging.exception("提取图标失败: %s", e)
 
         # 生成重命名预览
         app_name = self.le_app_name.text().strip() or "App"
@@ -1811,14 +2129,29 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "提示", "没有生成新的文件名。")
             return
         new_path = str(Path(old_path).with_name(new_name))
+        if os.path.abspath(new_path) == os.path.abspath(old_path):
+            return
+        if os.path.exists(new_path):
+            ret = QtWidgets.QMessageBox.question(
+                self, "覆盖确认",
+                f"目标文件已存在：\n{new_path}\n\n是否覆盖？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if ret != QtWidgets.QMessageBox.Yes:
+                return
         try:
-            os.rename(old_path, new_path)
+            # os.rename 在 Windows 上目标已存在时失败；os.replace 原子替换
+            os.replace(old_path, new_path)
             QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
             self.apk_path_edit.setText(new_path)
+            self.rename_preview.setText(new_name)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "错误", f"重命名失败: {e}")
 
-    def on_icon_loaded(self, pix: QtGui.QPixmap, data: bytes):
+    def on_icon_loaded(self, pix: QtGui.QPixmap, data: bytes, gen: int):
+        if gen != self._icon_gen:
+            return  # 过期结果（用户已开始解析新 APK），丢弃
         self.icon_label.setPixmap(pix)
         if pix and not pix.isNull():
             self._current_icon_bytes = data
@@ -1827,7 +2160,9 @@ class MainWindow(QtWidgets.QWidget):
             self._current_icon_bytes = None
             self.btn_export_icon.setVisible(False)
 
-    def on_icon_failed(self, message: str):
+    def on_icon_failed(self, message: str, gen: int):
+        if gen != self._icon_gen:
+            return
         # 图标提取失败时给出可见提示（之前是静默空白）
         self.icon_label.setText("提取失败")
         self.icon_label.setToolTip(f"图标提取失败：{message}")
@@ -1863,10 +2198,24 @@ class MainWindow(QtWidgets.QWidget):
         )
 
 def main():
-    # macOS Retina / 高分屏适配：必须在 QApplication 创建之前设置。
-    if sys.platform != "win32":
+    # 日志：控制台模式输出到 stderr；PyInstaller 窗口模式（无 stderr）落盘到临时目录
+    if sys.stderr is not None:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            filename=os.path.join(tempfile.gettempdir(), "winapkinfo.log"),
+        )
+
+    # 高分屏适配：必须在 QApplication 创建之前设置。
+    # Qt ≥ 5.14 起 high-DPI 缩放默认启用，再设置属性只会触发弃用警告；
+    # Qt < 5.14 则在所有平台统一开启（旧代码只在非 Windows 设置）。
+    qt_ver = tuple(int(x) for x in QtCore.QT_VERSION_STR.split(".")[:2])
+    if (5, 6) <= qt_ver < (5, 14):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
     app = QtWidgets.QApplication(sys.argv)
     # app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }"
     # "QGroupBox { font-size: 16px; font-family: Microsoft Yahei; }")
