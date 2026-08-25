@@ -19,8 +19,8 @@ try:
 except ImportError:  # numpy 可选：缺失时栅格化回退纯 Python 实现
     np = None
 
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtWidgets import QLabel
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtWidgets import QLabel
 
 
 # subprocess.CREATE_NO_WINDOW 仅存在于 Windows；macOS/Linux 上访问会在运行时报
@@ -1858,13 +1858,13 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(rename_group)
 
         # 原始输出
-        raw_group = QtWidgets.QGroupBox("aapt2 原始输出")
-        vg = QtWidgets.QVBoxLayout(raw_group)
+        # raw_group = QtWidgets.QGroupBox("aapt2 原始输出")
+        # vg = QtWidgets.QVBoxLayout(raw_group)
         self.te_raw = QtWidgets.QPlainTextEdit()
         self.te_raw.setReadOnly(True)
-        self.te_raw.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        vg.addWidget(self.te_raw)
-        layout.addWidget(raw_group, stretch=1)
+        self.te_raw.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        # vg.addWidget(self.te_raw)
+        # layout.addWidget(raw_group, stretch=1)
 
         # 底部按钮
         btn_row = QtWidgets.QHBoxLayout()
@@ -1886,7 +1886,7 @@ class MainWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(group)
         te = QtWidgets.QPlainTextEdit()
         te.setReadOnly(True)
-        te.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        te.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(te)
         return {"group": group, "edit": te}
 
@@ -1920,7 +1920,7 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_browse.setEnabled(not busy)
         self.apk_path_edit.setEnabled(not busy)
         if busy:
-            self.setCursor(QtCore.Qt.WaitCursor)
+            self.setCursor(QtCore.Qt.CursorShape.WaitCursor)
             self.te_raw.setPlainText("正在解析 APK，请稍候…")
         else:
             self.unsetCursor()
@@ -2135,10 +2135,10 @@ class MainWindow(QtWidgets.QWidget):
             ret = QtWidgets.QMessageBox.question(
                 self, "覆盖确认",
                 f"目标文件已存在：\n{new_path}\n\n是否覆盖？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
             )
-            if ret != QtWidgets.QMessageBox.Yes:
+            if ret != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         try:
             # os.rename 在 Windows 上目标已存在时失败；os.replace 原子替换
@@ -2190,7 +2190,7 @@ class MainWindow(QtWidgets.QWidget):
             self,
             "About",
             "<b>APK 信息查看器</b><br><br>"
-            "基于 PyQt5 + aapt2 的图形化<br>"
+            "基于 PyQt6 + aapt2 的图形化<br>"
             "解析 APK 文件信息的工具程序<br><br>"
             '更多信息: <a href="https://github.com/Sinryou/WinApkInfo">项目主页</a><br>'
             "版本: 1.1.0<br>"
@@ -2208,13 +2208,8 @@ def main():
             filename=os.path.join(tempfile.gettempdir(), "winapkinfo.log"),
         )
 
-    # 高分屏适配：必须在 QApplication 创建之前设置。
-    # Qt ≥ 5.14 起 high-DPI 缩放默认启用，再设置属性只会触发弃用警告；
-    # Qt < 5.14 则在所有平台统一开启（旧代码只在非 Windows 设置）。
-    qt_ver = tuple(int(x) for x in QtCore.QT_VERSION_STR.split(".")[:2])
-    if (5, 6) <= qt_ver < (5, 14):
-        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    # 高分屏适配：Qt6 默认启用 high-DPI 缩放（AA_EnableHighDpiScaling /
+    # AA_UseHighDpiPixmaps 已废弃），无需再设置任何属性。
 
     app = QtWidgets.QApplication(sys.argv)
     # app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }"
@@ -2222,7 +2217,7 @@ def main():
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
