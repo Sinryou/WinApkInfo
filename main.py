@@ -1766,7 +1766,7 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         self.setWindowTitle("APK 信息查看器（aapt2）")
         self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
-        self.resize(1050, 700)
+        self.resize(700, 700)
         self._busy = False
         # 线程对象必须长期持有引用：若线程仍在运行时 Python 引用被替换/回收，
         # PyQt 会在 QThread 析构时报 "QThread: Destroyed while thread is still running"。
