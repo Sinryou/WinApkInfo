@@ -1844,7 +1844,7 @@ def parse_aapt2_output(text: str) -> dict:
     return info
 
 class _Cancelled(Exception):
-    """内部取消信号：线程被 requestInterruption 时抛出让 run() 静默退出。"""
+    """内部取消信号：请求被更新的请求覆盖、或窗口关闭时抛出让 run() 丢弃本轮。"""
 
 
 class IconWorker(QtCore.QThread):

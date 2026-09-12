@@ -20,6 +20,14 @@
     P2-11 磁盘级 dump 缓存：跨进程复用，APK 变化即失效
     P2-12 回归守护：Pillow resize 不渗透明背景色（当前 Pillow 已内置预乘，
           该项经复核为误报，故只做守护不复修改代码）
+    A1    异常钩子线程安全（子线程不直接弹窗、进程不崩）
+    B1    自适应图标层无法栅格化时回退到位图
+    B2    磁盘缓存单条与总量字节上限
+    B3    SDK 版本表读取失败不再永久缓存
+    B4    图标提取为单常驻线程 + 最新请求覆盖
+
+注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
+（GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
 
 退出码：0 = 全部通过，1 = 存在失败项。
 """
@@ -34,7 +42,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import zipfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -201,6 +211,11 @@ def sample_apks(limit=None):
     return apks[:limit] if limit else apks
 
 
+def pick_apk(apks, largest=False):
+    """按体积挑样本：不依赖文件名（用户可能已经用重命名功能改过名）。"""
+    return (max if largest else min)(apks, key=os.path.getsize)
+
+
 def icon_xml_of(apk):
     """取 badging 里密度最高的 xml 图标路径。"""
     badging = m.run_aapt2_dump_badging(apk)
@@ -275,16 +290,27 @@ def check_p0_1():
     apks = sample_apks()
     if not apks:
         return
-    target = next((a for a in apks if "vending" in os.path.basename(a)), None)
-    if not target:
-        C.check("真实 APK fillType 用例", True, "（样本中无 vending 包，跳过）")
-        return
-    out = m.run_aapt2_dump_xmltree(target, "res/0YE.xml")
-    found = 0
-    for el in m._parse_vector_elements(out):
-        if el["tag"] == "path" and el["attrs"].get("fillType") == "1":
-            found += 1
-    C.check("真实 APK 中 fillType=1 被识别为 evenOdd", found > 0, "res/0YE.xml 命中 %d 个 path" % found)
+    # 按内容找带 fillType=1 的真实 XML：先看原始字节快速筛选，再交给 aapt2
+    target = pick_apk(apks, largest=True)
+    hit = None
+    dumps = 0
+    with zipfile.ZipFile(target) as zf:
+        for name in zf.namelist():
+            if dumps >= 3 or not name.lower().endswith(".xml"):
+                continue
+            try:
+                raw = zf.open(name).read()
+            except Exception:
+                continue
+            if raw[:4] != b"\x03\x00\x08\x00" or b"fillType" not in raw:
+                continue
+            dumps += 1
+            out = m.run_aapt2_dump_xmltree(target, name)
+            if re.search(r"fillType\(0x[0-9a-fA-F]+\)=1", out):
+                hit = name
+                break
+    C.check("真实 APK 中 fillType=1 被识别为 evenOdd", hit is not None,
+            "%s :: %s" % (os.path.basename(target)[:30], hit or "未找到"))
 
 
 def check_p0_2():
@@ -413,7 +439,7 @@ def check_p1_5(app):
     C.check("shutdown_background 存在", hasattr(m.MainWindow, "shutdown_background"))
 
     apks = sample_apks()
-    target = next((a for a in apks if "vending" in os.path.basename(a)), apks[0] if apks else None)
+    target = pick_apk(apks, largest=True) if apks else None
     if target:
         win = m.MainWindow()
         win.apk_path_edit.setText(target)
@@ -423,40 +449,52 @@ def check_p1_5(app):
         win.close()
         el = time.time() - t0
         C.check("解析进行中关窗不再阻塞 10s", el < 3.0, "close() 耗时=%.2fs" % el)
+        leftovers = win._apk_workers + ([win._icon_worker] if win._icon_worker else [])
         C.check("关闭后线程能收尾", win.shutdown_background(15000),
-                "剩余运行中线程=%d" % sum(1 for t in win._apk_workers + win._icon_workers if t.isRunning()))
+                "剩余运行中线程=%d" % sum(1 for t in leftovers if t.isRunning()))
 
 
 def check_p1_6(app):
-    C.title("P1-6 图标线程重启不阻塞 UI")
+    C.title("P1-6 / B4 图标提交通道：不阻塞 UI、单线程、最新请求覆盖")
 
-    class StubbornWorker(QtCore.QThread):
-        iconReady = QtCore.pyqtSignal(QtGui.QPixmap, bytes)
-        failed = QtCore.pyqtSignal(str)
+    calls = []
+    original_extract = m.IconWorker._extract
 
-        def __init__(self, apk_path, icon_path, parent=None):
-            super().__init__(parent)
+    def slow_extract(self, apk_path, icon_path):
+        calls.append(icon_path)
+        time.sleep(0.2)
+        return QtGui.QPixmap(4, 4), icon_path.encode()
 
-        def run(self):
-            time.sleep(2.5)   # 模拟卡在 aapt2 子进程、无法响应中断
-
-    original = m.IconWorker
-    m.IconWorker = StubbornWorker
+    m.IconWorker._extract = slow_extract
     try:
         win = m.MainWindow()
-        t0 = time.time(); win._start_icon_worker("a.apk", "res/a.xml"); first = time.time() - t0
-        consume_events(app, 0.15)
-        t0 = time.time(); win._start_icon_worker("b.apk", "res/b.xml"); second = time.time() - t0
-        C.check("旧线程仍在运行时启动新线程不阻塞", max(first, second) < 0.2,
-                "首次=%.4fs 二次=%.4fs" % (first, second))
-        C.check("运行中的线程仍持有引用（防 QThread 被 GC）", len(win._icon_workers) >= 2,
-                "引用数=%d" % len(win._icon_workers))
-        wait_for(app, lambda: all(not t.isRunning() for t in win._icon_workers), timeout=10)
-        win._prune_workers()
-        C.check("线程结束后被回收", len(win._icon_workers) == 0)
+        t0 = time.time()
+        win._start_icon_worker("a.apk", "res/A.xml")     # 先让它真的开始
+        time.sleep(0.05)
+        for name in ("B", "C", "D", "E"):
+            win._start_icon_worker("a.apk", "res/%s.xml" % name)
+            time.sleep(0.05)
+        for i in range(20):
+            win._start_icon_worker("a.apk", "res/F%d.xml" % i)
+        ui_elapsed = time.time() - t0 - 0.25             # 扣掉测试自身的 sleep
+        C.check("25 次请求不阻塞 UI 线程", ui_elapsed < 0.2, "UI 侧耗时=%.4fs" % ui_elapsed)
+        C.check("只创建一个常驻图标线程", win._icon_worker is not None and win._icon_worker.isRunning(),
+                "线程对象=1")
+        C.check("中间请求被覆盖跳过（执行次数远小于请求数）", len(calls) <= 3,
+                "实际执行 %d 次: %s" % (len(calls), calls))
+
+        ok = wait_for(app, lambda: bool(win._current_icon_bytes), timeout=5)
+        C.check("最终显示最新请求的结果", ok and win._current_icon_bytes == b"res/F19.xml",
+                "%r" % win._current_icon_bytes)
+
+        win.on_icon_loaded(QtGui.QPixmap(4, 4), b"stale", win._icon_gen - 1)
+        consume_events(app, 0.05)
+        C.check("过期代数结果被丢弃", win._current_icon_bytes == b"res/F19.xml")
+
         win.close()
+        C.check("关窗后常驻线程退出", win.shutdown_background(5000))
     finally:
-        m.IconWorker = original
+        m.IconWorker._extract = original_extract
 
 
 def check_p1_7(app):
@@ -465,7 +503,7 @@ def check_p1_7(app):
     if not apks:
         C.check("样本 APK 可用", False, "testSample 为空")
         return
-    target = next((a for a in apks if "TS_3.0.3" in os.path.basename(a)), apks[0])
+    target = pick_apk(apks)
     win = m.MainWindow()
     win.apk_path_edit.clear()             # 输入框故意留空
     win.process_apk(target)
@@ -609,9 +647,10 @@ def check_p2_11():
     apks = sample_apks()
     if not apks:
         return
-    apk = next((a for a in apks if "TS_3.0.3" in os.path.basename(a)), apks[0])
+    apk = pick_apk(apks)
 
     shutil.rmtree(disk_dir, ignore_errors=True)
+    os.makedirs(disk_dir, exist_ok=True)   # 清空内容但保留目录（缓存对象持有该路径）
     cold = _run_child(apk)
     warm = _run_child(apk)
     C.check("冷磁盘：需要启动 aapt2 子进程", cold > 0, "子进程=%d" % cold)
@@ -658,6 +697,188 @@ def check_p2_12():
     arr = np.asarray(src.resize((32, 32), Image.LANCZOS), dtype=int)
     C.check("透明白底缩放后边缘无白边", int(arr[:, :, 1].max()) == 0,
             "G 通道最大值=%d" % int(arr[:, :, 1].max()))
+
+
+A1_CHILD = r'''
+import os, sys
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+sys.path.insert(0, sys.argv[1])
+import main as m
+from PyQt6 import QtCore, QtWidgets
+app = QtWidgets.QApplication(sys.argv[:1])
+m.install_excepthook()
+class Boom(QtCore.QThread):
+    def run(self):
+        raise RuntimeError("boom-in-thread")
+_keep = Boom(); _keep.start()
+QtCore.QTimer.singleShot(1200, app.quit)
+app.exec()
+print("SURVIVED")
+'''
+
+
+def check_a1(app):
+    C.title("A1 异常钩子线程安全（不跨线程操作控件）")
+    codes = []
+    for _ in range(3):
+        p = subprocess.run([sys.executable, "-c", A1_CHILD, REPO],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        codes.append((p.returncode, "SURVIVED" in (p.stdout or "")))
+    surv = sum(1 for _, ok in codes if ok)
+    C.check("子线程未捕获异常时进程存活", surv == len(codes),
+            "存活 %d/%d（修复前 1/6，实测退出码 %s）" % (
+                surv, len(codes), ["0x%08X" % (c & 0xFFFFFFFF) for c, _ in codes]))
+
+    C.check("_on_gui_thread 在 GUI 线程返回 True", m._on_gui_thread())
+    off_thread = []
+    threading.Thread(target=lambda: off_thread.append(m._on_gui_thread())).start()
+    time.sleep(0.2)
+    C.check("_on_gui_thread 在子线程返回 False", off_thread == [False], "%r" % off_thread)
+
+    shown = []
+    original = QtWidgets.QMessageBox.critical
+    QtWidgets.QMessageBox.critical = staticmethod(
+        lambda *a, **k: shown.append(QtCore.QThread.currentThread() is app.thread()))
+    try:
+        m.install_excepthook()
+        C.check("钩子已安装且提示器在 GUI 线程创建", m._error_dialog is not None)
+        sys.excepthook(RuntimeError, RuntimeError("gui-boom"), None)
+        C.check("GUI 线程触发时立即弹窗", shown == [True], "弹窗=%r" % shown)
+
+        shown.clear()
+        t = threading.Thread(target=lambda: sys.excepthook(
+            RuntimeError, RuntimeError("worker-boom"), None))
+        t.start()
+        t.join()
+        C.check("子线程触发时不跨线程弹窗", shown == [], "当场弹窗=%r" % shown)
+        consume_events(app, 0.4)
+        C.check("异常经队列投递后在 GUI 线程弹出一次", shown == [True], "弹窗=%r" % shown)
+    finally:
+        QtWidgets.QMessageBox.critical = staticmethod(original)
+        sys.excepthook = sys.__excepthook__
+
+
+def check_b1(app):
+    C.title("B1 非 vector 图标层回退到位图")
+    fake_bitmap = ('N: android=http://schemas.android.com/apk/res/android (line=1)\n'
+                   '  E: bitmap (line=2)\n'
+                   '    A: http://schemas.android.com/apk/res/android:src(0x0101019a)=@0x7f080001\n')
+    saved = m.run_aapt2_dump_xmltree
+    m.run_aapt2_dump_xmltree = lambda apk, p, _t=fake_bitmap: _t
+    try:
+        unwrapped = m._resolve_xml_wrapper("x.apk", "", "res/x.xml", 0, None)
+        raster = m.rasterize_vector_layer("x.apk", "res/x.xml", 128, "", None)
+    finally:
+        m.run_aapt2_dump_xmltree = saved
+    C.check("<bitmap> 根既不能解引用也不能栅格化（复现失败条件）",
+            unwrapped == (None, None, None) and raster is None)
+
+    apks = sample_apks()
+    target = None
+    for apk in sorted(apks, key=os.path.getsize):
+        badging = m.run_aapt2_dump_badging(apk)
+        icons = sorted(re.findall(r"application-icon-(\d+):'([^']+)'", badging),
+                       key=lambda x: -int(x[0]))
+        xml = next((p for _, p in icons if p.lower().endswith(".xml")), None)
+        if not xml:
+            continue
+        full = m.run_aapt2_dump_resource(apk)
+        idx = m._ResourceIndex(full)
+        out = m.run_aapt2_dump_xmltree(apk, xml)
+        fg = m.find_adaptive_layer_addr(out, "foreground")
+        bg = m.find_adaptive_layer_addr(out, "background")
+        if not (fg and bg):
+            continue
+        fk, _, _ = m.resolve_icon_layer(apk, full, fg, index=idx)
+        bk, _, _ = m.resolve_icon_layer(apk, full, bg, index=idx)
+        if "vector" in (fk, bk) and m.find_mipmap_fallback(full, xml, idx):
+            target = apk
+            break
+    if not target:
+        C.check("找到含 vector 层且有位图回退的样本", False, "样本不足，跳过端到端验证")
+        return
+
+    def extract(force_fail):
+        win = m.MainWindow()
+        win.apk_path_edit.setText(target)
+        saved_raster = m.rasterize_vector_layer
+        if force_fail:
+            m.rasterize_vector_layer = lambda *a, **k: None
+        try:
+            win.process_apk(target)
+            wait_for(app, lambda: bool(win._current_icon_bytes) or
+                     win.lbl_icon_hint.text() != "", timeout=60)
+            return win._current_icon_bytes or b"", win.lbl_icon_hint.text()
+        finally:
+            m.rasterize_vector_layer = saved_raster
+            win.close()
+
+    normal, _ = extract(False)
+    fallback, hint = extract(True)
+    C.check("正常路径不受影响", bool(normal), "%d 字节" % len(normal))
+    C.check("栅格化失败时改用位图回退（不再直接判失败）",
+            bool(fallback) and not hint, "%d 字节（原为失败）" % len(fallback))
+
+
+def check_b2(full_mode):
+    C.title("B2 磁盘缓存字节上限")
+    tmp = os.path.join(REPO, "_verify_cache_tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        c = m._Aapt2OutputCache(capacity=4, disk_dir=tmp, disk_limit=3,
+                                disk_max_bytes=500, disk_max_entry=100)
+        for i in range(12):
+            c.put(("key", i), "x" * 60)
+        files = os.listdir(tmp)
+        total = sum(os.path.getsize(os.path.join(tmp, f)) for f in files)
+        C.check("条目数上限生效", len(files) <= 3, "%d 条" % len(files))
+        C.check("总量上限生效", total <= 500, "%d 字节" % total)
+        c.put(("big",), "y" * 500)
+        C.check("超过单条上限的输出不落盘",
+                len(os.listdir(tmp)) == len(files) and c.get(("big",)) is not None,
+                "仍在内存层可命中")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    C.check("默认上限：单条 8MB / 总量 200MB",
+            m._Aapt2OutputCache.DISK_MAX_ENTRY == 8 * 1024 * 1024 and
+            m._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024)
+    if not full_mode:
+        return
+    disk_dir = m._aapt2_cache._disk_dir
+    apks = sample_apks()
+    if not (disk_dir and apks):
+        return
+    largest = pick_apk(apks, largest=True)
+    m.run_aapt2_dump_badging(largest)
+    m.run_aapt2_dump_resource(largest)      # 该 dump 约 36MB，应只留内存
+    files = [(os.path.getsize(os.path.join(disk_dir, f)), f) for f in os.listdir(disk_dir)]
+    biggest = max((s for s, _ in files), default=0)
+    total = sum(s for s, _ in files)
+    C.check("真实样本：单条不超过 8MB", biggest <= m._Aapt2OutputCache.DISK_MAX_ENTRY,
+            "最大 %.1f MB" % (biggest / 1048576))
+    C.check("真实样本：总量不超过 200MB", total <= m._Aapt2OutputCache.DISK_MAX_BYTES,
+            "合计 %.1f MB / %d 条" % (total / 1048576, len(files)))
+
+
+def check_b3():
+    C.title("B3 SDK 版本表读取失败不再永久缓存")
+    saved_res = m.local_resource_path
+    saved_cache = m._sdk_versions_cache
+    try:
+        m._sdk_versions_cache = None
+        m.local_resource_path = lambda p: os.path.join("__missing__", p)
+        first = dict(m.load_sdk_versions())
+        C.check("文件缺失时返回空表且不写缓存",
+                first == {} and not m._sdk_versions_cache,
+                "cache=%r" % m._sdk_versions_cache)
+        m.local_resource_path = saved_res
+        second = m.load_sdk_versions()
+        C.check("文件恢复后可重新读到（修复前永久为空）", len(second) > 0,
+                "%d 条映射" % len(second))
+    finally:
+        m.local_resource_path = saved_res
+        m._sdk_versions_cache = saved_cache
 
 
 def check_end_to_end(app, limit):
@@ -729,6 +950,10 @@ def main():
     if not args.quick:
         check_p2_11()
     check_p2_12()
+    check_a1(app)
+    check_b1(app)
+    check_b2(not args.quick)
+    check_b3()
     if not args.quick:
         check_end_to_end(app, args.samples or None)
 
