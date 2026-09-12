@@ -35,6 +35,58 @@ class Aapt2Error(RuntimeError):
     """aapt2 执行失败（非零退出），message 为解码后的 stderr/stdout 文本。"""
 
 
+# 单个 aapt2 子进程的最长运行时间（秒）：异常的 APK 不应让工作线程永久阻塞
+_AAPT2_TIMEOUT = 60
+# 关闭窗口时等待后台线程收尾的时间（毫秒）
+_CLOSE_WAIT_MS = 5000
+
+# 正在运行的 aapt2 子进程句柄：关闭窗口时用于强制结束，
+# 这样工作线程能自己返回，无需（也不该）使用 QThread.terminate()
+_running_procs = set()
+_running_procs_lock = threading.Lock()
+
+
+def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT):
+    """运行 aapt2 子进程，返回 (returncode, stdout, stderr)。
+
+    与 subprocess.run 的区别：
+    - 带 timeout：超时先 kill 再抛 Aapt2Error；
+    - 运行期间把 Popen 登记到 _running_procs，便于关闭窗口时统一结束。
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=_SUBPROCESS_FLAGS,
+        )
+    except OSError as e:
+        raise Aapt2Error(f"无法启动 aapt2：{e}")
+
+    with _running_procs_lock:
+        _running_procs.add(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise Aapt2Error(f"aapt2 执行超时（超过 {timeout}s），已终止子进程")
+        return proc.returncode, out, err
+    finally:
+        with _running_procs_lock:
+            _running_procs.discard(proc)
+
+
+def kill_running_aapt2():
+    """强制结束所有仍在运行的 aapt2 子进程（关闭窗口/退出时调用）。"""
+    with _running_procs_lock:
+        procs = list(_running_procs)
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:  # 进程可能已经退出
+            pass
+
+
 def _decode_output(data: bytes) -> str:
     """按严格优先级解码 aapt2 输出：utf-8-sig → gbk → cp936，最后宽松兜底。
 
@@ -161,14 +213,12 @@ def run_aapt2_dump_badging(apk_path: str) -> str:
     if cached is not None:
         return cached
 
-    proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS
-    )
-    if proc.returncode != 0:
-        err = (_decode_output(proc.stderr or proc.stdout)).strip() or f"aapt2 退出码 {proc.returncode}"
-        raise Aapt2Error(err)
+    rc, out, err = _run_aapt2(cmd)
+    if rc != 0:
+        msg = (_decode_output(err or out)).strip() or f"aapt2 退出码 {rc}"
+        raise Aapt2Error(msg)
 
-    text = _decode_output(proc.stdout)
+    text = _decode_output(out)
     _aapt2_cache.put(key, text)
     return text
 
@@ -190,12 +240,15 @@ def run_aapt2_dump_resource(apk_path: str) -> str:
     if cached is not None:
         return cached
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS)
-    if proc.returncode != 0:
+    try:
+        rc, out, err = _run_aapt2(cmd)
+    except Aapt2Error as e:
         # 图标链路保持宽松：dump 失败时返回错误文本，由上层走位图回退
-        return _decode_output(proc.stderr or proc.stdout)
+        return str(e)
+    if rc != 0:
+        return _decode_output(err or out)
 
-    text = _decode_output(proc.stdout)
+    text = _decode_output(out)
     _aapt2_cache.put(key, text)
     return text
 
@@ -279,14 +332,15 @@ def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str) -> str:
     if cached is not None:
         return cached
 
-    proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_SUBPROCESS_FLAGS
-    )
-    if proc.returncode != 0:
+    try:
+        rc, out, err = _run_aapt2(cmd)
+    except Aapt2Error as e:
         # 图标链路保持宽松：dump 失败时返回错误文本，由上层走位图回退
-        return _decode_output(proc.stderr or proc.stdout)
+        return str(e)
+    if rc != 0:
+        return _decode_output(err or out)
 
-    text = _decode_output(proc.stdout)
+    text = _decode_output(out)
     _aapt2_cache.put(key, text)
     return text
 
@@ -1980,17 +2034,35 @@ class MainWindow(QtWidgets.QWidget):
         worker.start()
 
     def closeEvent(self, event):
-        """关闭窗口前停止并等待所有后台线程，避免 QThread 运行中被销毁。"""
+        """关闭窗口前取消后台线程，并强制结束卡住的 aapt2 子进程。
+
+        不使用 QThread.terminate()：Qt 明确说明它不安全（可能死锁或崩溃）。
+        这里先 kill 子进程，工作线程会立刻从 aapt2 调用返回并在下一个
+        取消检查点退出，因此只需有界等待。
+        """
         threads = self._apk_workers + self._icon_workers
         for t in threads:
             if t.isRunning():
                 t.requestInterruption()
+        kill_running_aapt2()
         for t in threads:
-            if not t.wait(8000):
-                # aapt2 子进程阻塞时的兜底：应用即将退出，强制结束线程
-                t.terminate()
-                t.wait(2000)
+            if t.isRunning() and not t.wait(_CLOSE_WAIT_MS):
+                logging.warning("后台线程未在 %d ms 内结束，交由退出流程收尾", _CLOSE_WAIT_MS)
         event.accept()
+
+    def shutdown_background(self, timeout_ms: int = 10000) -> bool:
+        """退出前等待后台线程真正结束。
+
+        QThread 在运行中被析构会让进程崩溃，因此事件循环结束后仍要确认。
+        返回是否全部结束。
+        """
+        kill_running_aapt2()
+        all_done = True
+        for t in self._apk_workers + self._icon_workers:
+            if t.isRunning() and not t.wait(timeout_ms):
+                logging.warning("后台线程仍在运行，等待超时: %s", t)
+                all_done = False
+        return all_done
 
     def on_apk_info_ready(self, output: str):
         try:
@@ -2280,7 +2352,10 @@ def main():
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    # 事件循环结束后必须确认后台线程已退出：QThread 运行中被析构会让进程崩溃
+    w.shutdown_background()
+    sys.exit(code)
 
 
 if __name__ == "__main__":
