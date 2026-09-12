@@ -4,6 +4,7 @@ import sys
 import re
 import io
 import math
+import hashlib
 import tempfile
 import shutil
 import subprocess
@@ -105,39 +106,128 @@ def _decode_output(data: bytes) -> str:
 
 
 class _Aapt2OutputCache:
-    """按 (apk 路径, mtime_ns, 子命令, 参数) 缓存 aapt2 dump 输出。
+    """按 (apk 路径, mtime_ns, 文件大小, 子命令, 参数) 缓存 aapt2 dump 输出。
 
     图标解析链路会对同一 APK 反复执行 dump（每个 XML 层一次 xmltree、
     full_res 缺省时多次 resources），缓存可避免重复起子进程。
-    键含 mtime，APK 被替换后自动失效；有界容量 + 线程锁。
+    键含 mtime 与大小，APK 被替换后自动失效；有界容量 + 线程锁。
+
+    另有可选的磁盘层：让"重新解析/再次打开同一个 APK"在**新进程**里也
+    不必重跑 aapt2（实测 Play 商店包单次 dump xmltree 约 2.5s）。磁盘条目
+    的键同样包含 mtime_ns 与文件大小，不会读到过期内容；写入用临时文件 +
+    os.replace，保证并发下不会读到半个文件。
     """
 
-    def __init__(self, capacity=32):
+    def __init__(self, capacity=64, disk_dir=None, disk_limit=300):
         self._capacity = capacity
         self._cache = {}
         self._order = []
         self._lock = threading.Lock()
+        self._disk_dir = disk_dir
+        self._disk_limit = disk_limit
+        if self._disk_dir:
+            try:
+                os.makedirs(self._disk_dir, exist_ok=True)
+            except OSError:
+                self._disk_dir = None  # 目录不可用时静默退回纯内存缓存
 
+    # ---------------- 内存层 ----------------
     def get(self, key):
         with self._lock:
-            return self._cache.get(key)
+            if key in self._cache:
+                return self._cache[key]
+        text = self._disk_get(key)
+        if text is not None:
+            with self._lock:
+                self._remember(key, text)
+        return text
 
     def put(self, key, value):
         with self._lock:
-            if key not in self._cache:
-                self._order.append(key)
-            self._cache[key] = value
-            while len(self._order) > self._capacity:
-                old = self._order.pop(0)
-                self._cache.pop(old, None)
+            self._remember(key, value)
+        self._disk_put(key, value)
+
+    def clear(self):
+        """清空内存层（磁盘层保留，测试与调优用）。"""
+        with self._lock:
+            self._cache.clear()
+            del self._order[:]
+
+    def _remember(self, key, value):
+        """写入内存层（调用方需持有 _lock）。"""
+        if key not in self._cache:
+            self._order.append(key)
+        self._cache[key] = value
+        while len(self._order) > self._capacity:
+            self._cache.pop(self._order.pop(0), None)
+
+    # ---------------- 磁盘层 ----------------
+    def _disk_path(self, key):
+        name = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()
+        return os.path.join(self._disk_dir, name + ".txt")
+
+    def _disk_get(self, key):
+        if not self._disk_dir:
+            return None
+        try:
+            with open(self._disk_path(key), "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _disk_put(self, key, value):
+        if not self._disk_dir:
+            return
+        path = self._disk_path(key)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(value)
+            os.replace(tmp, path)  # 原子替换，避免并发读到半个文件
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return
+        self._prune_disk()
+
+    def _prune_disk(self):
+        """条目数超限时按 mtime 删除最旧的文件。"""
+        try:
+            names = os.listdir(self._disk_dir)
+        except OSError:
+            return
+        if len(names) <= self._disk_limit:
+            return
+        entries = []
+        for n in names:
+            p = os.path.join(self._disk_dir, n)
+            try:
+                entries.append((os.path.getmtime(p), p))
+            except OSError:
+                continue
+        entries.sort()
+        for _, p in entries[:len(entries) - self._disk_limit]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
-_aapt2_cache = _Aapt2OutputCache()
+def _default_disk_cache_dir():
+    """磁盘缓存目录；设置 WINAPKINFO_NO_DISK_CACHE=1 可禁用。"""
+    if os.environ.get("WINAPKINFO_NO_DISK_CACHE"):
+        return None
+    return os.path.join(tempfile.gettempdir(), "winapk_info_cache")
+
+
+_aapt2_cache = _Aapt2OutputCache(disk_dir=_default_disk_cache_dir())
 
 
 def _aapt2_cache_key(apk_path: str, kind: str, arg=None):
-    mtime = os.stat(apk_path).st_mtime_ns
-    return (os.path.abspath(apk_path), mtime, kind, arg)
+    st = os.stat(apk_path)
+    return (os.path.abspath(apk_path), st.st_mtime_ns, st.st_size, kind, arg)
 
 
 def local_resource_path(relative_path):
