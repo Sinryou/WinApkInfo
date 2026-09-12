@@ -2459,22 +2459,63 @@ class MainWindow(QtWidgets.QWidget):
             "Copyright (c) 2025-2026 Sinryou.<br>At MIT License."
         )
 
+class _ErrorDialog(QtCore.QObject):
+    """把非 GUI 线程的未捕获异常投递到 GUI 线程弹窗。
+
+    必须先在 GUI 线程构造，signal/slot 的队列连接才会把槽函数派发回 GUI
+    线程；否则等于在子线程里操作控件。
+    """
+
+    requested = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.requested.connect(self._show, QtCore.Qt.ConnectionType.QueuedConnection)
+
+    @QtCore.pyqtSlot(str)
+    def _show(self, text: str):
+        QtWidgets.QMessageBox.critical(None, "未预期的错误", text)
+
+
+# 在 GUI 线程创建的异常提示器（见 install_excepthook），模块级引用防止被回收
+_error_dialog = None
+
+
+def _on_gui_thread() -> bool:
+    """当前线程是否 Qt GUI 线程（控件只能在 GUI 线程上使用）。"""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return False
+    return QtCore.QThread.currentThread() is app.thread()
+
+
 def install_excepthook():
     """安装全局异常钩子，避免未捕获异常让进程"静默消失"。
 
     PyQt6 在 slot 里抛出未捕获的 Python 异常时会调用 qFatal() 直接结束
     进程；打包配置是 console=False，用户既看不到 traceback 也看不到提示。
     这里把异常写进日志并弹窗，作为各 slot 自身 try/except 之外的兜底。
+
+    sys.excepthook 运行在**抛出异常的那个线程**里，而 QMessageBox 只能在
+    GUI 线程使用：实测在子线程直接弹窗会以 0xC0000005（访问违例）崩溃，
+    只写日志的钩子则能让进程正常存活。因此非 GUI 线程只记日志，GUI 线程
+    才直接弹窗；有 QApplication 时子线程的异常经队列投递回主线程再提示。
     """
+    global _error_dialog
+    if _error_dialog is None and QtWidgets.QApplication.instance() is not None:
+        _error_dialog = _ErrorDialog()
+
     def _hook(exc_type, exc, tb):
         logging.critical("未捕获异常", exc_info=(exc_type, exc, tb))
-        try:
-            QtWidgets.QMessageBox.critical(
-                None, "未预期的错误",
-                f"{exc_type.__name__}: {exc}\n\n详细信息见日志文件。",
-            )
-        except Exception:
-            pass
+        text = f"{exc_type.__name__}: {exc}\n\n详细信息见日志文件。"
+        if _on_gui_thread():
+            try:
+                QtWidgets.QMessageBox.critical(None, "未预期的错误", text)
+            except Exception:
+                pass
+        elif _error_dialog is not None:
+            # 队列连接：真正的弹窗发生在 GUI 线程，这里只投递
+            _error_dialog.requested.emit(text)
 
     sys.excepthook = _hook
 
@@ -2493,9 +2534,9 @@ def main():
     # 高分屏适配：Qt6 默认启用 high-DPI 缩放（AA_EnableHighDpiScaling /
     # AA_UseHighDpiPixmaps 已废弃），无需再设置任何属性。
 
-    install_excepthook()
-
     app = QtWidgets.QApplication(sys.argv)
+    # 必须在 QApplication 之后：钩子要用主线程创建的提示器做跨线程投递
+    install_excepthook()
     # app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }"
     # "QGroupBox { font-size: 16px; font-family: Microsoft Yahei; }")
     app.setStyle("Fusion")
