@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """WinApkInfo 修复验证脚本。
 
-用法（在仓库根目录）：
-    .venv\\Scripts\\python.exe verify_fixes.py            # 完整验证（含真实 APK 端到端）
-    .venv\\Scripts\\python.exe verify_fixes.py --quick    # 只跑合成用例，不碰 testSample
-    .venv\\Scripts\\python.exe verify_fixes.py --samples 3  # 端到端最多测 3 个样本 APK
+用法（在仓库根目录，使用系统 Python）：
+    python verify_fixes.py              # 完整验证（含真实 APK 端到端）
+    python verify_fixes.py --quick      # 只跑合成用例，不碰 testSample
+    python verify_fixes.py --samples 3  # 端到端最多测 3 个样本 APK
 
 覆盖范围（与提交一一对应）：
     P0-1  fillType 枚举（evenOdd 生效）
