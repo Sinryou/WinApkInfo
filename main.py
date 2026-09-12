@@ -10,6 +10,7 @@ import subprocess
 import json
 import logging
 import threading
+import functools
 from pathlib import Path
 import zipfile
 from PIL import Image, ImageChops, ImageDraw
@@ -182,15 +183,22 @@ def load_sdk_versions():
         _sdk_versions_cache = sdk_map
     return sdk_map
 
+@functools.lru_cache(maxsize=1)
 def find_aapt2() -> str:
     """
     优先在脚本同级目录查找 aapt2 / aapt2.exe；否则使用系统 PATH 中的 aapt2。
     找不到则抛出 FileNotFoundError。
+
+    结果用 lru_cache 缓存：一次图标提取可能发起多次 dump，每次都重新探测
+    候选文件并搜索 PATH 属于纯浪费（抛出的异常不会被缓存，装好 aapt2 后
+    仍可重新探测）。
     """
     here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # 支持 PyInstaller
     candidates = [here / "aapt2", here / "aapt2.exe", here / "tools" / "aapt2.exe"]
     for c in candidates:
-        if c.exists() and os.access(str(c), os.X_OK):
+        # 必须要求是文件：Windows 上 os.X_OK 对已存在的路径恒为真，
+        # 同名目录会被误当成可执行文件。
+        if c.is_file() and os.access(str(c), os.X_OK):
             return str(c)
 
     sys_aapt2 = shutil.which("aapt2")
