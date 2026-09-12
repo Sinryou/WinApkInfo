@@ -1853,14 +1853,22 @@ class IconWorker(QtCore.QThread):
             bg_kind, bg_val, _bg_scale = resolve_icon_layer(self.apk_path, full_res, bg_addr, index=index)
             self._check_cancel()
             if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
-                return extract_icon_bytes(
-                    self.apk_path,
-                    {"type": fg_kind, "value": fg_val},
-                    {"type": bg_kind, "value": bg_val},
-                    fg_scale=fg_scale,
-                    full_res=full_res,
-                    index=index,
-                )
+                try:
+                    return extract_icon_bytes(
+                        self.apk_path,
+                        {"type": fg_kind, "value": fg_val},
+                        {"type": bg_kind, "value": bg_val},
+                        fg_scale=fg_scale,
+                        full_res=full_res,
+                        index=index,
+                    )
+                except _Cancelled:
+                    raise
+                except Exception as e:
+                    # 层解析成功不代表能渲染：前景/背景可能是 <bitmap>、<shape>、
+                    # <animated-vector> 或 res/color 状态列表等根节点，栅格化会失败。
+                    # 这种情况下继续走下面的位图回退，而不是把整个图标判为失败。
+                    logging.warning("合成自适应图标失败，改用位图回退: %s", e)
 
         # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
         self._check_cancel()
