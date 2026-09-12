@@ -1848,18 +1848,67 @@ class _Cancelled(Exception):
 
 
 class IconWorker(QtCore.QThread):
-    # 注意：不要命名为 finished——会遮蔽 QThread 内建 finished 信号，
-    # 破坏 thread.finished.connect(deleteLater) 等惯用法。
-    iconReady = QtCore.pyqtSignal(QtGui.QPixmap, bytes)  # 成功时发射（字节流供导出）
-    failed = QtCore.pyqtSignal(str)  # 提取失败时发出，供 UI 可见提示
+    """常驻的图标提取线程：只保留「最新一次请求」，旧请求自动作废。
 
-    def __init__(self, apk_path, icon_path, parent=None):
+    旧实现每次都新建 QThread 并 requestInterruption 旧线程，虽然结果有代数
+    保护，但快速连续解析时线程与 aapt2 子进程会堆积（实测连续 20 次请求
+    = 20 个线程同时在跑）。改为单线程 + 最新请求覆盖：
+
+    - request() 由 UI 线程调用：写入待处理请求并唤醒工作线程，返回代数；
+    - 工作线程每轮取走请求；运行期间通过 _check_cancel() 检测到有更新请求
+      （或已请求停止）就抛 _Cancelled 提前放弃，再取最新请求；
+    - 只有仍是当前代数的结果才会 emit，UI 侧再用 _icon_gen 做一次投递延迟
+      校验（信号排队期间可能又来了新请求）。
+
+    注意：不要命名为 finished——会遮蔽 QThread 内建 finished 信号，
+    破坏 thread.finished.connect(deleteLater) 等惯用法。
+    """
+    iconReady = QtCore.pyqtSignal(QtGui.QPixmap, bytes, int)  # 成功（字节流供导出）
+    failed = QtCore.pyqtSignal(str, int)  # 提取失败时发出，供 UI 可见提示
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.apk_path = apk_path
-        self.icon_path = icon_path
+        self._cond = threading.Condition()
+        self._pending = None      # (apk_path, icon_path, gen)
+        self._gen = 0             # 最新请求代数
+        self._current_gen = 0     # 正在处理的代数
+        self._stopping = False
+
+    # ---------------- UI 线程接口 ----------------
+    def request(self, apk_path: str, icon_path: str) -> int:
+        """登记一次提取请求（覆盖尚未开始的旧请求），返回本次代数。"""
+        with self._cond:
+            self._gen += 1
+            self._pending = (apk_path, icon_path, self._gen)
+            self._cond.notify_all()
+            return self._gen
+
+    def stop(self):
+        """请求工作线程结束（关闭窗口时调用）。"""
+        with self._cond:
+            self._stopping = True
+            self._pending = None
+            self._cond.notify_all()
+
+    # ---------------- 工作线程 ----------------
+    def _take_pending(self):
+        """取走待处理请求；返回 None 表示应退出线程。"""
+        with self._cond:
+            while not self._stopping and self._pending is None:
+                self._cond.wait(0.5)
+            if self._stopping:
+                return None
+            item, self._pending = self._pending, None
+            self._current_gen = item[2]
+            return item
+
+    def _is_stale(self, gen: int) -> bool:
+        with self._cond:
+            return self._stopping or gen != self._gen
 
     def _check_cancel(self):
-        if self.isInterruptionRequested():
+        """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
+        if self._is_stale(self._current_gen):
             raise _Cancelled
 
     @staticmethod
@@ -1875,7 +1924,7 @@ class IconWorker(QtCore.QThread):
         except Exception:
             return False
 
-    def _extract_adaptive_icon(self) -> bytes:
+    def _extract_adaptive_icon(self, apk_path: str, icon_path: str) -> bytes:
         """
         自适应图标（.xml）提取：
         1) 从 xmltree 解析 foreground/background 资源地址，完整解析每一层
@@ -1888,7 +1937,7 @@ class IconWorker(QtCore.QThread):
         就 dump，非自适应图标也白白跑一次全量输出）。
         """
         self._check_cancel()
-        xml_out = run_aapt2_dump_xmltree(self.apk_path, self.icon_path)
+        xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
 
         fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
         bg_addr = find_adaptive_layer_addr(xml_out, "background")
@@ -1896,17 +1945,17 @@ class IconWorker(QtCore.QThread):
         full_res = None
         index = None
         if fg_addr and bg_addr:
-            full_res = run_aapt2_dump_resource(self.apk_path)
+            full_res = run_aapt2_dump_resource(apk_path)
             self._check_cancel()
             # 一次性索引全量输出，后续所有资源条目查询 O(1)
             index = _ResourceIndex(full_res)
-            fg_kind, fg_val, fg_scale = resolve_icon_layer(self.apk_path, full_res, fg_addr, index=index)
-            bg_kind, bg_val, _bg_scale = resolve_icon_layer(self.apk_path, full_res, bg_addr, index=index)
+            fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index)
+            bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index)
             self._check_cancel()
             if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
                 try:
                     return extract_icon_bytes(
-                        self.apk_path,
+                        apk_path,
                         {"type": fg_kind, "value": fg_val},
                         {"type": bg_kind, "value": bg_val},
                         fg_scale=fg_scale,
@@ -1924,12 +1973,12 @@ class IconWorker(QtCore.QThread):
         # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
         self._check_cancel()
         if full_res is None:
-            full_res = run_aapt2_dump_resource(self.apk_path)
+            full_res = run_aapt2_dump_resource(apk_path)
             self._check_cancel()
             index = _ResourceIndex(full_res)
-        fallback = find_mipmap_fallback(full_res, self.icon_path, index)
+        fallback = find_mipmap_fallback(full_res, icon_path, index)
         if fallback:
-            with zipfile.ZipFile(self.apk_path, "r") as zf:
+            with zipfile.ZipFile(apk_path, "r") as zf:
                 img = Image.open(zf.open(fallback)).convert("RGBA")
             img = img.resize((512, 512), Image.LANCZOS)
             buf = io.BytesIO()
@@ -1937,34 +1986,45 @@ class IconWorker(QtCore.QThread):
             return buf.getvalue()
         return b""
 
-    def run(self):
+    def _extract(self, apk_path: str, icon_path: str):
+        """执行一次提取，返回 (QPixmap, 原始 PNG 字节)。"""
         pix = QtGui.QPixmap()
         data = b""
-        try:
-            self._check_cancel()
-            if self.icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                with zipfile.ZipFile(self.apk_path, "r") as zf:
-                    data = zf.open(self.icon_path).read()
-                if not self._load_pixmap(pix, data):
-                    raise ValueError(f"图标文件无法解码为图片: {self.icon_path}")
+        if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+            with zipfile.ZipFile(apk_path, "r") as zf:
+                data = zf.open(icon_path).read()
+            if not self._load_pixmap(pix, data):
+                raise ValueError(f"图标文件无法解码为图片: {icon_path}")
 
-            elif self.icon_path.lower().endswith('.xml'):
-                data = self._extract_adaptive_icon()
-                if not data:
-                    raise ValueError("自适应图标前景/背景为纯矢量，且未找到位图回退图标")
-                if not self._load_pixmap(pix, data):
-                    raise ValueError("合成后的图标无法解码为图片")
-            else:
-                raise ValueError(f"不支持的图标类型: {self.icon_path}")
+        elif icon_path.lower().endswith('.xml'):
+            data = self._extract_adaptive_icon(apk_path, icon_path)
+            if not data:
+                raise ValueError("自适应图标前景/背景为纯矢量，且未找到位图回退图标")
+            if not self._load_pixmap(pix, data):
+                raise ValueError("合成后的图标无法解码为图片")
+        else:
+            raise ValueError(f"不支持的图标类型: {icon_path}")
+        return pix, data
 
-        except _Cancelled:
-            return  # 用户取消/窗口关闭：静默退出，不覆盖 UI 状态
-        except Exception as e:
-            logging.exception("子线程提取图标失败: %s", e)
-            self.failed.emit(str(e))
-            return  # 失败后不再 emit iconReady，避免清掉 failed 设置的提示
-
-        self.iconReady.emit(pix, data)
+    def run(self):
+        """工作线程主循环：不断取最新请求执行，直到 stop()。"""
+        while True:
+            item = self._take_pending()
+            if item is None:
+                return
+            apk_path, icon_path, gen = item
+            try:
+                self._check_cancel()
+                pix, data = self._extract(apk_path, icon_path)
+            except _Cancelled:
+                continue  # 已有更新的请求（或窗口关闭）：丢弃这次结果
+            except Exception as e:
+                logging.exception("子线程提取图标失败: %s", e)
+                if not self._is_stale(gen):
+                    self.failed.emit(str(e), gen)
+                continue
+            if not self._is_stale(gen):
+                self.iconReady.emit(pix, data, gen)
 
 class ApkInfoWorker(QtCore.QThread):
     """后台线程：运行 aapt2 dump badging，避免阻塞 UI"""
@@ -2028,8 +2088,9 @@ class MainWindow(QtWidgets.QWidget):
         # 线程对象必须长期持有引用：若线程仍在运行时 Python 引用被替换/回收，
         # PyQt 会在 QThread 析构时报 "QThread: Destroyed while thread is still running"。
         self._apk_workers = []
-        self._icon_workers = []
-        self._icon_gen = 0  # 图标提取代数，用于丢弃过期结果
+        # 图标提取是常驻线程（单线程 + 最新请求覆盖），首次使用时创建
+        self._icon_worker = None
+        self._icon_gen = 0  # 最近一次图标请求的代数，用于丢弃延迟投递的旧结果
         self.setup_ui()
 
     def setup_ui(self):
@@ -2202,31 +2263,29 @@ class MainWindow(QtWidgets.QWidget):
             self.unsetCursor()
 
     def _prune_workers(self):
-        """清理已结束的线程对象；运行中的保留引用，防止 QThread 被 GC 时崩溃。"""
-        for lst in (self._apk_workers, self._icon_workers):
-            for t in [t for t in lst if not t.isRunning()]:
-                t.deleteLater()
-                lst.remove(t)
+        """清理已结束的解析线程对象；运行中的保留引用，防止 QThread 被 GC 时崩溃。"""
+        for t in [t for t in self._apk_workers if not t.isRunning()]:
+            t.deleteLater()
+            self._apk_workers.remove(t)
 
     def _start_icon_worker(self, apk_path: str, icon_path: str):
-        """启动图标提取线程；旧线程只请求中断，不在 UI 线程里等待。
+        """把图标提取请求交给常驻线程，最新请求覆盖旧请求。
 
-        过期结果由 _icon_gen 代数丢弃，因此无需等待旧线程结束：旧实现会在
-        UI 线程 wait(5000)，连续拖入 APK 时界面最多卡 5 秒。
-        运行中的旧线程仍被 _icon_workers 持有引用，结束后由 _prune_workers 回收。
+        单线程 + 代数丢弃：连续解析多个 APK 时不会堆积线程与 aapt2 子进程，
+        UI 线程也不做任何等待（旧实现最多 wait(5000) 卡 5 秒，后来的实现则是
+        每请求起一个线程）。
         """
-        for t in self._icon_workers:
-            if t.isRunning():
-                t.requestInterruption()
-        self._prune_workers()
+        if self._icon_worker is None:
+            self._icon_worker = IconWorker()
+            self._icon_worker.iconReady.connect(self.on_icon_loaded)
+            self._icon_worker.failed.connect(self.on_icon_failed)
+            self._icon_worker.start()
+        self._icon_gen = self._icon_worker.request(apk_path, icon_path)
 
-        self._icon_gen += 1
-        gen = self._icon_gen
-        worker = IconWorker(apk_path, icon_path)
-        self._icon_workers.append(worker)
-        worker.iconReady.connect(lambda pix, data, g=gen: self.on_icon_loaded(pix, data, g))
-        worker.failed.connect(lambda msg, g=gen: self.on_icon_failed(msg, g))
-        worker.start()
+    def _stop_icon_worker(self):
+        """请求常驻图标线程结束（关闭窗口/退出时调用）。"""
+        if self._icon_worker is not None:
+            self._icon_worker.stop()
 
     def closeEvent(self, event):
         """关闭窗口前取消后台线程，并强制结束卡住的 aapt2 子进程。
@@ -2235,12 +2294,14 @@ class MainWindow(QtWidgets.QWidget):
         这里先 kill 子进程，工作线程会立刻从 aapt2 调用返回并在下一个
         取消检查点退出，因此只需有界等待。
         """
-        threads = self._apk_workers + self._icon_workers
+        self._stop_icon_worker()
+        threads = list(self._apk_workers)
         for t in threads:
             if t.isRunning():
                 t.requestInterruption()
         kill_running_aapt2()
-        for t in threads:
+        wait_list = threads + ([self._icon_worker] if self._icon_worker else [])
+        for t in wait_list:
             if t.isRunning() and not t.wait(_CLOSE_WAIT_MS):
                 logging.warning("后台线程未在 %d ms 内结束，交由退出流程收尾", _CLOSE_WAIT_MS)
         event.accept()
@@ -2251,9 +2312,10 @@ class MainWindow(QtWidgets.QWidget):
         QThread 在运行中被析构会让进程崩溃，因此事件循环结束后仍要确认。
         返回是否全部结束。
         """
+        self._stop_icon_worker()
         kill_running_aapt2()
         all_done = True
-        for t in self._apk_workers + self._icon_workers:
+        for t in self._apk_workers + ([self._icon_worker] if self._icon_worker else []):
             if t.isRunning() and not t.wait(timeout_ms):
                 logging.warning("后台线程仍在运行，等待超时: %s", t)
                 all_done = False
