@@ -998,6 +998,10 @@ def _group_matrix(tx, ty, px, py, rot_deg, sx, sy):
     return _mat_mul(Tp, _mat_mul(R, _mat_mul(S, Tm)))
 
 
+# 填充掩码分块行数：限制 (行数 × 边数) 中间矩阵的内存占用
+_MASK_CHUNK_ROWS = 128
+
+
 def _collect_edges(subpaths):
     """收集多边形边 [(x1, y1, x2, y2)]（跳过水平边）。"""
     edges = []
@@ -1058,6 +1062,10 @@ def _build_fill_mask(W, H, subpaths, fill_rule="nonzero"):
 
     numpy 可用时向量化（快一个数量级以上），否则回退 _fill_mask_py。
     扫描线判定用半开规则（y1 <= yy < y2 或 y2 <= yy < y1），与纯 Python 版一致。
+
+    按 _MASK_CHUNK_ROWS 行分块：中间矩阵规模是 (行数 × 边数)，一次对整幅图
+    做广播时，2 万条边在 1024² 画布上峰值内存接近 500MB；分块后只与当前
+    行区间相交的边参与运算，结果完全一致。
     """
     if np is None:
         mask = Image.new("L", (W, H), 0)
@@ -1078,41 +1086,52 @@ def _build_fill_mask(W, H, subpaths, fill_rule="nonzero"):
     if y_lo >= y_hi:
         return Image.fromarray(arr, "L")
 
-    ys = np.arange(y_lo, y_hi) + 0.5
-    # 每条边在每个扫描线是否相交（半开规则）
-    cross = ((y1 <= ys[:, None]) & (ys[:, None] < y2)) | ((y2 <= ys[:, None]) & (ys[:, None] < y1))
-    t = (ys[:, None] - y1[None, :]) / (y2[None, :] - y1[None, :])
-    xs = np.where(cross, x1[None, :] + t * (x2[None, :] - x1[None, :]), np.nan)
+    y_min = np.minimum(y1, y2)
+    y_max = np.maximum(y1, y2)
     wnd = np.where(y2 > y1, 1.0, -1.0)
 
-    for r in range(len(ys)):
-        row = xs[r]
-        keep = ~np.isnan(row)
-        if not keep.any():
+    for chunk_lo in range(y_lo, y_hi, _MASK_CHUNK_ROWS):
+        chunk_hi = min(chunk_lo + _MASK_CHUNK_ROWS, y_hi)
+        ys = np.arange(chunk_lo, chunk_hi) + 0.5
+        # 预筛：只有 y 区间与本块重叠的边才可能相交（宽松上界，不影响结果）
+        sel = (y_min < chunk_hi) & (y_max > chunk_lo)
+        if not sel.any():
             continue
-        row = row[keep]
-        y = y_lo + r
-        if fill_rule == "evenodd":
-            row.sort()
-            starts = row[0::2]
-            ends = row[1::2]
-        else:
-            wrow = wnd[keep]
-            order = np.argsort(row, kind="stable")
-            row = row[order]
-            acc = np.cumsum(wrow[order])
-            inside = acc != 0
-            if not inside.any():
+        bx1, bx2, by1, by2 = x1[sel], x2[sel], y1[sel], y2[sel]
+        # 每条边在每个扫描线是否相交（半开规则）
+        cross = ((by1 <= ys[:, None]) & (ys[:, None] < by2)) | ((by2 <= ys[:, None]) & (ys[:, None] < by1))
+        t = (ys[:, None] - by1[None, :]) / (by2[None, :] - by1[None, :])
+        xs = np.where(cross, bx1[None, :] + t * (bx2[None, :] - bx1[None, :]), np.nan)
+        bwnd = wnd[sel]
+
+        for r in range(len(ys)):
+            row = xs[r]
+            keep = ~np.isnan(row)
+            if not keep.any():
                 continue
-            # bool 数组直接 np.diff 得到的是异或（bool），必须转整型才能区分 +/-1
-            trans = np.diff(np.concatenate(([0], inside.astype(np.int8), [0])))
-            starts = row[np.flatnonzero(trans == 1)]
-            ends = row[np.flatnonzero(trans == -1)]
-        for a, b in zip(starts, ends):
-            ia = max(0, int(math.ceil(a - 0.5)))
-            ib = min(W, int(math.floor(b + 0.5)))
-            if ia < ib:
-                arr[y, ia:ib] = 255
+            row = row[keep]
+            y = chunk_lo + r
+            if fill_rule == "evenodd":
+                row.sort()
+                starts = row[0::2]
+                ends = row[1::2]
+            else:
+                wrow = bwnd[keep]
+                order = np.argsort(row, kind="stable")
+                row = row[order]
+                acc = np.cumsum(wrow[order])
+                inside = acc != 0
+                if not inside.any():
+                    continue
+                # bool 数组直接 np.diff 得到的是异或（bool），必须转整型才能区分 +/-1
+                trans = np.diff(np.concatenate(([0], inside.astype(np.int8), [0])))
+                starts = row[np.flatnonzero(trans == 1)]
+                ends = row[np.flatnonzero(trans == -1)]
+            for a, b in zip(starts, ends):
+                ia = max(0, int(math.ceil(a - 0.5)))
+                ib = min(W, int(math.floor(b + 0.5)))
+                if ia < ib:
+                    arr[y, ia:ib] = 255
     return Image.fromarray(arr, "L")
 
 
