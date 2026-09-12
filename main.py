@@ -2017,12 +2017,15 @@ class MainWindow(QtWidgets.QWidget):
                 lst.remove(t)
 
     def _start_icon_worker(self, apk_path: str, icon_path: str):
-        """启动图标提取线程；先取消并等待仍在运行的旧线程，避免结果乱序。"""
+        """启动图标提取线程；旧线程只请求中断，不在 UI 线程里等待。
+
+        过期结果由 _icon_gen 代数丢弃，因此无需等待旧线程结束：旧实现会在
+        UI 线程 wait(5000)，连续拖入 APK 时界面最多卡 5 秒。
+        运行中的旧线程仍被 _icon_workers 持有引用，结束后由 _prune_workers 回收。
+        """
         for t in self._icon_workers:
             if t.isRunning():
                 t.requestInterruption()
-        for t in [t for t in self._icon_workers if t.isRunning()]:
-            t.wait(5000)
         self._prune_workers()
 
         self._icon_gen += 1
