@@ -600,7 +600,10 @@ _FRAMEWORK_COLOR_MAP = {
     "0x01060010": "#ffcccccc",  # android:color/lighter_gray
 }
 
-_VECTOR_CAPS = {"butt": 0, "round": 1, "square": 2, "0x00000000": 0, "0x00000001": 1, "0x00000002": 2}
+# strokeLineCap 同样是枚举：aapt2 输出十进制 0=butt / 1=round / 2=square。
+# 查表前先用 _attr_enum 归一化，否则圆头/方头端点会被静默降级成 butt
+# （旧表只有名字和 0x 写法两种键，命中不了十进制值）。
+_VECTOR_CAPS = {"butt": 0, "round": 1, "square": 2, "0": 0, "1": 1, "2": 2}
 
 
 def _parse_vector_elements(xml_out):
@@ -1346,7 +1349,7 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
                     sa = pa * _attr_float(a, "strokeAlpha", 1.0)
                     if sw > 0 and sa > 0:
                         wpx = max(1, int(round(sw * min(sx, sy))))
-                        cap = _VECTOR_CAPS.get(str(a.get("strokeLineCap", "butt")).lower(), 0)
+                        cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
                         _draw_stroke(layer, tsubs, stroke_color, sa, wpx, cap)
     return layer.resize((size, size), Image.LANCZOS)
 
