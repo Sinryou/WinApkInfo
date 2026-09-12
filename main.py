@@ -1887,6 +1887,11 @@ class MainWindow(QtWidgets.QWidget):
         icon_row.addSpacing(50)
         icon_row.addWidget(self.btn_export_icon)
 
+        # 图标状态就地提示：失败原因不弹模态对话框，避免批量拖入时反复打断
+        self.lbl_icon_hint = QLabel("")
+        self.lbl_icon_hint.setStyleSheet("color: #a05a00;")
+        icon_row.addWidget(self.lbl_icon_hint)
+
         # 右侧可伸缩空白（保证整体布局自适应）
         icon_row.addStretch(1)
 
@@ -2212,6 +2217,7 @@ class MainWindow(QtWidgets.QWidget):
                     icon_path = best[1]
 
                     self.icon_label.clear()  # 先清空（含上次失败提示文本）
+                    self.lbl_icon_hint.clear()
                     self._start_icon_worker(apk_path, icon_path)
             except Exception as e:
                 logging.exception("提取图标失败: %s", e)
@@ -2281,6 +2287,8 @@ class MainWindow(QtWidgets.QWidget):
         if gen != self._icon_gen:
             return  # 过期结果（用户已开始解析新 APK），丢弃
         self.icon_label.setPixmap(pix)
+        self.lbl_icon_hint.clear()
+        self.lbl_icon_hint.setToolTip("")
         if pix and not pix.isNull():
             self._current_icon_bytes = data
             self.btn_export_icon.setVisible(True)
@@ -2289,14 +2297,23 @@ class MainWindow(QtWidgets.QWidget):
             self.btn_export_icon.setVisible(False)
 
     def on_icon_failed(self, message: str, gen: int):
+        """图标提取失败：就地文字提示（非模态），详情放 tooltip 与日志。
+
+        旧实现每次失败都弹 QMessageBox.warning，连续拖入多个 APK 时会
+        反复打断用户；这里改成不阻塞的提示。
+        """
         if gen != self._icon_gen:
             return
-        # 图标提取失败时给出可见提示（之前是静默空白）
+        logging.warning("图标提取失败: %s", message)
         self.icon_label.setText("提取失败")
         self.icon_label.setToolTip(f"图标提取失败：{message}")
+        brief = (message or "").strip().splitlines()[0] if (message or "").strip() else "未知原因"
+        if len(brief) > 48:
+            brief = brief[:47] + "…"
+        self.lbl_icon_hint.setText(f"图标提取失败：{brief}")
+        self.lbl_icon_hint.setToolTip(f"图标提取失败：\n{message}")
         self._current_icon_bytes = None
         self.btn_export_icon.setVisible(False)
-        QtWidgets.QMessageBox.warning(self, "图标提取失败", f"无法提取该 APK 的图标。\n\n{message}")
 
     def export_icon(self):
         if not self._current_icon_bytes:
