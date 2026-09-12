@@ -116,15 +116,29 @@ class _Aapt2OutputCache:
     不必重跑 aapt2（实测 Play 商店包单次 dump xmltree 约 2.5s）。磁盘条目
     的键同样包含 mtime_ns 与文件大小，不会读到过期内容；写入用临时文件 +
     os.replace，保证并发下不会读到半个文件。
+
+    磁盘层有双重上限：单条超过 disk_max_entry 的输出（例如几十 MB 的
+    resources dump）只留在内存不落盘，整目录再受 disk_limit 条数与
+    disk_max_bytes 总字节约束，超限按 mtime 从最旧的开始删。
     """
 
-    def __init__(self, capacity=64, disk_dir=None, disk_limit=300):
+    # 单条超过 8MB 的 dump 不落盘（Play 商店包实测单条 resources dump 36MB）
+    DISK_MAX_ENTRY = 8 * 1024 * 1024
+    # 磁盘缓存总量上限 200MB / 300 条
+    DISK_MAX_BYTES = 200 * 1024 * 1024
+    DISK_LIMIT = 300
+
+    def __init__(self, capacity=64, disk_dir=None, disk_limit=None,
+                 disk_max_bytes=None, disk_max_entry=None):
         self._capacity = capacity
         self._cache = {}
         self._order = []
         self._lock = threading.Lock()
         self._disk_dir = disk_dir
-        self._disk_limit = disk_limit
+        self._disk_limit = self.DISK_LIMIT if disk_limit is None else disk_limit
+        self._disk_max_bytes = self.DISK_MAX_BYTES if disk_max_bytes is None else disk_max_bytes
+        self._disk_max_entry = self.DISK_MAX_ENTRY if disk_max_entry is None else disk_max_entry
+        self._puts_since_prune = 0
         if self._disk_dir:
             try:
                 os.makedirs(self._disk_dir, exist_ok=True)
@@ -170,19 +184,29 @@ class _Aapt2OutputCache:
         if not self._disk_dir:
             return None
         try:
-            with open(self._disk_path(key), "r", encoding="utf-8") as f:
-                return f.read()
-        except OSError:
+            with open(self._disk_path(key), "rb") as f:
+                return f.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
             return None
 
     def _disk_put(self, key, value):
         if not self._disk_dir:
             return
+        # 先编码成字节：既能拿到真实落盘体积，也避免写文件时再编码一次
+        try:
+            payload = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return
+        if len(payload) > self._disk_max_entry:
+            # 超大 dump（如 30MB+ 的 resources 输出）只留在内存层
+            logging.debug("dump 输出 %.1fMB 超过单条上限，不写入磁盘缓存",
+                          len(payload) / 1048576)
+            return
         path = self._disk_path(key)
         tmp = path + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(value)
+            with open(tmp, "wb") as f:
+                f.write(payload)
             os.replace(tmp, path)  # 原子替换，避免并发读到半个文件
         except OSError:
             try:
@@ -193,26 +217,43 @@ class _Aapt2OutputCache:
         self._prune_disk()
 
     def _prune_disk(self):
-        """条目数超限时按 mtime 删除最旧的文件。"""
+        """条目数或总字节数超限时，按 mtime 删除最旧的文件。
+
+        listdir 很便宜，可以每次做；stat 全目录较贵，因此普通写入只在每
+        16 次落盘后做一次完整核算。
+        """
         try:
             names = os.listdir(self._disk_dir)
         except OSError:
             return
-        if len(names) <= self._disk_limit:
+        self._puts_since_prune += 1
+        if len(names) <= self._disk_limit and self._puts_since_prune < 16:
             return
+        self._puts_since_prune = 0
         entries = []
+        total = 0
         for n in names:
             p = os.path.join(self._disk_dir, n)
             try:
-                entries.append((os.path.getmtime(p), p))
+                st = os.stat(p)
             except OSError:
                 continue
-        entries.sort()
-        for _, p in entries[:len(entries) - self._disk_limit]:
+            entries.append((st.st_mtime, p, st.st_size))
+            total += st.st_size
+        if len(entries) <= self._disk_limit and total <= self._disk_max_bytes:
+            return
+        entries.sort()  # 最旧的先删
+        count = len(entries)
+        for _, p, size in entries:
+            if count <= self._disk_limit and total <= self._disk_max_bytes:
+                break
             try:
                 os.remove(p)
             except OSError:
-                pass
+                continue
+            count -= 1
+            total -= size
+        logging.debug("磁盘缓存清理完成：%d 条 / %.1fMB", count, total / 1048576)
 
 
 def _default_disk_cache_dir():
