@@ -1847,6 +1847,8 @@ class MainWindow(QtWidgets.QWidget):
         self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
         self.resize(700, 700)
         self._busy = False
+        # 当前已解析 APK 的路径：process_apk 显式记录，不再靠回读输入框
+        self._apk_path = ""
         # 线程对象必须长期持有引用：若线程仍在运行时 Python 引用被替换/回收，
         # PyQt 会在 QThread 析构时报 "QThread: Destroyed while thread is still running"。
         self._apk_workers = []
@@ -1977,6 +1979,14 @@ class MainWindow(QtWidgets.QWidget):
             self.apk_path_edit.setText(path)
             self.process_apk(path)
 
+    def _current_apk_path(self) -> str:
+        """当前解析结果对应的 APK 路径。
+
+        优先用 process_apk 记录的路径：调用方（拖放、命令行等）不一定已经
+        把路径同步到输入框，回读输入框会导致这类调用完全提取不到图标。
+        """
+        return self._apk_path or self.apk_path_edit.text().strip()
+
     def process_apk(self, path: str):
         if not path or not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
@@ -1984,6 +1994,7 @@ class MainWindow(QtWidgets.QWidget):
         if self._busy:
             QtWidgets.QMessageBox.information(self, "提示", "正在解析 APK，请稍候再试。")
             return
+        self._apk_path = path
         try:
             self.set_busy(True)
             self._prune_workers()
@@ -2191,7 +2202,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # 提取图标
         self.btn_export_icon.setVisible(False)
-        apk_path = self.apk_path_edit.text().strip()
+        apk_path = self._current_apk_path()
         if apk_path and os.path.isfile(apk_path):
             try:
                 icons = info.get("icons", {})
@@ -2236,7 +2247,7 @@ class MainWindow(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "已复制", "已复制摘要到剪贴板。")
 
     def do_rename(self):
-        old_path = self.apk_path_edit.text().strip()
+        old_path = self._current_apk_path()
         new_name = self.rename_preview.text().strip()
         if not old_path or not os.path.isfile(old_path):
             QtWidgets.QMessageBox.warning(self, "提示", "未选择有效的 APK 文件。")
@@ -2260,6 +2271,7 @@ class MainWindow(QtWidgets.QWidget):
             # os.rename 在 Windows 上目标已存在时失败；os.replace 原子替换
             os.replace(old_path, new_path)
             QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
+            self._apk_path = new_path
             self.apk_path_edit.setText(new_path)
             self.rename_preview.setText(new_name)
         except Exception as e:
