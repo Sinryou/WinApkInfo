@@ -277,18 +277,26 @@ def local_resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 _sdk_versions_cache = None
+_sdk_load_warned = False
 
 def load_sdk_versions():
-    """尝试读取 resources/android_sdk_versions.json（结果缓存，失败也缓存空表）。"""
-    global _sdk_versions_cache
-    if _sdk_versions_cache is not None:
+    """读取 resources/android_sdk_versions.json，**成功才缓存**。
+
+    旧实现把"文件缺失/解析失败"得到的空表也写进缓存，之后永不重试，
+    SDK 就只剩裸 API 级别可看（例如打包漏带 resources 时）。
+    现在失败只返回空表并留下提示，下次调用会重新尝试。
+    """
+    global _sdk_versions_cache, _sdk_load_warned
+    if _sdk_versions_cache:
         return _sdk_versions_cache
     sdk_map = {}
     # here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     # sdk_file = here / "android_sdk_versions.json"
     sdk_file = Path(local_resource_path("resources/android_sdk_versions.json"))
     if not sdk_file.exists():
-        _sdk_versions_cache = sdk_map
+        if not _sdk_load_warned:
+            logging.warning("未找到 %s，SDK 版本将只显示 API 级别", sdk_file)
+            _sdk_load_warned = True
         return sdk_map
     try:
         with open(sdk_file, "r", encoding="utf-8") as f:
@@ -308,10 +316,12 @@ def load_sdk_versions():
                 sdk_map[api] = f"{version} {codename}"
             else:
                 sdk_map[api] = version
-        _sdk_versions_cache = sdk_map
+        if sdk_map:
+            _sdk_versions_cache = sdk_map   # 仅在真正解析出内容时缓存
+        else:
+            logging.warning("%s 内容为空，SDK 版本将只显示 API 级别", sdk_file)
     except Exception as e:
         logging.warning("读取 android_sdk_versions.json 出错: %s", e)
-        _sdk_versions_cache = sdk_map
     return sdk_map
 
 @functools.lru_cache(maxsize=1)
