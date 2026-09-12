@@ -814,7 +814,7 @@ def _flatten_subpaths(cmds, step):
                 subpaths.append(sub)
                 sub = None
             cur = [start[0], start[1]]
-            last_cmd = c
+            last_cmd = c.upper()
             last_ctrl = None
             continue
         if c in "Mm":
@@ -829,7 +829,7 @@ def _flatten_subpaths(cmds, step):
             cur = [x, y]
             start = [x, y]
             sub = [(x, y)]
-            last_cmd = c
+            last_cmd = c.upper()
             last_ctrl = None
             continue
         if sub is None:
@@ -908,7 +908,9 @@ def _flatten_subpaths(cmds, step):
                 sub.extend(_arc_points(cur[0], cur[1], rx, ry, rot, large != 0, sweep != 0, x, y, step))
                 cur = [x, y]
                 last_ctrl = None
-        last_cmd = c
+        # 统一存大写：S/T 分支要判断「上一条命令是不是 C/S」「Q/T」，
+        # 存原始大小写会让相对命令 c/q 后的 s/t 判不出镜像控制点。
+        last_cmd = c.upper()
     if sub is not None:
         subpaths.append(sub)
     return subpaths
