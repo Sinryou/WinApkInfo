@@ -638,6 +638,23 @@ def _attr_float(attrs, name, default=None):
     return default
 
 
+def _attr_enum(raw) -> str:
+    """把 aapt2 的枚举型属性值归一化成小写字符串。
+
+    `aapt2 dump xmltree` 对枚举属性一律输出**十进制**整数（实测
+    fillType=1 / strokeLineCap=2 / gradient type=1），个别版本可能输出
+    0x00000001。这里统一折算成十进制字符串，调用方既可以按名字
+    （"evenodd"）也可以按数值（"1"）比较；无法识别时返回小写原值。
+    """
+    v = str(raw if raw is not None else "").strip().lower()
+    if v.startswith("0x"):
+        try:
+            return str(int(v, 16))
+        except ValueError:
+            return v
+    return v
+
+
 def _tokenize_path_data(d):
     """SVG pathData 词法切分，返回 [(cmd, 0.0) | (None, float)] 序列。"""
     tokens = []
@@ -1299,7 +1316,10 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
                 continue
             m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
             tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
-            fill_rule = "evenodd" if str(a.get("fillType", "")).lower() == "evenodd" else "nonzero"
+            # fillType 是枚举：aapt2 输出十进制 0=nonZero / 1=evenOdd，
+            # 旧实现只与字符串 "evenodd" 比较，导致 evenOdd 路径全部被
+            # 当成 nonzero 渲染（同向子路径的"洞"会被填实）。
+            fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
             if "fillColor" in a:
                 fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
                 if fill is not None:
