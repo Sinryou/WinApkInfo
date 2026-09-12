@@ -1930,13 +1930,18 @@ class MainWindow(QtWidgets.QWidget):
         if self._busy:
             QtWidgets.QMessageBox.information(self, "提示", "正在解析 APK，请稍候再试。")
             return
-        self.set_busy(True)
-        self._prune_workers()
-        worker = ApkInfoWorker(path)
-        self._apk_workers.append(worker)
-        worker.resultReady.connect(self.on_apk_info_ready)
-        worker.failed.connect(self.on_apk_info_failed)
-        worker.start()
+        try:
+            self.set_busy(True)
+            self._prune_workers()
+            worker = ApkInfoWorker(path)
+            self._apk_workers.append(worker)
+            worker.resultReady.connect(self.on_apk_info_ready)
+            worker.failed.connect(self.on_apk_info_failed)
+            worker.start()
+        except Exception as e:
+            logging.exception("启动解析线程失败: %s", e)
+            self.set_busy(False)  # 否则界面会一直停在"忙碌"状态
+            QtWidgets.QMessageBox.critical(self, "错误", f"启动解析任务失败：\n{e}")
 
     def set_busy(self, busy: bool):
         self._busy = busy
@@ -1988,10 +1993,17 @@ class MainWindow(QtWidgets.QWidget):
         event.accept()
 
     def on_apk_info_ready(self, output: str):
-        self.te_raw.setPlainText(output)
-        info = parse_aapt2_output(output)
-        self.fill_info(info)
-        self.set_busy(False)
+        try:
+            self.te_raw.setPlainText(output)
+            info = parse_aapt2_output(output)
+            self.fill_info(info)
+        except Exception as e:
+            # slot 内未捕获异常会让 PyQt6 直接 qFatal() 结束进程，必须自行兜住
+            logging.exception("处理 aapt2 输出失败: %s", e)
+            QtWidgets.QMessageBox.critical(self, "错误", f"解析 APK 信息失败：\n{e}")
+        finally:
+            # 无论成功失败都要恢复界面，否则按钮会永久禁用
+            self.set_busy(False)
 
     def on_apk_info_failed(self, message: str):
         QtWidgets.QMessageBox.critical(self, "错误", message)
@@ -2001,8 +2013,12 @@ class MainWindow(QtWidgets.QWidget):
         text = self.te_raw.toPlainText()
         if not text.strip():
             return
-        info = parse_aapt2_output(text)
-        self.fill_info(info)
+        try:
+            info = parse_aapt2_output(text)
+            self.fill_info(info)
+        except Exception as e:
+            logging.exception("重新解析失败: %s", e)
+            QtWidgets.QMessageBox.critical(self, "错误", f"重新解析失败：\n{e}")
 
     def fill_info(self, info: dict):
         # 顶部字段
@@ -2222,6 +2238,26 @@ class MainWindow(QtWidgets.QWidget):
             "Copyright (c) 2025-2026 Sinryou.<br>At MIT License."
         )
 
+def install_excepthook():
+    """安装全局异常钩子，避免未捕获异常让进程"静默消失"。
+
+    PyQt6 在 slot 里抛出未捕获的 Python 异常时会调用 qFatal() 直接结束
+    进程；打包配置是 console=False，用户既看不到 traceback 也看不到提示。
+    这里把异常写进日志并弹窗，作为各 slot 自身 try/except 之外的兜底。
+    """
+    def _hook(exc_type, exc, tb):
+        logging.critical("未捕获异常", exc_info=(exc_type, exc, tb))
+        try:
+            QtWidgets.QMessageBox.critical(
+                None, "未预期的错误",
+                f"{exc_type.__name__}: {exc}\n\n详细信息见日志文件。",
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+
 def main():
     # 日志：控制台模式输出到 stderr；PyInstaller 窗口模式（无 stderr）落盘到临时目录
     if sys.stderr is not None:
@@ -2235,6 +2271,8 @@ def main():
 
     # 高分屏适配：Qt6 默认启用 high-DPI 缩放（AA_EnableHighDpiScaling /
     # AA_UseHighDpiPixmaps 已废弃），无需再设置任何属性。
+
+    install_excepthook()
 
     app = QtWidgets.QApplication(sys.argv)
     # app.setStyleSheet("QLabel { font-size: 16px; font-family: Microsoft Yahei; }"
