@@ -214,5 +214,10 @@
     "codename": "Baklava",
     "apiLevel": 36,
     "releaseDate": "2025-6"
+  },{
+    "version": "Android 17",
+    "codename": "Cinnamon Bun",
+    "apiLevel": 37,
+    "releaseDate": "2026-6"
   }
 ]
