@@ -2576,7 +2576,7 @@ class MainWindow(QtWidgets.QWidget):
             "基于 PyQt6 + aapt2 的图形化<br>"
             "解析 APK 文件信息的工具程序<br><br>"
             '更多信息: <a href="https://github.com/Sinryou/WinApkInfo">项目主页</a><br>'
-            "版本: 1.1.1<br>"
+            "版本: 1.1.2<br>"
             "Copyright (c) 2025-2026 Sinryou.<br>At MIT License."
         )
 
