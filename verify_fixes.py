@@ -25,6 +25,9 @@
     B2    磁盘缓存单条与总量字节上限
     B3    SDK 版本表读取失败不再永久缓存
     B4    图标提取为单常驻线程 + 最新请求覆盖
+    C     本轮修复回归：渐变 type 枚举 / #RGB 颜色 / 畸形 pathData 容错 /
+          strokeLineCap=square / 文件名净化 / dump 失败返回 None /
+          统一 512² 导出 / 子线程只用 QImage / 图标与架构兜底
 
 注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
 （GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
@@ -41,7 +44,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import zipfile
@@ -419,7 +421,17 @@ def check_p1_5(app):
     C.check("超时后进程登记表已清空", len(m._running_procs) == 0)
 
     import threading
-    threading.Thread(target=lambda: (time.sleep(0.6), m.kill_running_aapt2()), daemon=True).start()
+
+    def kill_once_registered():
+        # 不能固定 sleep 一段时间再杀：Popen 返回耗时实测在 0.002s~1.0s 之间波动，
+        # 固定延迟会赶在子进程登记进 _running_procs 之前执行，什么也杀不到，
+        # 于是这里要等满 30s 超时（表现为本用例随机 FAIL）。改为轮询登记表。
+        deadline = time.time() + 10
+        while time.time() < deadline and not m._running_procs:
+            time.sleep(0.01)
+        m.kill_running_aapt2()
+
+    threading.Thread(target=kill_once_registered, daemon=True).start()
     t0 = time.time()
     killed = False
     try:
@@ -463,7 +475,7 @@ def check_p1_6(app):
     def slow_extract(self, apk_path, icon_path):
         calls.append(icon_path)
         time.sleep(0.2)
-        return QtGui.QPixmap(4, 4), icon_path.encode()
+        return QtGui.QImage(4, 4, QtGui.QImage.Format.Format_ARGB32), icon_path.encode()
 
     m.IconWorker._extract = slow_extract
     try:
@@ -487,7 +499,8 @@ def check_p1_6(app):
         C.check("最终显示最新请求的结果", ok and win._current_icon_bytes == b"res/F19.xml",
                 "%r" % win._current_icon_bytes)
 
-        win.on_icon_loaded(QtGui.QPixmap(4, 4), b"stale", win._icon_gen - 1)
+        win.on_icon_loaded(QtGui.QImage(4, 4, QtGui.QImage.Format.Format_ARGB32),
+                           b"stale", win._icon_gen - 1)
         consume_events(app, 0.05)
         C.check("过期代数结果被丢弃", win._current_icon_bytes == b"res/F19.xml")
 
@@ -647,38 +660,50 @@ def check_p2_11():
     apks = sample_apks()
     if not apks:
         return
-    apk = pick_apk(apks)
 
-    shutil.rmtree(disk_dir, ignore_errors=True)
-    os.makedirs(disk_dir, exist_ok=True)   # 清空内容但保留目录（缓存对象持有该路径）
-    cold = _run_child(apk)
-    warm = _run_child(apk)
-    C.check("冷磁盘：需要启动 aapt2 子进程", cold > 0, "子进程=%d" % cold)
-    C.check("温磁盘：全新进程也不再启动子进程", warm == 0, "子进程=%d" % warm)
-
-    st = os.stat(apk)
+    # 本用例要改 APK 的 mtime，必须用副本：直接 os.utime 样本文件既会改动
+    # 用户数据，也要求 testSample 可写。
+    # 目录用 os.makedirs（默认权限，继承父目录）而不是 tempfile.mkdtemp：
+    # mkdtemp 会按 0o700 写入受限 ACL，在沙箱/受限令牌下反而不可写。
+    work = os.path.join(REPO, "_verify_p211_tmp")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
+    src = pick_apk(apks)
+    apk = os.path.join(work, os.path.basename(src))
+    shutil.copy2(src, apk)
     try:
-        # 用 ns 精度改/还原 mtime：缓存键是 st_mtime_ns，浮点秒会丢精度
-        os.utime(apk, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
-        changed = _run_child(apk)
-    finally:
-        os.utime(apk, ns=(st.st_atime_ns, st.st_mtime_ns))
-    C.check("APK mtime 变化后缓存失效", changed > 0, "子进程=%d" % changed)
+        shutil.rmtree(disk_dir, ignore_errors=True)
+        os.makedirs(disk_dir, exist_ok=True)   # 清空内容但保留目录（缓存对象持有该路径）
+        cold = _run_child(apk)
+        warm = _run_child(apk)
+        C.check("冷磁盘：需要启动 aapt2 子进程", cold > 0, "子进程=%d" % cold)
+        C.check("温磁盘：全新进程也不再启动子进程", warm == 0, "子进程=%d" % warm)
 
-    disabled = _run_child(apk, {"WINAPKINFO_NO_DISK_CACHE": "1"})
-    C.check("禁用磁盘缓存时子进程数回到冷启动水平", disabled > 0,
-            "WINAPKINFO_NO_DISK_CACHE=1 → 子进程=%d" % disabled)
-    os.environ["WINAPKINFO_NO_DISK_CACHE"] = "1"
-    try:
-        C.check("_default_disk_cache_dir 尊重禁用开关", m._default_disk_cache_dir() is None)
-    finally:
-        os.environ.pop("WINAPKINFO_NO_DISK_CACHE", None)
+        st = os.stat(apk)
+        try:
+            # 用 ns 精度改/还原 mtime：缓存键是 st_mtime_ns，浮点秒会丢精度
+            os.utime(apk, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+            changed = _run_child(apk)
+        finally:
+            os.utime(apk, ns=(st.st_atime_ns, st.st_mtime_ns))
+        C.check("APK mtime 变化后缓存失效", changed > 0, "子进程=%d" % changed)
 
-    m._aapt2_cache.clear()
-    C.check("内存层清空后仍能命中磁盘（mtime 已精确还原）",
-            m._aapt2_cache.get(m._aapt2_cache_key(apk, "badging")) is not None)
-    C.check("缓存键包含文件大小（APK 替换即失效）",
-            len(m._aapt2_cache_key(apk, "badging")) == 5)
+        disabled = _run_child(apk, {"WINAPKINFO_NO_DISK_CACHE": "1"})
+        C.check("禁用磁盘缓存时子进程数回到冷启动水平", disabled > 0,
+                "WINAPKINFO_NO_DISK_CACHE=1 → 子进程=%d" % disabled)
+        os.environ["WINAPKINFO_NO_DISK_CACHE"] = "1"
+        try:
+            C.check("_default_disk_cache_dir 尊重禁用开关", m._default_disk_cache_dir() is None)
+        finally:
+            os.environ.pop("WINAPKINFO_NO_DISK_CACHE", None)
+
+        m._aapt2_cache.clear()
+        C.check("内存层清空后仍能命中磁盘（mtime 已精确还原）",
+                m._aapt2_cache.get(m._aapt2_cache_key(apk, "badging")) is not None)
+        C.check("缓存键包含文件大小（APK 替换即失效）",
+                len(m._aapt2_cache_key(apk, "badging")) == 5)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def check_p2_12():
@@ -881,6 +906,108 @@ def check_b3():
         m._sdk_versions_cache = saved_cache
 
 
+def check_new_fixes():
+    C.title("C. 本轮修复的回归守护（无需样本 APK）")
+
+    # --- 渐变 type 枚举（旧实现用 _attr_float，0x 写法被截成 0）---
+    C.check("_attr_int 识别十进制/0x 枚举",
+            m._attr_int("1") == 1 and m._attr_int("0x00000001") == 1 and
+            m._attr_int(None, 9) == 9,
+            "_attr_int('0x00000001')=%s" % m._attr_int("0x00000001"))
+    for raw, want in (("1", 1), ("0x00000001", 1), ("2", 2), ("0x00000002", 2)):
+        xml = ('E: gradient (line=1)\n'
+               '  A: http://schemas.android.com/apk/res/android:type(0x0101019c)=%s\n'
+               '  E: item (line=2)\n'
+               '    A: http://schemas.android.com/apk/res/android:color(0x0101019d)=#ffff0000\n'
+               '  E: item (line=3)\n'
+               '    A: http://schemas.android.com/apk/res/android:color(0x0101019d)=#ff0000ff\n' % raw)
+        g = m._parse_gradient(xml)
+        C.check("gradient type=%-12s -> %d" % (raw, want), bool(g) and g["type"] == want,
+                "解析结果 %s（0=linear 1=radial 2=sweep）" % (g and g["type"]))
+
+    # --- Android 合法的 #RGB / #ARGB 简写 ---
+    C.check("parse_android_color 支持 #RGB/#ARGB",
+            m.parse_android_color("#f00") == (255, 0, 0, 255) and
+            m.parse_android_color("#8f00") == (255, 0, 0, 0x88) and
+            m.parse_android_color("#ff112233") == (0x11, 0x22, 0x33, 0xff) and
+            m.parse_android_color("#112233") == (0x11, 0x22, 0x33, 255))
+    for bad in ("#gggggg", "#12345", "", "#"):
+        try:
+            m.parse_android_color(bad)
+            raised = False
+        except ValueError:
+            raised = True
+        C.check("非法颜色 %r 抛统一的格式错误" % bad, raised)
+
+    # --- 畸形 pathData 容错 ---
+    try:
+        m._tokenize_path_data("M0,0 L1.2.3 4,4")
+        m._flatten_subpaths(m._parse_path_commands(m._tokenize_path_data("M0,0 L1.2.3 4,4")), 1.0)
+        ok = True
+    except Exception as e:
+        ok = False
+        C.check("畸形 pathData 不再抛异常", False, repr(e))
+    if ok:
+        C.check("畸形 pathData 不再抛异常", True, "非法数字被跳过")
+
+    # --- strokeLineCap=square ---
+    closed = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]
+    C.check("闭合子路径不做 square 端点外推",
+            m._extend_square_caps(closed, 2.0) == closed)
+    ext = m._extend_square_caps([(0.0, 0.0), (10.0, 0.0)], 3.0)
+    C.check("square 端点沿线段方向外推半个线宽",
+            ext[0] == (-3.0, 0.0) and ext[-1] == (13.0, 0.0), "%r" % (ext,))
+
+    # --- 文件名净化 ---
+    sanitized = m._sanitize_apk_name('a/b:c*?"<>|')
+    C.check("文件名净化：非法字符被替换",
+            not any(ch in sanitized for ch in '\\/:*?"<>|') and sanitized.endswith(".apk"),
+            sanitized)
+    C.check("文件名净化：结尾点/空格与保留设备名",
+            m._sanitize_apk_name("name... ") == "name.apk" and
+            m._sanitize_apk_name("CON") == "_CON.apk" and
+            m._sanitize_apk_name("  ") == "" and
+            m._sanitize_apk_name("微信_8.0.1") == "微信_8.0.1.apk",
+            "%r %r" % (m._sanitize_apk_name("name... "), m._sanitize_apk_name("CON")))
+
+    # --- dump 失败必须可区分 ---
+    C.check("dump 失败返回 None（不再把错误文本当输出）",
+            m.run_aapt2_dump_resource("__no_such__.apk") is None and
+            m.run_aapt2_dump_xmltree("__no_such__.apk", "res/x.xml") is None)
+    try:
+        m._aapt2_cache_key("__no_such__.apk", "badging")
+        err = None
+    except Exception as e:
+        err = e
+    C.check("缓存键对缺失文件抛 Aapt2Error（不是裸 OSError）",
+            isinstance(err, m.Aapt2Error), repr(err))
+
+    # --- 统一导出规格 ---
+    src = io.BytesIO()
+    Image.new("RGB", (37, 91), (10, 20, 30)).save(src, format="PNG")
+    out = m._normalize_icon_png(src.getvalue())
+    out_size = Image.open(io.BytesIO(out)).size if out else None
+    C.check("位图图标归一化为 512×512", out_size == (512, 512), "%s" % (out_size,))
+    C.check("不可解码的字节返回 None（由调用方回退原始字节）",
+            m._normalize_icon_png(b"not an image") is None)
+
+    # --- 子线程只碰 QImage ---
+    C.check("图标链路改用 QImage（子线程不再创建 QPixmap）",
+            hasattr(m.IconWorker, "_load_image") and not hasattr(m.IconWorker, "_load_pixmap"))
+
+    # --- 无 application-icon-* 时的图标兜底 + 架构去重 ---
+    fake = ("package: name='a.b' versionCode='1' versionName='1.0'\n"
+            "application: label='X' icon='res/mipmap/ic_launcher.xml'\n"
+            "native-code: 'arm64-v8a' 'armeabi-v7a'\n"
+            "alt-native-code: 'arm64-v8a'\n")
+    info = m.parse_aapt2_output(fake)
+    C.check("无 application-icon-* 时回退 application 节点 icon",
+            info["icons"].get("0") == "res/mipmap/ic_launcher.xml", "%r" % info["icons"])
+    C.check("native-code / alt-native-code 架构去重",
+            info["architectures"] == ["arm64-v8a", "armeabi-v7a"],
+            "%r" % info["architectures"])
+
+
 def check_end_to_end(app, limit):
     C.title("E. 端到端：真实样本 APK 解析 + 图标提取")
     apks = sample_apks(limit)
@@ -889,6 +1016,7 @@ def check_end_to_end(app, limit):
         return
     ok = 0
     sizes = []
+    non_uniform = []
     for apk in apks:
         name = os.path.basename(apk)
         t0 = time.time()
@@ -906,8 +1034,9 @@ def check_end_to_end(app, limit):
                 img = Image.open(io.BytesIO(data))
                 img.load()
                 size = img.size
-                # 自适应图标链路固定输出 512²；纯位图图标按原图输出（最小边 ≥48 即可用）
                 decode_ok = min(size) >= 48
+                if size != (512, 512):
+                    non_uniform.append((name[:30], size))
             except Exception:
                 decode_ok = False
         good = bool(data) and decode_ok
@@ -918,10 +1047,10 @@ def check_end_to_end(app, limit):
                     win.le_app_name.text()[:14], len(data), size or "-", el))
         win.close()
     C.check("全部样本均成功提取图标", ok == len(apks), "%d/%d" % (ok, len(apks)))
-    fixed = [s for s in sizes if s == (512, 512)]
-    if sizes and len(fixed) != len(sizes):
-        print("  备注：%d/%d 个样本导出为 512²，其余为原图尺寸（位图图标链路不做放大）"
-              % (len(fixed), len(sizes)))
+    # 位图/矢量/自适应三条链路统一导出 _ICON_SIZE²，否则"导出图标"给出的
+    # 文件规格会随图标类型变化
+    C.check("图标导出规格统一为 512×512", not non_uniform,
+            "非 512² 的有 %d 个：%s" % (len(non_uniform), non_uniform[:3]))
 
 
 def main():
@@ -954,6 +1083,7 @@ def main():
     check_b1(app)
     check_b2(not args.quick)
     check_b3()
+    check_new_fixes()
     if not args.quick:
         check_end_to_end(app, args.samples or None)
 
