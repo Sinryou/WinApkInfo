@@ -427,8 +427,9 @@ def check_p1_4(app):
         return
     win = m.MainWindow()
     win.apk_path_edit.setText(apks[0])
-    orig = m.parse_aapt2_output
-    m.parse_aapt2_output = lambda t: (_ for _ in ()).throw(RuntimeError("verification-injected"))
+    import ui.main_window as ui_main_mod
+    orig = ui_main_mod.parse_aapt2_output
+    ui_main_mod.parse_aapt2_output = lambda t: (_ for _ in ()).throw(RuntimeError("verification-injected"))
     try:
         win.process_apk(apks[0])
         finished = wait_for(app, lambda: not win._busy, timeout=20)
@@ -438,7 +439,7 @@ def check_p1_4(app):
         C.check("异常已提示用户", any(k == "critical" for k, _ in MODAL_CALLS),
                 "critical 弹窗 %d 次" % sum(1 for k, _ in MODAL_CALLS if k == "critical"))
     finally:
-        m.parse_aapt2_output = orig
+        ui_main_mod.parse_aapt2_output = orig
         win.close()
     # 正常路径不受影响
     win2 = m.MainWindow()
@@ -820,7 +821,8 @@ def check_a1(app):
         lambda *a, **k: shown.append(QtCore.QThread.currentThread() is app.thread()))
     try:
         m.install_excepthook()
-        C.check("钩子已安装且提示器在 GUI 线程创建", m._error_dialog is not None)
+        import ui.main_window as ui_main_mod
+        C.check("钩子已安装且提示器在 GUI 线程创建", ui_main_mod._error_dialog is not None)
         sys.excepthook(RuntimeError, RuntimeError("gui-boom"), None)
         C.check("GUI 线程触发时立即弹窗", shown == [True], "弹窗=%r" % shown)
 
@@ -842,13 +844,19 @@ def check_b1(app):
     fake_bitmap = ('N: android=http://schemas.android.com/apk/res/android (line=1)\n'
                    '  E: bitmap (line=2)\n'
                    '    A: http://schemas.android.com/apk/res/android:src(0x0101019a)=@0x7f080001\n')
-    saved = m.run_aapt2_dump_xmltree
-    m.run_aapt2_dump_xmltree = lambda apk, p, _t=fake_bitmap: _t
+    import core.apk_parser as core_apk_parser
+    import core.vector as core_vector
+    saved_parser = core_apk_parser.run_aapt2_dump_xmltree
+    saved_vector = core_vector.run_aapt2_dump_xmltree
+    fake_dump = lambda apk, p, _t=fake_bitmap: _t
+    core_apk_parser.run_aapt2_dump_xmltree = fake_dump
+    core_vector.run_aapt2_dump_xmltree = fake_dump
     try:
         unwrapped = m._resolve_xml_wrapper("x.apk", "", "res/x.xml", 0, None)
         raster = m.rasterize_vector_layer("x.apk", "res/x.xml", 128, "", None)
     finally:
-        m.run_aapt2_dump_xmltree = saved
+        core_apk_parser.run_aapt2_dump_xmltree = saved_parser
+        core_vector.run_aapt2_dump_xmltree = saved_vector
     C.check("<bitmap> 根既不能解引用也不能栅格化（复现失败条件）",
             unwrapped == (None, None, None) and raster is None)
 
@@ -880,16 +888,27 @@ def check_b1(app):
     def extract(force_fail):
         win = m.MainWindow()
         win.apk_path_edit.setText(target)
-        saved_raster = m.rasterize_vector_layer
+        import ui.workers as ui_workers
+        import core.apk_parser as core_apk_parser
+        import core.vector as core_vector
+
+        saved_workers_raster = ui_workers.rasterize_vector_layer
+        saved_parser_raster = core_apk_parser.rasterize_vector_layer
+        saved_vector_raster = core_vector.rasterize_vector_layer
         if force_fail:
-            m.rasterize_vector_layer = lambda *a, **k: None
+            fail_fn = lambda *a, **k: None
+            ui_workers.rasterize_vector_layer = fail_fn
+            core_apk_parser.rasterize_vector_layer = fail_fn
+            core_vector.rasterize_vector_layer = fail_fn
         try:
             win.process_apk(target)
             wait_for(app, lambda: bool(win._current_icon_bytes) or
                      win.lbl_icon_hint.text() != "", timeout=60)
             return win._current_icon_bytes or b"", win.lbl_icon_hint.text()
         finally:
-            m.rasterize_vector_layer = saved_raster
+            ui_workers.rasterize_vector_layer = saved_workers_raster
+            core_apk_parser.rasterize_vector_layer = saved_parser_raster
+            core_vector.rasterize_vector_layer = saved_vector_raster
             win.close()
 
     normal, _ = extract(False)
@@ -942,22 +961,23 @@ def check_b2(full_mode):
 
 def check_b3():
     C.title("B3 SDK 版本表读取失败不再永久缓存")
-    saved_res = m.local_resource_path
-    saved_cache = m._sdk_versions_cache
+    import core.resources as core_resources
+    saved_res = core_resources.local_resource_path
+    saved_cache = core_resources._sdk_versions_cache
     try:
-        m._sdk_versions_cache = None
-        m.local_resource_path = lambda p: os.path.join("__missing__", p)
-        first = dict(m.load_sdk_versions())
+        core_resources._sdk_versions_cache = None
+        core_resources.local_resource_path = lambda p: os.path.join("__missing__", p)
+        first = dict(core_resources.load_sdk_versions())
         C.check("文件缺失时返回空表且不写缓存",
-                first == {} and not m._sdk_versions_cache,
-                "cache=%r" % m._sdk_versions_cache)
-        m.local_resource_path = saved_res
-        second = m.load_sdk_versions()
+                first == {} and not core_resources._sdk_versions_cache,
+                "cache=%r" % core_resources._sdk_versions_cache)
+        core_resources.local_resource_path = saved_res
+        second = core_resources.load_sdk_versions()
         C.check("文件恢复后可重新读到（修复前永久为空）", len(second) > 0,
                 "%d 条映射" % len(second))
     finally:
-        m.local_resource_path = saved_res
-        m._sdk_versions_cache = saved_cache
+        core_resources.local_resource_path = saved_res
+        core_resources._sdk_versions_cache = saved_cache
 
 
 def check_new_fixes():

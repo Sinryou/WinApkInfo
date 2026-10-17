@@ -49,21 +49,11 @@ def load_sdk_versions():
     现在失败只返回空表并留下提示，下次调用会重新尝试。
     """
     global _sdk_versions_cache, _sdk_load_warned
-    # 兼容测试中对 main._sdk_versions_cache 的重置与 mocking
-    main_mod = sys.modules.get("main")
-    if main_mod is not None and hasattr(main_mod, "_sdk_versions_cache"):
-        cached = getattr(main_mod, "_sdk_versions_cache")
-        if cached is None:
-            _sdk_versions_cache = None
-        elif _sdk_versions_cache is None:
-            _sdk_versions_cache = cached
-
     if _sdk_versions_cache:
         return _sdk_versions_cache
 
     sdk_map = {}
-    res_func = getattr(main_mod, "local_resource_path", local_resource_path) if main_mod else local_resource_path
-    sdk_file = Path(res_func("resources/android_sdk_versions.json"))
+    sdk_file = Path(local_resource_path("resources/android_sdk_versions.json"))
     if not sdk_file.exists():
         if not _sdk_load_warned:
             logging.warning("未找到 %s，SDK 版本将只显示 API 级别", sdk_file)
@@ -89,11 +79,6 @@ def load_sdk_versions():
                 sdk_map[api] = version
         if sdk_map:
             _sdk_versions_cache = sdk_map   # 仅在真正解析出内容时缓存
-            if main_mod is not None:
-                try:
-                    main_mod._sdk_versions_cache = sdk_map
-                except Exception:
-                    pass
         else:
             logging.warning("%s 内容为空，SDK 版本将只显示 API 级别", sdk_file)
     except Exception as e:

@@ -15,7 +15,6 @@
 """
 import os
 import sys
-import types
 import subprocess
 import tempfile
 import logging
@@ -288,46 +287,13 @@ def main():
     return code
 
 
-# ---------------------------------------------------------------------------
-# 模块级动态代理：无缝兼容测试套件对顶层 main 模块的 monkeypatching
-# ---------------------------------------------------------------------------
-class _MainModuleProxy(types.ModuleType):
-    """支持测试套件直接在 main 模块上访问与替换核心函数/状态并自动同步到对应子模块。"""
-
-    @property
-    def _error_dialog(self):
+def __getattr__(name: str):
+    """向后兼容属性动态读取（PEP 562）。"""
+    if name == "_error_dialog":
         return _main_window_mod._error_dialog
-
-    @_error_dialog.setter
-    def _error_dialog(self, value):
-        _main_window_mod._error_dialog = value
-
-    @property
-    def _sdk_versions_cache(self):
+    if name == "_sdk_versions_cache":
         return _resources_mod._sdk_versions_cache
-
-    @_sdk_versions_cache.setter
-    def _sdk_versions_cache(self, value):
-        _resources_mod._sdk_versions_cache = value
-
-    def __setattr__(self, name, value):
-        super().__setattr__(name, value)
-        if name in ("_sdk_versions_cache", "local_resource_path"):
-            setattr(_resources_mod, name, value)
-        elif name in ("parse_aapt2_output",):
-            setattr(_apk_parser_mod, name, value)
-            setattr(_main_window_mod, name, value)
-        elif name in ("rasterize_vector_layer",):
-            setattr(_vector_mod, name, value)
-            setattr(_apk_parser_mod, name, value)
-            setattr(_workers_mod, name, value)
-        elif name in ("run_aapt2_dump_xmltree",):
-            setattr(_aapt_mod, name, value)
-            setattr(_vector_mod, name, value)
-            setattr(_workers_mod, name, value)
-
-
-sys.modules[__name__].__class__ = _MainModuleProxy
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 if __name__ == "__main__":
