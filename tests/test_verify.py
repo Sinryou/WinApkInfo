@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import glob
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -83,15 +84,26 @@ class TestCacheManagement(unittest.TestCase):
         self.assertIsInstance(key[6], tuple)
 
     def test_disk_cache_info_and_clear(self):
-        info = aapt_mod.get_disk_cache_info()
-        self.assertIn("dir", info)
-        self.assertIn("count", info)
-        self.assertIn("total_bytes", info)
-        self.assertIsInstance(info["total_mb"], (int, float))
+        # 必须用临时目录：clear_disk_cache 会删除真实用户缓存
+        tmp = tempfile.mkdtemp(prefix="winapkinfo-test-cache-")
+        cache = aapt_mod._Aapt2OutputCache(disk_dir=tmp)
+        try:
+            with mock.patch.object(aapt_mod, "_aapt2_cache", cache), \
+                    mock.patch.object(aapt_mod, "_default_disk_cache_dir", return_value=tmp):
+                cache.put(("unit-test",), "cached-text")
+                info = aapt_mod.get_disk_cache_info()
+                self.assertIn("dir", info)
+                self.assertIn("count", info)
+                self.assertIn("total_bytes", info)
+                self.assertEqual(info["count"], 1)
+                self.assertIsInstance(info["total_mb"], (int, float))
 
-        # 测试清空逻辑能安全调用不崩溃
-        freed = aapt_mod.clear_disk_cache()
-        self.assertGreaterEqual(freed, 0)
+                freed = aapt_mod.clear_disk_cache()
+                self.assertGreater(freed, 0)
+                self.assertIsNone(cache.get(("unit-test",)))
+                self.assertEqual(aapt_mod.get_disk_cache_info()["count"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestResourceIndex(unittest.TestCase):

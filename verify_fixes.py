@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -74,6 +75,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import main as m
+import core.aapt as aapt_mod
 import core.vector as vector_mod
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -709,27 +711,33 @@ def _run_child(apk, env_extra=None):
 
 def check_p2_11():
     C.title("P2-11 磁盘级 dump 缓存（跨进程复用）")
-    disk_dir = m._aapt2_cache._disk_dir
-    C.check("磁盘缓存默认启用", bool(disk_dir), str(disk_dir))
-    if not disk_dir:
+    real_disk_dir = m._aapt2_cache._disk_dir
+    C.check("磁盘缓存默认启用", bool(real_disk_dir), str(real_disk_dir))
+    if not real_disk_dir:
         return
     apks = sample_apks()
     if not apks:
         return
 
-    # 本用例要改 APK 的 mtime，必须用副本：直接 os.utime 样本文件既会改动
-    # 用户数据，也要求 testSample 可写。
-    # 目录用 os.makedirs（默认权限，继承父目录）而不是 tempfile.mkdtemp：
-    # mkdtemp 会按 0o700 写入受限 ACL，在沙箱/受限令牌下反而不可写。
-    work = os.path.join(REPO, "_verify_p211_tmp")
-    shutil.rmtree(work, ignore_errors=True)
-    os.makedirs(work, exist_ok=True)
+    # 本用例既要改 APK mtime，也要清空缓存目录：全部在临时目录里做，
+    # 绝不动 %LOCALAPPDATA%/WinApkInfo/cache 里的真实用户缓存。
+    work = tempfile.mkdtemp(prefix="winapkinfo-p211-")
+    work_cache = os.path.join(work, "cache")
+    os.makedirs(work_cache, exist_ok=True)
     src = pick_apk(apks)
     apk = os.path.join(work, os.path.basename(src))
     shutil.copy2(src, apk)
+
+    saved_env = os.environ.get("WINAPKINFO_CACHE_DIR")
+    saved_cache = aapt_mod._aapt2_cache
+    saved_main_cache = m._aapt2_cache
+    os.environ["WINAPKINFO_CACHE_DIR"] = work_cache
     try:
-        shutil.rmtree(disk_dir, ignore_errors=True)
-        os.makedirs(disk_dir, exist_ok=True)   # 清空内容但保留目录（缓存对象持有该路径）
+        # 子进程通过 WINAPKINFO_CACHE_DIR 使用同一个临时缓存；
+        # 父进程的全局缓存也临时替换，避免 clear/get 落到真实目录。
+        aapt_mod._aapt2_cache = aapt_mod._Aapt2OutputCache(disk_dir=work_cache)
+        m._aapt2_cache = aapt_mod._aapt2_cache
+
         cold = _run_child(apk)
         warm = _run_child(apk)
         C.check("冷磁盘：需要启动 aapt2 子进程", cold > 0, "子进程=%d" % cold)
@@ -761,6 +769,12 @@ def check_p2_11():
                 len(key) == 7 and key[5] >= 1 and isinstance(key[6], tuple),
                 "键字段=%d" % len(key))
     finally:
+        aapt_mod._aapt2_cache = saved_cache
+        m._aapt2_cache = saved_main_cache
+        if saved_env is None:
+            os.environ.pop("WINAPKINFO_CACHE_DIR", None)
+        else:
+            os.environ["WINAPKINFO_CACHE_DIR"] = saved_env
         shutil.rmtree(work, ignore_errors=True)
 
 
