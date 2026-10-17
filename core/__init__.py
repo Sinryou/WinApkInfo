@@ -27,6 +27,7 @@ from core.resources import (
     _sdk_versions_cache,
     _sdk_load_warned,
     load_sdk_versions,
+    _LazyEntryMap,
     _entry_span,
     _ResourceIndex,
     extract_resource_entry,
@@ -68,6 +69,7 @@ from core.vector import (
     _resolve_vector_fill,
     _extend_square_caps,
     _draw_stroke,
+    _cmds_to_qpainterpath,
     rasterize_vector_layer,
     _trim_to_content,
 )

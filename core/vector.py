@@ -819,6 +819,142 @@ def _create_qbrush(fill, m, falpha: float):
     return None
 
 
+def _cmds_to_qpainterpath(cmds, m, fill_rule="nonzero", step=1.0) -> QtGui.QPainterPath:
+    """把 SVG path 命令直接构造成 Qt 原生 QPainterPath，利用 C++ 原生三次/二次贝塞尔与圆弧渲染。"""
+    qpath = QtGui.QPainterPath()
+    qpath.setFillRule(
+        QtCore.Qt.FillRule.OddEvenFill if fill_rule == "evenodd" else QtCore.Qt.FillRule.WindingFill
+    )
+    cur = [0.0, 0.0]
+    start = [0.0, 0.0]
+    last_cmd = None
+    last_ctrl = None
+
+    for cmd, args in cmds:
+        c = cmd
+        if c in ("Z", "z"):
+            qpath.closeSubpath()
+            cur = [start[0], start[1]]
+            last_cmd = "Z"
+            last_ctrl = None
+            continue
+
+        if c in ("M", "m"):
+            x, y = args[0], args[1]
+            if c == "m":
+                x += cur[0]
+                y += cur[1]
+            cur = [x, y]
+            start = [x, y]
+            tx, ty = _mat_apply(m, x, y)
+            qpath.moveTo(tx, ty)
+            last_cmd = "M"
+            last_ctrl = None
+            continue
+
+        rel = c.islower()
+        base = c.upper()
+        if base == "L":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                cur = [x, y]
+                tx, ty = _mat_apply(m, x, y)
+                qpath.lineTo(tx, ty)
+            last_cmd = "L"
+            last_ctrl = None
+        elif base == "H":
+            for k in range(len(args)):
+                x = args[k]
+                if rel:
+                    x += cur[0]
+                cur = [x, cur[1]]
+                tx, ty = _mat_apply(m, cur[0], cur[1])
+                qpath.lineTo(tx, ty)
+            last_cmd = "H"
+            last_ctrl = None
+        elif base == "V":
+            for k in range(len(args)):
+                y = args[k]
+                if rel:
+                    y += cur[1]
+                cur = [cur[0], y]
+                tx, ty = _mat_apply(m, cur[0], cur[1])
+                qpath.lineTo(tx, ty)
+            last_cmd = "V"
+            last_ctrl = None
+        elif base == "C":
+            for k in range(0, len(args), 6):
+                x1, y1, x2, y2, x, y = args[k:k + 6]
+                if rel:
+                    x1 += cur[0]; y1 += cur[1]; x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
+                p1 = _mat_apply(m, x1, y1)
+                p2 = _mat_apply(m, x2, y2)
+                p = _mat_apply(m, x, y)
+                qpath.cubicTo(p1[0], p1[1], p2[0], p2[1], p[0], p[1])
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+            last_cmd = "C"
+        elif base == "S":
+            for k in range(0, len(args), 4):
+                x2, y2, x, y = args[k:k + 4]
+                if rel:
+                    x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
+                if last_cmd in ("C", "S") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur[0], cur[1]
+                p1 = _mat_apply(m, x1, y1)
+                p2 = _mat_apply(m, x2, y2)
+                p = _mat_apply(m, x, y)
+                qpath.cubicTo(p1[0], p1[1], p2[0], p2[1], p[0], p[1])
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+            last_cmd = "S"
+        elif base == "Q":
+            for k in range(0, len(args), 4):
+                x1, y1, x, y = args[k:k + 4]
+                if rel:
+                    x1 += cur[0]; y1 += cur[1]; x += cur[0]; y += cur[1]
+                p1 = _mat_apply(m, x1, y1)
+                p = _mat_apply(m, x, y)
+                qpath.quadTo(p1[0], p1[1], p[0], p[1])
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+            last_cmd = "Q"
+        elif base == "T":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]; y += cur[1]
+                if last_cmd in ("Q", "T") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur[0], cur[1]
+                p1 = _mat_apply(m, x1, y1)
+                p = _mat_apply(m, x, y)
+                qpath.quadTo(p1[0], p1[1], p[0], p[1])
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+            last_cmd = "T"
+        elif base == "A":
+            for k in range(0, len(args), 7):
+                rx, ry, rot, large, sweep, x, y = args[k:k + 7]
+                if rel:
+                    x += cur[0]; y += cur[1]
+                arc_pts = _arc_points(cur[0], cur[1], rx, ry, rot, large != 0, sweep != 0, x, y, step)
+                for pt in arc_pts:
+                    tp = _mat_apply(m, pt[0], pt[1])
+                    qpath.lineTo(tp[0], tp[1])
+                cur = [x, y]
+                last_ctrl = None
+            last_cmd = "A"
+
+    return qpath
+
+
 def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=None):
     """使用 PyQt6 原生 QPainterPath / QPainter 进行 C++ 矢量光栅化。"""
     xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
@@ -882,25 +1018,13 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
             if not path_data:
                 continue
             cmds = _parse_path_commands(_tokenize_path_data(path_data))
-            subpaths = _flatten_subpaths(cmds, step)
-            if not subpaths:
+            if not cmds:
                 continue
             m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
-            tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
             fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
-
-            qpath = QtGui.QPainterPath()
-            qpath.setFillRule(
-                QtCore.Qt.FillRule.OddEvenFill if fill_rule == "evenodd" else QtCore.Qt.FillRule.WindingFill
-            )
-            for pts in tsubs:
-                if not pts:
-                    continue
-                qpath.moveTo(pts[0][0], pts[0][1])
-                for pt in pts[1:]:
-                    qpath.lineTo(pt[0], pt[1])
-                if len(pts) > 1 and abs(pts[-1][0] - pts[0][0]) < 1e-4 and abs(pts[-1][1] - pts[0][1]) < 1e-4:
-                    qpath.closeSubpath()
+            qpath = _cmds_to_qpainterpath(cmds, m, fill_rule, step)
+            if qpath.isEmpty():
+                continue
 
             if "fillColor" in a:
                 fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
