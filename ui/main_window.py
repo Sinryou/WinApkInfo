@@ -27,6 +27,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._busy = False
         # 当前已解析 APK 的路径：process_apk 显式记录，不再靠回读输入框
         self._apk_path = ""
+        # 最近一次成功解析的 badging 原始输出与对应文件路径。
+        # “重新解析”和“执行重命名”都以这里为准，不再依赖隐藏控件，
+        # 避免解析失败后残留的占位文本被当成真实输出。
+        self._raw_output = ""
+        self._parse_ok_path = ""
         # 基础解析线程（单常驻线程 + 最新请求覆盖）与向后兼容引用列表
         self._apk_worker = None
         self._apk_gen = 0
@@ -129,15 +134,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rename_layout.addWidget(btn_rename)
         layout.addWidget(rename_group)
 
-        # 原始输出
-        # raw_group = QtWidgets.QGroupBox("aapt2 原始输出")
-        # vg = QtWidgets.QVBoxLayout(raw_group)
-        self.te_raw = QtWidgets.QPlainTextEdit()
-        self.te_raw.setReadOnly(True)
-        self.te_raw.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-        # vg.addWidget(self.te_raw)
-        # layout.addWidget(raw_group, stretch=1)
-
         # 底部按钮
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_about = QtWidgets.QPushButton(" 关于 ")
@@ -190,6 +186,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
         self._apk_path = path
+        # 开始新一轮解析前清空上一轮的可导出/可重命名状态：
+        # 否则新 APK 解析失败时，旧图标和旧文件名预览会被误认为属于新文件。
+        self._raw_output = ""
+        self._parse_ok_path = ""
+        self._current_icon_bytes = None
+        self.icon_label.clear()
+        self.btn_export_icon.setVisible(False)
+        self.lbl_icon_hint.clear()
+        self.lbl_icon_hint.setToolTip("")
+        self.rename_preview.clear()
         # 若已有任务正在解析，强制中断前序 aapt2 子进程以快速让路，不再弹模态弹窗打断用户
         if self._busy:
             kill_running_aapt2()
@@ -209,9 +215,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apk_path_edit.setEnabled(not busy)
         if busy:
             self.setCursor(QtCore.Qt.CursorShape.WaitCursor)
-            self.te_raw.setPlainText("正在解析 APK，请稍候…")
+            self.statusBar().showMessage("正在解析 APK，请稍候…")
         else:
             self.unsetCursor()
+            self.statusBar().clearMessage()
 
     def _start_apk_worker(self, apk_path: str):
         """把 APK 解析请求交给常驻线程，最新请求覆盖旧请求。"""
@@ -293,7 +300,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if gen != 0 and gen != self._apk_gen:
             return  # 延迟到达的旧请求结果，丢弃
         try:
-            self.te_raw.setPlainText(output)
+            # 先记录原始输出：解析成功与否都不影响后续“重新解析”使用真实文本
+            self._raw_output = output
+            self._parse_ok_path = self._apk_path
             info = parse_aapt2_output(output)
             self.fill_info(info)
         except Exception as e:
@@ -307,15 +316,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_apk_info_failed(self, message: str, gen: int = 0):
         if gen != 0 and gen != self._apk_gen:
             return
+        logging.warning("解析 APK 失败（%s）：%s", self._apk_path, message)
+        # 失败后必须清空本轮状态：否则“重新解析”会把占位文本当 badging，
+        # 重命名预览也会把上一个 APK 的名字用到当前文件上。
+        self._raw_output = ""
+        self._apk_path = ""
+        self._parse_ok_path = ""
+        self._current_icon_bytes = None
+        self.icon_label.clear()
+        self.btn_export_icon.setVisible(False)
+        self.lbl_icon_hint.clear()
+        self.lbl_icon_hint.setToolTip("")
+        self.rename_preview.clear()
         QtWidgets.QMessageBox.critical(self, "错误", message)
         self.set_busy(False)
 
     def reparse_current(self):
-        text = self.te_raw.toPlainText()
-        if not text.strip():
+        # 只重新解析最近一次成功得到的真实 badging 文本；
+        # 解析失败后 _raw_output 已清空，不能再用隐藏控件里的占位内容。
+        if not self._raw_output.strip():
             return
         try:
-            info = parse_aapt2_output(text)
+            info = parse_aapt2_output(self._raw_output)
             self.fill_info(info)
         except Exception as e:
             logging.exception("重新解析失败: %s", e)
@@ -470,6 +492,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not old_path or not os.path.isfile(old_path):
             QtWidgets.QMessageBox.warning(self, "提示", "未选择有效的 APK 文件。")
             return
+        if self._parse_ok_path != old_path:
+            # 解析失败或输入框被改成别的路径时，预览名仍可能来自上一个 APK，
+            # 直接重命名会把错误的名字用到当前文件上。
+            QtWidgets.QMessageBox.warning(
+                self, "提示", "当前 APK 尚未成功解析，请先重新解析后再重命名。"
+            )
+            return
         if not new_name:
             QtWidgets.QMessageBox.warning(self, "提示", "没有生成新的文件名。")
             return
@@ -491,6 +520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             os.replace(old_path, new_path)
             QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
             self._apk_path = new_path
+            self._parse_ok_path = new_path
             self.apk_path_edit.setText(new_path)
             self.rename_preview.setText(new_name)
         except Exception as e:
