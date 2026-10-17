@@ -277,9 +277,6 @@ def extract_icon_bytes(apk_path, foreground, background, size=_ICON_SIZE, fg_sca
         # 合成 (背景在下，前景在上)
         final_img = Image.alpha_composite(background_img, foreground_img)
 
-        # 裁掉纯色/透明空边，避免生成的图标带白边
-        # final_img = _trim_to_content(final_img, size)
-
         # 转字节流
         output = io.BytesIO()
         final_img.save(output, format="PNG")
