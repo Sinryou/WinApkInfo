@@ -17,6 +17,8 @@ from pathlib import Path
 import zipfile
 from PIL import Image, ImageChops, ImageDraw
 
+from version import __version__
+
 try:
     import numpy as np
 except ImportError:  # numpy 可选：缺失时栅格化回退纯 Python 实现
@@ -3000,7 +3002,7 @@ class MainWindow(QtWidgets.QWidget):
             "基于 PyQt6 + aapt2 的图形化<br>"
             "解析 APK 文件信息的工具程序<br><br>"
             '更多信息: <a href="https://github.com/Sinryou/WinApkInfo">项目主页</a><br>'
-            "版本: 1.1.2<br>"
+            f"版本: {__version__}<br>"
             "Copyright (c) 2025-2026 Sinryou.<br>At MIT License."
         )
 
@@ -3065,6 +3067,61 @@ def install_excepthook():
     sys.excepthook = _hook
 
 
+def _self_test(apk_path: str = None) -> int:
+    """打包后自检（`WinApkInfo.exe --self-test [apk]`），供构建管线验证产物。
+
+    不创建 QApplication，只检查运行时依赖与随包资源：aapt2 可执行、
+    resources/ 下的图标与 SDK 表齐全。传入 APK 时还会走一遍真实的
+    badging → 最佳密度 → 图标提取链路，验证 aapt2 与图片解码在打包
+    环境下确实可用。窗口模式没有控制台，构建脚本只依据退出码判断；
+    失败详情写入日志文件。
+    """
+    problems = []
+    aapt2_path = None
+    try:
+        aapt2_path = find_aapt2()
+        rc, out, err = _run_aapt2([aapt2_path, "version"], timeout=30)
+        if rc != 0:
+            detail = (_decode_output(err or out)).strip() or f"退出码 {rc}"
+            problems.append(f"aapt2 无法运行：{detail}")
+    except Exception as e:
+        problems.append(f"找不到可用的 aapt2：{e}")
+
+    for rel in ("resources/android_sdk_versions.json", "resources/logo.ico", "resources/info.png"):
+        path = local_resource_path(rel)
+        if not os.path.isfile(path):
+            problems.append(f"缺少随包资源：{path}")
+
+    try:
+        if not load_sdk_versions():
+            problems.append("SDK 版本表为空或无法解析")
+    except Exception as e:
+        problems.append(f"读取 SDK 版本表失败：{e}")
+
+    if apk_path:
+        try:
+            info = parse_aapt2_output(run_aapt2_dump_badging(apk_path))
+            icons = info.get("icons") or {}
+            if not icons:
+                problems.append(f"样本 APK 没有可用图标：{apk_path}")
+            else:
+                icon_path = max(icons.items(), key=lambda item: int(item[0]))[1]
+                image, data = IconWorker()._extract(apk_path, icon_path)
+                if image.isNull() or not data:
+                    problems.append(f"样本 APK 图标提取结果为空：{icon_path}")
+                else:
+                    logging.info("自检图标提取通过：%s -> %d 字节", icon_path, len(data))
+        except Exception as e:
+            problems.append(f"样本 APK 图标提取失败：{e}")
+
+    if problems:
+        for problem in problems:
+            logging.error("自检失败：%s", problem)
+        return 1
+    logging.info("自检通过：aapt2=%s", aapt2_path)
+    return 0
+
+
 def main():
     # 日志：控制台模式输出到 stderr；PyInstaller 窗口模式（无 stderr）落盘到临时目录
     if sys.stderr is not None:
@@ -3075,6 +3132,18 @@ def main():
             format="%(asctime)s %(levelname)s %(message)s",
             filename=os.path.join(tempfile.gettempdir(), "winapkinfo.log"),
         )
+
+    # 构建/排障入口：--version 输出版本，--self-test 检查打包产物是否完整
+    if "--version" in sys.argv:
+        if sys.stdout is not None:
+            print(__version__)
+        return 0
+    if "--self-test" in sys.argv:
+        index = sys.argv.index("--self-test")
+        apk_path = None
+        if index + 1 < len(sys.argv) and not sys.argv[index + 1].startswith("-"):
+            apk_path = sys.argv[index + 1]
+        return _self_test(apk_path)
 
     # 高分屏适配：Qt6 默认启用 high-DPI 缩放（AA_EnableHighDpiScaling /
     # AA_UseHighDpiPixmaps 已废弃），无需再设置任何属性。
@@ -3088,8 +3157,8 @@ def main():
     code = app.exec()
     # 事件循环结束后必须确认后台线程已退出：QThread 运行中被析构会让进程崩溃
     w.shutdown_background()
-    sys.exit(code)
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

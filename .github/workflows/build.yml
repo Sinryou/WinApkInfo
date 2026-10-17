@@ -1,0 +1,97 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.mode }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [onedir, onefile]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Locate aapt2 from Android SDK
+        shell: pwsh
+        run: |
+          $localSdk = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Android\Sdk" } else { $null }
+          $roots = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, $localSdk, "C:\Android\android-sdk") |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+            Select-Object -Unique
+          $candidates = foreach ($root in $roots) {
+            $buildTools = Join-Path $root "build-tools"
+            if (Test-Path -LiteralPath $buildTools) {
+              Get-ChildItem -LiteralPath $buildTools -Directory |
+                Sort-Object -Property Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "aapt2.exe" }
+            }
+          }
+          $aapt2 = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $aapt2) {
+            throw "aapt2.exe was not found in the Windows runner's Android SDK."
+          }
+          Write-Host "Using aapt2: $aapt2"
+          "AAPT2_PATH=$aapt2" >> $env:GITHUB_ENV
+
+      - name: Build and package
+        shell: pwsh
+        run: .\build.ps1 -Mode ${{ matrix.mode }} -Aapt2Path $env:AAPT2_PATH -Clean
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinApkInfo-${{ matrix.mode }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

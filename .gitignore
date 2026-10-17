@@ -31,6 +31,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# 本项目的 PyInstaller spec 需要入库；上面的通配规则忽略临时生成的 spec
+!WinApkInfo.spec
 
 # Installer logs
 pip-log.txt
@@ -182,4 +184,7 @@ cython_debug/
 /.idea
 /main.dist
 /_icon_out
+/_debugout
 /testSample
+# 本地提供的 aapt2 二进制，不入库
+/tools/aapt2.exe

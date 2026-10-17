@@ -33,3 +33,83 @@
 
 - **aapt2 原始输出**  
   - 提供完整文本输出，方便进一步分析  
+
+## 运行环境
+
+- Windows 10/11（x64）
+- Python 3.10+
+- `aapt2`（解析 APK 时必需）
+
+## 从源码运行
+
+```powershell
+python -m pip install -r requirements.txt
+python main.py
+```
+
+`aapt2` 的查找顺序：程序目录 → 程序目录下 `tools/aapt2.exe` → 系统 `PATH`。开发时也可以直接把 `aapt2.exe` 放到仓库的 `tools/` 目录。
+
+## 构建与打包
+
+构建脚本基于 PyInstaller，产出免安装的 Windows 目录版和单文件版：
+
+```powershell
+# 安装构建依赖（包含运行依赖）
+python -m pip install -r requirements-dev.txt
+
+# 目录版（启动快，推荐）
+.\build.ps1 -Clean
+
+# 单文件版
+.\build.ps1 -Clean -Mode onefile
+```
+
+如果 `aapt2.exe` 不在 `tools/`、不在 `PATH`、也不在 Android SDK 的 `build-tools` 中，显式传入：
+
+```powershell
+.\build.ps1 -Clean -Aapt2Path "D:\Android\Sdk\build-tools\35.0.0\aapt2.exe"
+```
+
+构建完成后：
+
+```text
+dist/WinApkInfo-<version>-windows-x64-onedir.zip
+dist/WinApkInfo-<version>-windows-x64-onefile.zip
+dist/WinApkInfo-<version>-windows-x64-<mode>.zip.sha256
+```
+
+脚本会依次执行：检查依赖 → 运行回归检查（`verify_fixes.py --quick`）→ 生成 Windows 文件版本信息 → 打包 `resources/` 与 `aapt2.exe` → 运行 `WinApkInfo.exe --self-test` → 生成 zip 与 SHA256。
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `-Mode onedir\|onefile` | 目录版或单文件版，默认 `onedir` |
+| `-Aapt2Path <file>` | 指定要随包携带的 `aapt2.exe` |
+| `-Version <x.y.z>` | 覆盖 `version.py` 中的版本号 |
+| `-SkipTests` | 跳过构建前回归检查 |
+| `-FullTests` | 运行需要 `testSample/` 的完整回归；不传则只跑合成用例 |
+| `-AllowMissingAapt2` | 允许构建不含 `aapt2.exe` 的包（仅排障用） |
+| `-NoZip` | 只生成 `dist/`，不创建 zip |
+| `-Clean` | 构建前删除 `build/` 与 `dist/` |
+| `-Python <exe>` | 指定 Python 解释器 |
+
+版本号统一在 [`version.py`](version.py) 中维护，构建脚本、Windows 文件属性与“关于”对话框共用该值。
+
+### 自检与回归
+
+```powershell
+python verify_fixes.py --quick   # 不依赖 testSample，适合 CI
+python verify_fixes.py           # 含真实 APK 端到端，需要 testSample/
+python main.py --version         # 打印版本
+python main.py --self-test       # 检查 aapt2 与随包资源
+```
+
+### 持续集成
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) 会在 Windows runner 上构建 `onedir` 与 `onefile` 两种产物并上传 artifact；推送 `v*` 标签时会自动创建 GitHub Release 并附带 zip 与校验文件。
+
+```powershell
+git tag v1.1.2
+git push origin v1.1.2
+```
