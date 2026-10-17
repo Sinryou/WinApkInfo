@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """标准测试适配入口，支持 pytest 与 python -m unittest 自动发现执行。"""
+import io
 import os
 import sys
 import glob
+import tempfile
 import unittest
+import zipfile
 
 # 确保项目根目录在 sys.path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +20,8 @@ import core.resources as res_mod
 import core.vector as vec_mod
 import ui.main_window as mw_mod
 import verify_fixes
+from PIL import Image
+from ui.workers import IconWorker
 
 
 class TestSignatureAndMeta(unittest.TestCase):
@@ -101,6 +106,25 @@ class TestVectorRasterization(unittest.TestCase):
         m = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
         qpath = vec_mod._cmds_to_qpainterpath(cmds, m, "nonzero")
         self.assertFalse(qpath.isEmpty())
+
+
+class TestIconTypeSniffing(unittest.TestCase):
+    """混淆 APK 的资源路径可能没有扩展名，提取链必须按魔数兜底。"""
+
+    def test_extensionless_png_is_extracted(self):
+        buf = io.BytesIO()
+        Image.new("RGBA", (16, 16), (255, 0, 0, 255)).save(buf, format="PNG")
+
+        fd, apk_path = tempfile.mkstemp(suffix=".apk", prefix="winapkinfo-test-")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(apk_path, "w") as zf:
+                zf.writestr("res/Ab", buf.getvalue())
+            image, data = IconWorker()._extract(apk_path, "res/Ab")
+            self.assertFalse(image.isNull())
+            self.assertTrue(data.startswith(b"\x89PNG"))
+        finally:
+            os.remove(apk_path)
 
 
 class TestRegressionSuite(unittest.TestCase):

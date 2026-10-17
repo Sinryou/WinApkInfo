@@ -10,12 +10,15 @@ from PIL import Image
 from PyQt6 import QtCore, QtGui
 
 from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2_dump_xmltree
-from core.resources import _ResourceIndex, _open_apk_zip
+from core.resources import _ResourceIndex, _open_apk_zip, _sniff_file_kind
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
     _ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
     extract_icon_bytes, find_mipmap_fallback, _normalize_icon_png
 )
+
+# 图标路径的快速后缀判断；后缀不可信（混淆包可能没有扩展名）时再按魔数嗅探
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 class _Cancelled(Exception):
     """内部取消信号：请求被更新的请求覆盖、或窗口关闭时抛出让工作者丢弃本轮。"""
@@ -233,21 +236,45 @@ class IconWorker(QtCore.QThread):
         img = QtGui.QImage()
         data = b""
         with _open_apk_zip(apk_path, zf) as shared_zf:
-            if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            kind = self._icon_kind(apk_path, icon_path, shared_zf)
+            if kind == "image":
                 raw = shared_zf.open(icon_path).read()
                 data = _normalize_icon_png(raw) or raw
                 if not self._load_image(img, data):
-                    raise ValueError(f"图标文件无法解码为图片: {icon_path}")
+                    # 后缀可能是伪装/错误的：按魔数再确认一次是否为 XML。
+                    # 例如 AndResGuard 有时会把二进制 XML 改名成 .png。
+                    if _sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
+                        kind = "xml"
+                    else:
+                        raise ValueError(f"图标文件无法解码为图片: {icon_path}")
 
-            elif icon_path.lower().endswith('.xml'):
+            if kind == "xml":
                 data = self._extract_adaptive_icon(apk_path, icon_path, zf=shared_zf)
                 if not data:
                     raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
                 if not self._load_image(img, data):
                     raise ValueError("合成后的图标无法解码为图片")
-            else:
-                raise ValueError(f"不支持的图标类型: {icon_path}")
+            elif kind != "image":
+                raise ValueError(f"无法识别图标类型（非图片也非 XML）: {icon_path}")
         return img, data
+
+    @staticmethod
+    def _icon_kind(apk_path: str, icon_path: str, zf=None):
+        """按后缀/魔数判断图标是位图还是 XML。
+
+        混淆包（AndResGuard 等）的资源路径可能完全没有扩展名，此时不能只靠
+        endswith 分派，否则明明能读取的图标会被判成“不支持的类型”。
+        """
+        lower = icon_path.lower()
+        if lower.endswith(_IMAGE_EXTENSIONS):
+            return "image"
+        if lower.endswith(".xml"):
+            return "xml"
+        try:
+            return _sniff_file_kind(apk_path, icon_path, zf=zf)
+        except Exception as e:
+            logging.debug("图标类型嗅探失败 %s: %s", icon_path, e)
+            return None
 
 
 class _ApkInfoWorkerCore(QtCore.QObject):
