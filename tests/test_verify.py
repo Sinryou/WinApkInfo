@@ -66,7 +66,21 @@ class TestSignatureAndMeta(unittest.TestCase):
 
 
 class TestCacheManagement(unittest.TestCase):
-    """测试磁盘缓存统计与清空逻辑。"""
+    """测试缓存容量、缓存键与磁盘缓存统计逻辑。"""
+
+    def test_memory_byte_cap(self):
+        cache = aapt_mod._Aapt2OutputCache(capacity=10, disk_dir=None, mem_max_bytes=100)
+        cache.put(("m1",), "x" * 60)
+        cache.put(("m2",), "x" * 60)
+        self.assertEqual(len(cache._cache), 1)
+        self.assertIsNone(cache.get(("m1",)))
+        self.assertEqual(cache.get(("m2",)), "x" * 60)
+
+    def test_cache_key_is_versioned(self):
+        key = aapt_mod._aapt2_cache_key(__file__, "badging")
+        self.assertEqual(len(key), 7)
+        self.assertGreaterEqual(key[5], 1)
+        self.assertIsInstance(key[6], tuple)
 
     def test_disk_cache_info_and_clear(self):
         info = aapt_mod.get_disk_cache_info()

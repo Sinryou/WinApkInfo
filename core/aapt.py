@@ -27,6 +27,9 @@ class Aapt2Error(RuntimeError):
 # 单个 aapt2 子进程的最长运行时间（秒）：异常的 APK 不应让工作线程永久阻塞
 _AAPT2_TIMEOUT = 60
 
+# 缓存键的 schema 版本：解析逻辑或输出格式变化时递增，让旧磁盘条目自然失效
+_AAPT2_CACHE_VERSION = 2
+
 # 正在运行的 aapt2 子进程句柄：关闭窗口时用于强制结束，
 # 这样工作线程能自己返回，无需（也不该）使用 QThread.terminate()
 _running_procs = set()
@@ -108,6 +111,9 @@ class _Aapt2OutputCache:
     磁盘层有双重上限：单条超过 disk_max_entry 的输出（例如几十 MB 的
     resources dump）只留在内存不落盘，整目录再受 disk_limit 条数与
     disk_max_bytes 总字节约束，超限按 mtime 从最旧的开始删。
+
+    内存层同样有字节上限：capacity 只能限制条数，单条 resources dump
+    可达几十 MB，必须再按总字节淘汰，避免长时间运行累积成数百 MB。
     """
 
     # 单条超过 8MB 的 dump 不落盘（Play 商店包实测单条 resources dump 36MB）
@@ -115,12 +121,17 @@ class _Aapt2OutputCache:
     # 磁盘缓存总量上限 200MB / 300 条
     DISK_MAX_BYTES = 200 * 1024 * 1024
     DISK_LIMIT = 300
+    # 内存层总量上限 64MB（单条超大 dump 至少保留一条，避免反复重跑 aapt2）
+    MEM_MAX_BYTES = 64 * 1024 * 1024
 
     def __init__(self, capacity=64, disk_dir=None, disk_limit=None,
-                 disk_max_bytes=None, disk_max_entry=None):
+                 disk_max_bytes=None, disk_max_entry=None, mem_max_bytes=None):
         self._capacity = capacity
         self._cache = {}
         self._order = []
+        self._sizes = {}
+        self._mem_bytes = 0
+        self._mem_max_bytes = self.MEM_MAX_BYTES if mem_max_bytes is None else mem_max_bytes
         self._lock = threading.Lock()
         self._disk_dir = disk_dir
         self._disk_limit = self.DISK_LIMIT if disk_limit is None else disk_limit
@@ -154,14 +165,36 @@ class _Aapt2OutputCache:
         with self._lock:
             self._cache.clear()
             del self._order[:]
+            self._sizes.clear()
+            self._mem_bytes = 0
+
+    def _evict_oldest(self):
+        """从内存层淘汰最旧一条（调用方需持有 _lock）。"""
+        old = self._order.pop(0)
+        self._cache.pop(old, None)
+        self._mem_bytes -= self._sizes.pop(old, 0)
 
     def _remember(self, key, value):
         """写入内存层（调用方需持有 _lock）。"""
-        if key not in self._cache:
+        if isinstance(value, str):
+            size = len(value.encode("utf-8"))
+        elif isinstance(value, (bytes, bytearray)):
+            size = len(value)
+        else:
+            size = 0
+        if key in self._cache:
+            self._mem_bytes -= self._sizes.get(key, 0)
+        else:
             self._order.append(key)
         self._cache[key] = value
-        while len(self._order) > self._capacity:
-            self._cache.pop(self._order.pop(0), None)
+        self._sizes[key] = size
+        self._mem_bytes += size
+        # 条数上限与字节上限同时生效；至少保留一条，避免单条超大 dump
+        # 每次都因为超限被立刻淘汰、导致 aapt2 反复重跑。
+        while len(self._order) > self._capacity and self._order:
+            self._evict_oldest()
+        while self._mem_bytes > self._mem_max_bytes and len(self._order) > 1:
+            self._evict_oldest()
 
     # ---------------- 磁盘层 ----------------
     def _disk_path(self, key):
@@ -260,6 +293,11 @@ def _default_disk_cache_dir():
     if os.environ.get("WINAPKINFO_NO_DISK_CACHE"):
         return None
 
+    # 测试/排障可把缓存目录整体重定向到临时目录，避免污染真实用户缓存
+    custom_dir = os.environ.get("WINAPKINFO_CACHE_DIR")
+    if custom_dir:
+        return os.path.abspath(os.path.expanduser(custom_dir))
+
     # Windows 平台标准应用缓存目录
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -288,8 +326,22 @@ def _default_disk_cache_dir():
 _aapt2_cache = _Aapt2OutputCache(disk_dir=_default_disk_cache_dir())
 
 
+def _aapt2_cache_identity():
+    """返回 aapt2 工具的 (路径, mtime_ns, size)，找不到时返回空标识。
+
+    缓存键必须包含工具版本信息：升级随包 aapt2 后，dump 的格式或行为
+    可能变化，仅靠 APK 的 mtime/size 无法让旧输出失效。
+    """
+    try:
+        path = find_aapt2()
+        st = os.stat(path)
+        return (path, st.st_mtime_ns, st.st_size)
+    except Exception:
+        return ("", 0, 0)
+
+
 def _aapt2_cache_key(apk_path: str, kind: str, arg=None):
-    """(绝对路径, mtime_ns, 大小, 子命令, 参数) 缓存键。
+    """(绝对路径, mtime_ns, 大小, 子命令, 参数, schema 版本, aapt2 标识) 缓存键。
 
     os.stat 失败时统一抛 Aapt2Error 而不是裸 OSError：调用方
     （run_aapt2_dump_*）的异常处理与提示都是围绕 Aapt2Error 组织的，
@@ -299,7 +351,10 @@ def _aapt2_cache_key(apk_path: str, kind: str, arg=None):
         st = os.stat(apk_path)
     except OSError as e:
         raise Aapt2Error(f"无法读取 APK 文件：{apk_path}（{e.strerror or e}）")
-    return (os.path.abspath(apk_path), st.st_mtime_ns, st.st_size, kind, arg)
+    return (
+        os.path.abspath(apk_path), st.st_mtime_ns, st.st_size, kind, arg,
+        _AAPT2_CACHE_VERSION, _aapt2_cache_identity(),
+    )
 
 
 @functools.lru_cache(maxsize=1)

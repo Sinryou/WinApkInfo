@@ -755,8 +755,10 @@ def check_p2_11():
         m._aapt2_cache.clear()
         C.check("内存层清空后仍能命中磁盘（mtime 已精确还原）",
                 m._aapt2_cache.get(m._aapt2_cache_key(apk, "badging")) is not None)
-        C.check("缓存键包含文件大小（APK 替换即失效）",
-                len(m._aapt2_cache_key(apk, "badging")) == 5)
+        key = m._aapt2_cache_key(apk, "badging")
+        C.check("缓存键包含文件大小、schema 版本与 aapt2 标识",
+                len(key) == 7 and key[5] >= 1 and isinstance(key[6], tuple),
+                "键字段=%d" % len(key))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -919,7 +921,7 @@ def check_b1(app):
 
 
 def check_b2(full_mode):
-    C.title("B2 磁盘缓存字节上限")
+    C.title("B2 缓存字节上限")
     tmp = os.path.join(REPO, "_verify_cache_tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -935,12 +937,20 @@ def check_b2(full_mode):
         C.check("超过单条上限的输出不落盘",
                 len(os.listdir(tmp)) == len(files) and c.get(("big",)) is not None,
                 "仍在内存层可命中")
+
+        mem = m._Aapt2OutputCache(capacity=10, disk_dir=None, mem_max_bytes=100)
+        mem.put(("m1",), "x" * 60)
+        mem.put(("m2",), "x" * 60)
+        C.check("内存层字节上限生效",
+                len(mem._cache) == 1 and mem.get(("m1",)) is None and mem.get(("m2",)) == "x" * 60,
+                "保留 %d 条" % len(mem._cache))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    C.check("默认上限：单条 8MB / 总量 200MB",
+    C.check("默认上限：单条 8MB / 磁盘 200MB / 内存 64MB",
             m._Aapt2OutputCache.DISK_MAX_ENTRY == 8 * 1024 * 1024 and
-            m._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024)
+            m._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024 and
+            m._Aapt2OutputCache.MEM_MAX_BYTES == 64 * 1024 * 1024)
     if not full_mode:
         return
     disk_dir = m._aapt2_cache._disk_dir
