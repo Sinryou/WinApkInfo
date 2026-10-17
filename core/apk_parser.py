@@ -12,7 +12,7 @@ from PIL import Image, ImageChops
 from core.aapt import run_aapt2_dump_resource, run_aapt2_dump_xmltree
 from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    _ResourceIndex, extract_resource_entry, _density_of,
+    _ResourceIndex, _entry_span, extract_resource_entry, _density_of,
     _pick_best_density, _sniff_file_kind, get_resource_info,
     _BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
 )
@@ -313,15 +313,21 @@ def parse_aapt2_output(text: str) -> dict:
     }
 
     # --- 基本信息 ---
-    m_pkg = re.search(
-        r"package:\s+name='([^']+)'\s+versionCode='([^']+)'\s+versionName='([^']+)'.*?",
-        text,
-        re.S,
-    )
+    # package 行的属性顺序随 aapt2 版本变化（如 versionCodeMajor 可能插在
+    # versionCode 与 versionName 之间），整行一次性匹配会让包名与版本号
+    # 全部丢失；先截取 package 行，再逐个属性独立提取。
+    m_pkg = re.search(r"package:\s[^\n]*", text)
     if m_pkg:
-        info["package_name"] = m_pkg.group(1)
-        info["version_code"] = m_pkg.group(2)
-        info["version_name"] = m_pkg.group(3)
+        pkg_line = m_pkg.group(0)
+        m_name = re.search(r"\bname='([^']+)'", pkg_line)
+        if m_name:
+            info["package_name"] = m_name.group(1)
+        m_vcode = re.search(r"\bversionCode='([^']+)'", pkg_line)
+        if m_vcode:
+            info["version_code"] = m_vcode.group(1)
+        m_vname = re.search(r"\bversionName='([^']+)'", pkg_line)
+        if m_vname:
+            info["version_name"] = m_vname.group(1)
 
     # 平台/编译 SDK
     m_plat = re.search(

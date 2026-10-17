@@ -1106,6 +1106,24 @@ def check_new_fixes():
             info["architectures"] == ["arm64-v8a", "armeabi-v7a"],
             "%r" % info["architectures"])
 
+    # --- package 行属性顺序容错（versionCodeMajor 插在中间时不再整行丢失）---
+    info_pkg = m.parse_aapt2_output(
+        "package: name='com.a' versionCode='7' versionCodeMajor='0' versionName='2.3.4'\n")
+    C.check("package 行含 versionCodeMajor 仍解析出包名/版本",
+            info_pkg["package_name"] == "com.a" and
+            info_pkg["version_code"] == "7" and
+            info_pkg["version_name"] == "2.3.4",
+            "%r / %r / %r" % (info_pkg["package_name"], info_pkg["version_code"],
+                              info_pkg["version_name"]))
+
+    # --- find_mipmap_fallback 无 index 路径（曾因未导入 _entry_span 抛 NameError）---
+    fake_res = ("resource 0x7f0e0001 res/mipmap/ic_launcher\n"
+                "    (anydpi-v26) (file) res/mipmap-anydpi-v26/ic_launcher.xml type=XML\n"
+                "    (xxxhdpi) (file) res/mipmap-xxxhdpi-v4/ic_launcher.png type=PNG\n")
+    fb = m.find_mipmap_fallback(fake_res, "res/mipmap-anydpi-v26/ic_launcher.xml")
+    C.check("find_mipmap_fallback 无 index 也能返回最高密度位图",
+            fb == "res/mipmap-xxxhdpi-v4/ic_launcher.png", "%r" % fb)
+
 
 def check_end_to_end(app, limit):
     C.title("E. 端到端：真实样本 APK 解析 + 图标提取")
