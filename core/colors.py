@@ -111,7 +111,6 @@ _FRAMEWORK_COLOR_MAP = {
     "0x01060054": "#fffdd7fa",  # system_accent3_100
     "0x01060055": "#ffe0bbdd",  # system_accent3_200
     "0x01060056": "#ffc3a0c1",  # system_accent3_300
-    "0x01060057": "#ffc3a0c1",  # system_accent3_400 (stop)
     "0x01060057": "#ffa886a6",  # system_accent3_400
     "0x01060058": "#ff8c6d8c",  # system_accent3_500
     "0x01060059": "#ff725572",  # system_accent3_600
