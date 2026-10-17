@@ -605,8 +605,13 @@ def get_resource_info(entry_text: str) -> dict:
             "type": "image",       "value": 最高密度位图路径（png/webp/jpg/gif）
             "type": "vector",      "value": xml 路径（矢量 drawable，无法直接栅格化）
             "type": "string_file", "value": 指向文件的字符串值（混淆包），需进一步解析
+            "type": "ref",         "value": 另一个资源地址（如 "@0x0106003b"）
             "type": "unknown",     "value": None
         }
+
+    "ref" 是 Android 资源别名：`aapt2 dump resources` 对颜色别名输出
+    `() @0x0106003b`（RootMyVivo 的 launcher 颜色就全部是这种写法），
+    旧实现不识别该行，导致颜色层被判为 unknown、整张图标透明。
     """
     lines = (entry_text or "").splitlines()
 
@@ -614,10 +619,13 @@ def get_resource_info(entry_text: str) -> dict:
     xml_files = []      # path
     string_files = []   # (density, value)
     color = None
+    ref = None
 
     file_re = re.compile(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+?)(?:\s+type=(\w+))?\s*$")
     str_re = re.compile(r"^\s*\(([^)]*)\)\s*\"([^\"]+)\"\s*$")
-    color_re = re.compile(r"^\s*\(\s*\)\s*(#[0-9a-fA-F]{6,8})\s*$")
+    # #RGB / #ARGB / #RRGGBB / #AARRGGBB 都是合法颜色
+    color_re = re.compile(r"^\s*\(\s*\)\s*(#[0-9a-fA-F]{3,8})\s*$")
+    ref_re = re.compile(r"^\s*\(\s*\)\s*@?(0x[0-9a-fA-F]+)\s*$")
 
     for line in lines[1:]:  # 跳过 `resource 0x..` 头部行
         m = file_re.match(line)
@@ -636,6 +644,11 @@ def get_resource_info(entry_text: str) -> dict:
             m = color_re.match(line)
             if m:
                 color = m.group(1)
+                continue
+        if ref is None:
+            m = ref_re.match(line)
+            if m:
+                ref = m.group(1).lower()
 
     if bitmaps:
         return {"type": "image", "value": _pick_best_density(bitmaps)}
@@ -643,6 +656,8 @@ def get_resource_info(entry_text: str) -> dict:
         return {"type": "color", "value": color}
     if xml_files:
         return {"type": "vector", "value": xml_files[0]}
+    if ref:
+        return {"type": "ref", "value": ref}
     if string_files:
         return {"type": "string_file", "value": string_files[0][1]}
     return {"type": "unknown", "value": None}
@@ -725,7 +740,8 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
 
     支持混淆包的解引用链：字符串值指向文件、无扩展名文件按魔数识别、
     <scale> 包装继续跟随 android:drawable 引用；深度受限防止循环。
-    另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）。
+    另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）
+    以及应用内资源别名（`() @0x7f......`，颜色资源常见的间接层）。
     index 为 _ResourceIndex 时条目查询 O(1)。
     """
     rid = (res_id or "").lower()
@@ -742,6 +758,9 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
         return (kind, value, None)
     if depth >= _MAX_DEREF_DEPTH:
         return ("vector", value, None) if kind == "vector" else (None, None, None)
+    if kind == "ref" and value:
+        # 应用内别名：继续跟随（目标可能是颜色/位图/矢量，也可能是框架颜色）
+        return resolve_icon_layer(apk_path, full_res, value, depth + 1, index)
     if kind == "string_file":
         ext = os.path.splitext(value)[1].lower()
         if ext in _BITMAP_EXTS:
@@ -826,15 +845,209 @@ def parse_android_color(color_str: str):
 
 # ---------------- Vector Drawable 栅格化 ----------------
 
-# Android 框架（android 包）中常见的颜色资源，用于解析 0x01xxxxxx 引用
-# （TS 等混淆包的自适应图标背景会直接引用 @android:color/transparent）
+# Android 框架（android 包）颜色资源表：键为 AOSP public-final.xml 中的公开
+# color 资源 ID，值为 colors*.xml 的默认 ARGB。用于解析 0x01xxxxxx 引用
+# （自适应图标背景/前景常直接引用 @android:color/...）。
+#
+# system_* 是 Material You 动态色，设备上可被 OverlayManager 按壁纸替换；
+# 这里使用 AOSP 默认调色板（Pixel 默认主题）。静态解析拿不到用户主题，
+# 取默认值仍能渲染出接近真实图标的颜色，比按"未知"当透明更可用。
 _FRAMEWORK_COLOR_MAP = {
-    "0x0106000b": "#00000000",  # android:color/transparent
-    "0x0106000c": "#ff000000",  # android:color/black
-    "0x0106000d": "#ffffffff",  # android:color/white
-    "0x0106000e": "#ff444444",  # android:color/darker_gray
-    "0x0106000f": "#ff888888",  # android:color/gray
-    "0x01060010": "#ffcccccc",  # android:color/lighter_gray
+    "0x01060000": "#ffaaaaaa",  # darker_gray
+    "0x0106000b": "#ffffffff",  # white
+    "0x0106000c": "#ff000000",  # black
+    "0x0106000d": "#00000000",  # transparent
+    "0x0106000e": "#ff000000",  # background_dark
+    "0x0106000f": "#ffffffff",  # background_light
+    "0x01060012": "#ff33b5e5",  # holo_blue_light
+    "0x01060013": "#ff0099cc",  # holo_blue_dark
+    "0x01060014": "#ff99cc00",  # holo_green_light
+    "0x01060015": "#ff669900",  # holo_green_dark
+    "0x01060016": "#ffff4444",  # holo_red_light
+    "0x01060017": "#ffcc0000",  # holo_red_dark
+    "0x01060018": "#ffffbb33",  # holo_orange_light
+    "0x01060019": "#ffff8800",  # holo_orange_dark
+    "0x0106001a": "#ffaa66cc",  # holo_purple
+    "0x0106001b": "#ff00ddff",  # holo_blue_bright
+    "0x0106001c": "#00000000",  # system_notification_accent_color
+    "0x0106001d": "#ffffffff",  # system_neutral1_0
+    "0x0106001e": "#fffefbff",  # system_neutral1_10
+    "0x0106001f": "#fff1f0f7",  # system_neutral1_50
+    "0x01060020": "#ffe2e2e9",  # system_neutral1_100
+    "0x01060021": "#ffc6c6cd",  # system_neutral1_200
+    "0x01060022": "#ffababb1",  # system_neutral1_300
+    "0x01060023": "#ff909097",  # system_neutral1_400
+    "0x01060024": "#ff76777d",  # system_neutral1_500
+    "0x01060025": "#ff5d5e64",  # system_neutral1_600
+    "0x01060026": "#ff45464c",  # system_neutral1_700
+    "0x01060027": "#ff2f3036",  # system_neutral1_800
+    "0x01060028": "#ff1a1b20",  # system_neutral1_900
+    "0x01060029": "#ff000000",  # system_neutral1_1000
+    "0x0106002a": "#ffffffff",  # system_neutral2_0
+    "0x0106002b": "#fffefbff",  # system_neutral2_10
+    "0x0106002c": "#fff0f0fa",  # system_neutral2_50
+    "0x0106002d": "#ffe1e2ec",  # system_neutral2_100
+    "0x0106002e": "#ffc5c6d0",  # system_neutral2_200
+    "0x0106002f": "#ffa9abb4",  # system_neutral2_300
+    "0x01060030": "#ff8f9099",  # system_neutral2_400
+    "0x01060031": "#ff757780",  # system_neutral2_500
+    "0x01060032": "#ff5c5e67",  # system_neutral2_600
+    "0x01060033": "#ff44464f",  # system_neutral2_700
+    "0x01060034": "#ff2e3038",  # system_neutral2_800
+    "0x01060035": "#ff191b23",  # system_neutral2_900
+    "0x01060036": "#ff000000",  # system_neutral2_1000
+    "0x01060037": "#ffffffff",  # system_accent1_0
+    "0x01060038": "#fffefbff",  # system_accent1_10
+    "0x01060039": "#ffeef0ff",  # system_accent1_50
+    "0x0106003a": "#ffd9e2ff",  # system_accent1_100
+    "0x0106003b": "#ffb0c6ff",  # system_accent1_200
+    "0x0106003c": "#ff94aae4",  # system_accent1_300
+    "0x0106003d": "#ff7a90c8",  # system_accent1_400
+    "0x0106003e": "#ff6076ac",  # system_accent1_500
+    "0x0106003f": "#ff475d92",  # system_accent1_600
+    "0x01060040": "#ff2f4578",  # system_accent1_700
+    "0x01060041": "#ff152e60",  # system_accent1_800
+    "0x01060042": "#ff001945",  # system_accent1_900
+    "0x01060043": "#ff000000",  # system_accent1_1000
+    "0x01060044": "#ffffffff",  # system_accent2_0
+    "0x01060045": "#fffefbff",  # system_accent2_10
+    "0x01060046": "#ffeef0ff",  # system_accent2_50
+    "0x01060047": "#ffdce2f9",  # system_accent2_100
+    "0x01060048": "#ffc0c6dc",  # system_accent2_200
+    "0x01060049": "#ffa4abc1",  # system_accent2_300
+    "0x0106004a": "#ff8a90a5",  # system_accent2_400
+    "0x0106004b": "#ff70778b",  # system_accent2_500
+    "0x0106004c": "#ff575e71",  # system_accent2_600
+    "0x0106004d": "#ff404659",  # system_accent2_700
+    "0x0106004e": "#ff2a3042",  # system_accent2_800
+    "0x0106004f": "#ff151b2c",  # system_accent2_900
+    "0x01060050": "#ff000000",  # system_accent2_1000
+    "0x01060051": "#ffffffff",  # system_accent3_0
+    "0x01060052": "#fffffbff",  # system_accent3_10
+    "0x01060053": "#ffffebfa",  # system_accent3_50
+    "0x01060054": "#fffdd7fa",  # system_accent3_100
+    "0x01060055": "#ffe0bbdd",  # system_accent3_200
+    "0x01060056": "#ffc3a0c1",  # system_accent3_300
+    "0x01060057": "#ffa886a6",  # system_accent3_400
+    "0x01060058": "#ff8c6d8c",  # system_accent3_500
+    "0x01060059": "#ff725572",  # system_accent3_600
+    "0x0106005a": "#ff593d59",  # system_accent3_700
+    "0x0106005b": "#ff412742",  # system_accent3_800
+    "0x0106005c": "#ff2a122c",  # system_accent3_900
+    "0x0106005d": "#ff000000",  # system_accent3_1000
+    "0x0106005e": "#ffd9e2ff",  # system_primary_container_light
+    "0x0106005f": "#ff2f4578",  # system_on_primary_container_light
+    "0x01060060": "#ff475d92",  # system_primary_light
+    "0x01060061": "#ffffffff",  # system_on_primary_light
+    "0x01060062": "#ffdce2f9",  # system_secondary_container_light
+    "0x01060063": "#ff404659",  # system_on_secondary_container_light
+    "0x01060064": "#ff575e71",  # system_secondary_light
+    "0x01060065": "#ffffffff",  # system_on_secondary_light
+    "0x01060066": "#fffdd7fa",  # system_tertiary_container_light
+    "0x01060067": "#ff593d59",  # system_on_tertiary_container_light
+    "0x01060068": "#ff725572",  # system_tertiary_light
+    "0x01060069": "#ffffffff",  # system_on_tertiary_light
+    "0x0106006a": "#fffaf8ff",  # system_background_light
+    "0x0106006b": "#ff1a1b20",  # system_on_background_light
+    "0x0106006c": "#fffaf8ff",  # system_surface_light
+    "0x0106006d": "#ff1a1b20",  # system_on_surface_light
+    "0x0106006e": "#fff4f3fa",  # system_surface_container_low_light
+    "0x0106006f": "#ffffffff",  # system_surface_container_lowest_light
+    "0x01060070": "#ffeeedf4",  # system_surface_container_light
+    "0x01060071": "#ffe8e7ef",  # system_surface_container_high_light
+    "0x01060072": "#ffe2e2e9",  # system_surface_container_highest_light
+    "0x01060073": "#fffaf8ff",  # system_surface_bright_light
+    "0x01060074": "#ffdad9e0",  # system_surface_dim_light
+    "0x01060075": "#ffe1e2ec",  # system_surface_variant_light
+    "0x01060076": "#ff44464f",  # system_on_surface_variant_light
+    "0x01060077": "#ff757780",  # system_outline_light
+    "0x01060078": "#ffba1a1a",  # system_error_light
+    "0x01060079": "#ffffffff",  # system_on_error_light
+    "0x0106007a": "#ffffdad6",  # system_error_container_light
+    "0x0106007b": "#ff93000a",  # system_on_error_container_light
+    "0x0106007c": "#ffd9e2ff",  # system_control_activated_light
+    "0x0106007d": "#ff44464f",  # system_control_normal_light
+    "0x0106007e": "#ff000000",  # system_control_highlight_light
+    "0x0106007f": "#ffe2e2e9",  # system_text_primary_inverse_light
+    "0x01060080": "#ffc5c6d0",  # system_text_secondary_and_tertiary_inverse_light
+    "0x01060081": "#ffe2e2e9",  # system_text_primary_inverse_disable_only_light
+    "0x01060082": "#ffe2e2e9",  # system_text_secondary_and_tertiary_inverse_disabled_light
+    "0x01060083": "#ffe2e2e9",  # system_text_hint_inverse_light
+    "0x01060084": "#ff6076ac",  # system_palette_key_color_primary_light
+    "0x01060085": "#ff70778b",  # system_palette_key_color_secondary_light
+    "0x01060086": "#ff8c6d8c",  # system_palette_key_color_tertiary_light
+    "0x01060087": "#ff76777d",  # system_palette_key_color_neutral_light
+    "0x01060088": "#ff757780",  # system_palette_key_color_neutral_variant_light
+    "0x01060089": "#ff2f4578",  # system_primary_container_dark
+    "0x0106008a": "#ffd9e2ff",  # system_on_primary_container_dark
+    "0x0106008b": "#ffb0c6ff",  # system_primary_dark
+    "0x0106008c": "#ff152e60",  # system_on_primary_dark
+    "0x0106008d": "#ff404659",  # system_secondary_container_dark
+    "0x0106008e": "#ffdce2f9",  # system_on_secondary_container_dark
+    "0x0106008f": "#ffc0c6dc",  # system_secondary_dark
+    "0x01060090": "#ff2a3042",  # system_on_secondary_dark
+    "0x01060091": "#ff593d59",  # system_tertiary_container_dark
+    "0x01060092": "#fffdd7fa",  # system_on_tertiary_container_dark
+    "0x01060093": "#ffe0bbdd",  # system_tertiary_dark
+    "0x01060094": "#ff412742",  # system_on_tertiary_dark
+    "0x01060095": "#ff121318",  # system_background_dark
+    "0x01060096": "#ffe2e2e9",  # system_on_background_dark
+    "0x01060097": "#ff121318",  # system_surface_dark
+    "0x01060098": "#ffe2e2e9",  # system_on_surface_dark
+    "0x01060099": "#ff1a1b20",  # system_surface_container_low_dark
+    "0x0106009a": "#ff0c0e13",  # system_surface_container_lowest_dark
+    "0x0106009b": "#ff1e1f25",  # system_surface_container_dark
+    "0x0106009c": "#ff282a2f",  # system_surface_container_high_dark
+    "0x0106009d": "#ff33343a",  # system_surface_container_highest_dark
+    "0x0106009e": "#ff38393f",  # system_surface_bright_dark
+    "0x0106009f": "#ff121318",  # system_surface_dim_dark
+    "0x010600a0": "#ff44464f",  # system_surface_variant_dark
+    "0x010600a1": "#ffc5c6d0",  # system_on_surface_variant_dark
+    "0x010600a2": "#ff8f9099",  # system_outline_dark
+    "0x010600a3": "#ffffb4ab",  # system_error_dark
+    "0x010600a4": "#ff690005",  # system_on_error_dark
+    "0x010600a5": "#ff93000a",  # system_error_container_dark
+    "0x010600a6": "#ffffdad6",  # system_on_error_container_dark
+    "0x010600a7": "#ff2f4578",  # system_control_activated_dark
+    "0x010600a8": "#ffc5c6d0",  # system_control_normal_dark
+    "0x010600a9": "#ffffffff",  # system_control_highlight_dark
+    "0x010600aa": "#ff1a1b20",  # system_text_primary_inverse_dark
+    "0x010600ab": "#ff44464f",  # system_text_secondary_and_tertiary_inverse_dark
+    "0x010600ac": "#ff1a1b20",  # system_text_primary_inverse_disable_only_dark
+    "0x010600ad": "#ff1a1b20",  # system_text_secondary_and_tertiary_inverse_disabled_dark
+    "0x010600ae": "#ff1a1b20",  # system_text_hint_inverse_dark
+    "0x010600af": "#ff6076ac",  # system_palette_key_color_primary_dark
+    "0x010600b0": "#ff70778b",  # system_palette_key_color_secondary_dark
+    "0x010600b1": "#ff8c6d8c",  # system_palette_key_color_tertiary_dark
+    "0x010600b2": "#ff76777d",  # system_palette_key_color_neutral_dark
+    "0x010600b3": "#ff757780",  # system_palette_key_color_neutral_variant_dark
+    "0x010600b4": "#ffd9e2ff",  # system_primary_fixed
+    "0x010600b5": "#ffb0c6ff",  # system_primary_fixed_dim
+    "0x010600b6": "#ff001945",  # system_on_primary_fixed
+    "0x010600b7": "#ff2f4578",  # system_on_primary_fixed_variant
+    "0x010600b8": "#ffdce2f9",  # system_secondary_fixed
+    "0x010600b9": "#ffc0c6dc",  # system_secondary_fixed_dim
+    "0x010600ba": "#ff151b2c",  # system_on_secondary_fixed
+    "0x010600bb": "#ff404659",  # system_on_secondary_fixed_variant
+    "0x010600bc": "#fffdd7fa",  # system_tertiary_fixed
+    "0x010600bd": "#ffe0bbdd",  # system_tertiary_fixed_dim
+    "0x010600be": "#ff2a122c",  # system_on_tertiary_fixed
+    "0x010600bf": "#ff593d59",  # system_on_tertiary_fixed_variant
+    "0x010600c0": "#ffc5c6d0",  # system_outline_variant_light
+    "0x010600c1": "#ff44464f",  # system_outline_variant_dark
+    "0x010600c5": "#ffffffff",  # system_error_0
+    "0x010600c6": "#fffffbff",  # system_error_10
+    "0x010600c7": "#ffffedea",  # system_error_50
+    "0x010600c8": "#ffffdad6",  # system_error_100
+    "0x010600c9": "#ffffb4ab",  # system_error_200
+    "0x010600ca": "#ffff897d",  # system_error_300
+    "0x010600cb": "#ffff5449",  # system_error_400
+    "0x010600cc": "#ffde3730",  # system_error_500
+    "0x010600cd": "#ffba1a1a",  # system_error_600
+    "0x010600ce": "#ff93000a",  # system_error_700
+    "0x010600cf": "#ff690005",  # system_error_800
+    "0x010600d0": "#ff410002",  # system_error_900
+    "0x010600d1": "#ff000000",  # system_error_1000
 }
 
 # strokeLineCap 同样是枚举：aapt2 输出十进制 0=butt / 1=round / 2=square。
@@ -1187,6 +1400,17 @@ def _mat_apply(m, x, y):
     return (a * x + c * y + e, b * x + d * y + f)
 
 
+def _mat_scale(m):
+    """仿射矩阵的平均缩放倍数 = sqrt(|det|)，用于把 viewport 单位换算成像素。
+
+    描边宽度必须跟着 **group 变换** 一起缩放：aapt2 里 group 的 scaleX/scaleY
+    会把 path 坐标整体缩小（实测 GhostLock 的 group scale=0.0586），若只乘
+    viewport→像素的全局比例，strokeWidth 会被放大约 17 倍，细线变成实心块。
+    非等比缩放下 Android 的描边本身是各向异性的，这里用面积的平方根做近似。
+    """
+    return math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
+
+
 def _group_matrix(tx, ty, px, py, rot_deg, sx, sy):
     """VectorDrawable group 变换：T(translate+pivot) ∘ R(rot) ∘ S(scale) ∘ T(-pivot)。"""
     r = math.radians(rot_deg)
@@ -1479,10 +1703,13 @@ def _render_gradient_py(W, H, grad, m):
     return img
 
 
-def _resolve_vector_fill(apk_path, full_res, color_value, index=None):
+def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
     """
     解析 vector 的 fillColor / strokeColor 属性值（可能带资源引用）。
     返回 ("color", (r,g,b,a))、("gradient", grad_dict) 或 None。
+
+    颜色资源本身也可能是一条别名（`() @0x0106...`，Material You 动态色
+    在 APK 里就是这种形态），因此这里要跟随引用链；深度受限防止循环。
     """
     v = (color_value or "").strip()
     if v.startswith("#"):
@@ -1506,6 +1733,19 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None):
             return ("color", parse_android_color(info["value"]))
         except ValueError:
             return None
+    if info["type"] == "ref" and info["value"]:
+        if depth >= _MAX_DEREF_DEPTH:
+            return None
+        target = info["value"].lower()
+        if target.startswith("0x01"):
+            c = _FRAMEWORK_COLOR_MAP.get(target)
+            if c:
+                try:
+                    return ("color", parse_android_color(c))
+                except ValueError:
+                    return None
+            return None
+        return _resolve_vector_fill(apk_path, full_res, "@" + target, index, depth + 1)
     if info["type"] in ("vector", "string_file", "image") and info["value"]:
         # 可能是 aapt2 拆分出来的渐变 drawable（$xxx__0.xml）
         grad = _parse_gradient(run_aapt2_dump_xmltree(apk_path, info["value"]))
@@ -1656,7 +1896,9 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
                     sw = _attr_float(a, "strokeWidth", 0.0)
                     sa = pa * _attr_float(a, "strokeAlpha", 1.0)
                     if sw > 0 and sa > 0:
-                        wpx = max(1, int(round(sw * min(sx, sy))))
+                        # 描边宽度按完整变换（viewport 缩放 × group 缩放/旋转）换算，
+                        # 不能只用 sx/sy，否则带 group scale 的图标描边会粗成实心块。
+                        wpx = max(1, int(round(sw * _mat_scale(m))))
                         cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
                         _draw_stroke(layer, tsubs, stroke_color, sa, wpx, cap)
     return layer.resize((size, size), Image.LANCZOS)
@@ -2044,11 +2286,15 @@ class IconWorker(QtCore.QThread):
 
     def _extract_adaptive_icon(self, apk_path: str, icon_path: str) -> bytes:
         """
-        自适应图标（.xml）提取：
-        1) 从 xmltree 解析 foreground/background 资源地址，完整解析每一层
-           （支持混淆字符串引用、无扩展名文件、<scale> 包装），
-           两层都能渲染（位图/颜色/矢量）时合成完整图标；
-        2) 结构不是标准 adaptive-icon、或任一层渲染失败时，回退到
+        XML 图标提取（自适应图标或普通 VectorDrawable）：
+        1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
+           mipmap/ic_launcher 直接指向一个普通矢量 drawable，它的
+           viewport 里已经画好了完整图标，没有 foreground/background 层；
+           旧实现只按 adaptive-icon 解析，找不到两层就判失败。
+        2) 根元素是 <adaptive-icon> 时，从 xmltree 解析 foreground/background
+           资源地址，完整解析每一层（支持混淆字符串引用、无扩展名文件、
+           <scale> 包装），两层都能渲染（位图/颜色/矢量）时合成完整图标；
+        3) 结构不是标准 adaptive-icon、或任一层渲染失败时，回退到
            icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
 
         `dump resources` 只在确实需要时执行（旧实现在拿到 fg/bg 地址前
@@ -2056,6 +2302,16 @@ class IconWorker(QtCore.QThread):
         """
         self._check_cancel()
         xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
+
+        root_m = re.search(r"E:\s*(\S+)\s*\(", xml_out or "")
+        if root_m and root_m.group(1) == "vector":
+            self._check_cancel()
+            img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE)
+            if img is None:
+                return b""
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
 
         fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
         bg_addr = find_adaptive_layer_addr(xml_out, "background")
@@ -2108,7 +2364,7 @@ class IconWorker(QtCore.QThread):
         """执行一次提取，返回 (QImage, 导出用 PNG 字节)。"""
         img = QtGui.QImage()
         data = b""
-        if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+        if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
             with zipfile.ZipFile(apk_path, "r") as zf:
                 raw = zf.open(icon_path).read()
             # 与自适应/矢量链路统一导出规格（_ICON_SIZE²）；PIL 解不了时
