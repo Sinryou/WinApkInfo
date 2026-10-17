@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
-"""WinApkInfo UI 交互与主窗口模块。"""
-from ui.widgets import DropLineEdit
-from ui.workers import _Cancelled, IconWorker, ApkInfoWorker
-from ui.main_window import (
-    _CLOSE_WAIT_MS,
-    MainWindow,
-    _ErrorDialog,
-    _error_dialog,
-    _on_gui_thread,
-    install_excepthook,
-)
+"""WinApkInfo UI 包。
+
+子模块按需导入（例如 ``import ui.main_window``）。这里刻意不做聚合导入：
+否则 ``import ui.widgets`` 也会顺带加载整个主窗口与工作线程。
+需要兼容导出的调用方请使用 ``main`` 模块。
+"""

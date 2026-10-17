@@ -15,28 +15,17 @@
 """
 import os
 import sys
-import subprocess
 import tempfile
 import logging
-from pathlib import Path
 
 from version import __version__
 
-try:
-    import numpy as np
-except ImportError:
-    np = None
+from PyQt6 import QtWidgets
 
-from PyQt6 import QtCore, QtGui, QtWidgets
-
-# 核心模块导入
-import core.aapt as _aapt_mod
-import core.colors as _colors_mod
+# 只保留兼容层 __getattr__ 需要用到的模块引用；
+# 其余符号通过下面的 from ... import 显式导出，避免任何 core.* 导入
+# 都被这里的别名提前拉起一遍。
 import core.resources as _resources_mod
-import core.vector as _vector_mod
-import core.apk_parser as _apk_parser_mod
-import ui.workers as _workers_mod
-import ui.widgets as _widgets_mod
 import ui.main_window as _main_window_mod
 
 # 导出 core.aapt 符号
@@ -77,7 +66,6 @@ from core.colors import (
 # 导出 core.resources 符号
 from core.resources import (
     local_resource_path,
-    _sdk_load_warned,
     load_sdk_versions,
     _LazyEntryMap,
     _entry_span,
@@ -299,11 +287,17 @@ def main():
 
 
 def __getattr__(name: str):
-    """向后兼容属性动态读取（PEP 562）。"""
+    """向后兼容属性动态读取（PEP 562）。
+
+    这些是可变全局：必须每次从定义模块读取，不能按值 from-import，
+    否则拿到的是导入瞬间的副本（SDK 缓存永远 None、警告标志永远 False）。
+    """
     if name == "_error_dialog":
         return _main_window_mod._error_dialog
     if name == "_sdk_versions_cache":
         return _resources_mod._sdk_versions_cache
+    if name == "_sdk_load_warned":
+        return _resources_mod._sdk_load_warned
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 

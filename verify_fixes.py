@@ -74,6 +74,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import main as m
+import core.vector as vector_mod
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 
@@ -281,7 +282,7 @@ def check_env():
         # 没有 aapt2 时不要在这里抛异常中断整套用例；后续依赖 aapt2 的
         # 真实样本用例会自行跳过。
         C.skip("aapt2 可用", str(e))
-    C.check("numpy 可用（矢量栅格化向量化路径）", m.np is not None, "numpy %s" % (np.__version__,))
+    C.check("numpy 可用（矢量栅格化向量化路径）", vector_mod.np is not None, "numpy %s" % (np.__version__,))
     C.check("PyQt6 / Pillow 版本", True,
             "PyQt6 %s · Qt %s · Pillow %s" % (
                 QtCore.PYQT_VERSION_STR, QtCore.QT_VERSION_STR, Image.__version__))
@@ -675,16 +676,16 @@ def check_p2_10():
 
 
 CHILD_CODE = r'''
-import os, sys, glob, re
+import os, sys, glob, re, subprocess
 sys.path.insert(0, sys.argv[1])
 import main as m
 spawns = {"n": 0}
-_orig = m.subprocess.Popen
+_orig = subprocess.Popen
 class CountingPopen(_orig):
     def __init__(self, *a, **k):
         spawns["n"] += 1
         super().__init__(*a, **k)
-m.subprocess.Popen = CountingPopen
+subprocess.Popen = CountingPopen
 apk = sys.argv[2]
 badging = m.run_aapt2_dump_badging(apk)
 xmls = [p for _, p in re.findall(r"application-icon-(\d+):'([^']+)'", badging) if p.endswith(".xml")]
