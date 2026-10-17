@@ -48,6 +48,22 @@ import threading
 import time
 import zipfile
 
+
+def _force_utf8_stdio():
+    """验证输出含中文，Windows CI 的 cp1252 控制台会抛 UnicodeEncodeError。
+
+    在打印任何内容前把 stdout/stderr 切到 UTF-8；GitHub Actions 日志本身
+    按 UTF-8 解码，这样既不会崩，中文也能正常显示。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_force_utf8_stdio()
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

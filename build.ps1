@@ -68,6 +68,10 @@ $DistRoot = Join-Path $ProjectRoot "dist"
 $WorkRoot = Join-Path $BuildRoot "pyinstaller"
 $SpecFile = Join-Path $ProjectRoot "WinApkInfo.spec"
 
+# Windows runners default to a legacy console code page (cp1252). The test
+# suite and version-info scripts print Chinese, so force UTF-8 for children.
+$env:PYTHONIOENCODING = "utf-8"
+
 $runningApp = @(Get-Process -Name "WinApkInfo" -ErrorAction SilentlyContinue)
 if ($runningApp.Count -gt 0) {
     $pids = ($runningApp | ForEach-Object { $_.Id }) -join ", "
