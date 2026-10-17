@@ -16,6 +16,7 @@ from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
     _ResourceIndex, extract_resource_entry, get_resource_info, _MAX_DEREF_DEPTH
 )
+from PyQt6 import QtCore, QtGui
 
 # strokeLineCap 同样是枚举：aapt2 输出十进制 0=butt / 1=round / 2=square。
 # 查表前先用 _attr_enum 归一化，否则圆头/方头端点会被静默降级成 butt
@@ -769,12 +770,184 @@ def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
     layer.alpha_composite(stroke)
 
 
-def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
-    """
-    把 Android VectorDrawable（aapt2 dump xmltree 输出）栅格化为 size×size RGBA 图像。
-    支持 vector / group / path、填充与描边、nonzero/evenodd 填充规则、
-    以及带资源引用的填充（含 aapt2 拆分出来的 <gradient> 渐变）。
-    """
+def _qimage_to_pil(qimg: QtGui.QImage) -> Image.Image:
+    """把 QImage 转为 PIL RGBA Image。"""
+    if qimg.isNull():
+        return None
+    converted = qimg.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+    w, h = converted.width(), converted.height()
+    b = converted.bits()
+    b.setsize(w * h * 4)
+    return Image.frombuffer("RGBA", (w, h), bytes(b), "raw", "RGBA", 0, 1)
+
+
+def _create_qbrush(fill, m, falpha: float):
+    """根据解析后的 fill ('color' 或 'gradient') 创建对应的 QBrush。"""
+    if fill[0] == "color":
+        c = fill[1]
+        ca = int(round(c[3] * falpha))
+        if ca <= 0:
+            return None
+        return QtGui.QBrush(QtGui.QColor(c[0], c[1], c[2], ca))
+
+    if fill[0] == "gradient":
+        grad = fill[1]
+        gt = grad["type"]
+        if gt == 0:  # linear
+            sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
+            ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
+            dx, dy = ex - sx, ey - sy
+            if dx * dx + dy * dy < 1e-9:
+                a = math.radians(grad["angle"])
+                dx, dy = math.cos(a) * 1000.0, -math.sin(a) * 1000.0
+                ex, ey = sx + dx, sy + dy
+            qgrad = QtGui.QLinearGradient(QtCore.QPointF(sx, sy), QtCore.QPointF(ex, ey))
+        elif gt == 1:  # radial
+            cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+            det = m[0] * m[3] - m[1] * m[2]
+            r_px = grad["radius"] * math.sqrt(abs(det)) if det else grad["radius"]
+            qgrad = QtGui.QRadialGradient(QtCore.QPointF(cx, cy), max(1e-3, r_px))
+        else:  # sweep
+            cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
+            qgrad = QtGui.QConicalGradient(QtCore.QPointF(cx, cy), 180.0)
+
+        for offset, color in grad["stops"]:
+            ca = int(round(color[3] * falpha))
+            qgrad.setColorAt(offset, QtGui.QColor(color[0], color[1], color[2], ca))
+        return QtGui.QBrush(qgrad)
+
+    return None
+
+
+def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=None):
+    """使用 PyQt6 原生 QPainterPath / QPainter 进行 C++ 矢量光栅化。"""
+    xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
+    if not xml_out:
+        return None
+    elems = _parse_vector_elements(xml_out)
+    root = None
+    for el in elems:
+        if el["tag"] == "vector":
+            root = el
+            break
+    if root is None:
+        return None
+    attrs = root["attrs"]
+    vw = _attr_float(attrs, "viewportWidth", _attr_float(attrs, "width", 108.0))
+    vh = _attr_float(attrs, "viewportHeight", _attr_float(attrs, "height", 108.0))
+    if vw <= 0 or vh <= 0:
+        vw = vh = 108.0
+
+    W = size
+    H = size
+    sx = W / vw
+    sy = H / vh
+    step = max(0.5, max(vw, vh) / 160.0)
+    vec_alpha = _attr_float(attrs, "alpha", 1.0)
+
+    qimg = QtGui.QImage(W, H, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+    qimg.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(qimg)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+
+    stack = []  # (indent, 累计矩阵, 累计 alpha)
+    for el in elems:
+        tag = el["tag"]
+        indent = el["indent"]
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if tag == "vector":
+            stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
+            continue
+        if tag == "group":
+            if not stack:
+                continue
+            a = el["attrs"]
+            m = _group_matrix(
+                _attr_float(a, "translateX", 0.0), _attr_float(a, "translateY", 0.0),
+                _attr_float(a, "pivotX", 0.0), _attr_float(a, "pivotY", 0.0),
+                _attr_float(a, "rotation", 0.0),
+                _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
+            )
+            pm, pa = stack[-1][1], stack[-1][2]
+            stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
+            continue
+        if tag == "path":
+            if not stack:
+                continue
+            pm, pa = stack[-1][1], stack[-1][2]
+            a = el["attrs"]
+            path_data = a.get("pathData")
+            if not path_data:
+                continue
+            cmds = _parse_path_commands(_tokenize_path_data(path_data))
+            subpaths = _flatten_subpaths(cmds, step)
+            if not subpaths:
+                continue
+            m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
+            tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
+            fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
+
+            qpath = QtGui.QPainterPath()
+            qpath.setFillRule(
+                QtCore.Qt.FillRule.OddEvenFill if fill_rule == "evenodd" else QtCore.Qt.FillRule.WindingFill
+            )
+            for pts in tsubs:
+                if not pts:
+                    continue
+                qpath.moveTo(pts[0][0], pts[0][1])
+                for pt in pts[1:]:
+                    qpath.lineTo(pt[0], pt[1])
+                if len(pts) > 1 and abs(pts[-1][0] - pts[0][0]) < 1e-4 and abs(pts[-1][1] - pts[0][1]) < 1e-4:
+                    qpath.closeSubpath()
+
+            if "fillColor" in a:
+                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
+                if fill is not None:
+                    falpha = pa * _attr_float(a, "fillAlpha", 1.0)
+                    brush = _create_qbrush(fill, m, falpha)
+                    if brush is not None:
+                        painter.fillPath(qpath, brush)
+
+            if "strokeColor" in a:
+                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
+                if sc is not None:
+                    sw = _attr_float(a, "strokeWidth", 0.0)
+                    sa = pa * _attr_float(a, "strokeAlpha", 1.0)
+                    if sw > 0 and sa > 0:
+                        wpx = max(1.0, sw * _mat_scale(m))
+                        cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
+                        if cap_enum in ("1", "round"):
+                            cap = QtCore.Qt.PenCapStyle.RoundCap
+                        elif cap_enum in ("2", "square"):
+                            cap = QtCore.Qt.PenCapStyle.SquareCap
+                        else:
+                            cap = QtCore.Qt.PenCapStyle.FlatCap
+
+                        join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
+                        if join_enum in ("0", "miter"):
+                            join = QtCore.Qt.PenJoinStyle.MiterJoin
+                        elif join_enum in ("2", "bevel"):
+                            join = QtCore.Qt.PenJoinStyle.BevelJoin
+                        else:
+                            join = QtCore.Qt.PenJoinStyle.RoundJoin
+
+                        pen = QtGui.QPen()
+                        pen.setWidthF(wpx)
+                        pen.setCapStyle(cap)
+                        pen.setJoinStyle(join)
+                        brush = _create_qbrush(sc, m, sa)
+                        if brush is not None:
+                            pen.setBrush(brush)
+                            painter.strokePath(qpath, pen)
+
+    painter.end()
+    return _qimage_to_pil(qimg)
+
+
+def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=None):
+    """纯 Python/Pillow 栅格化回退实现。"""
     xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
     if not xml_out:
         return None
@@ -869,6 +1042,22 @@ def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
                         cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
                         _draw_stroke(layer, tsubs, stroke_color, sa, wpx, cap)
     return layer.resize((size, size), Image.LANCZOS)
+
+
+def rasterize_vector_layer(apk_path, xml_path, size, full_res=None, index=None):
+    """
+    把 Android VectorDrawable（aapt2 dump xmltree 输出）栅格化为 size×size RGBA 图像。
+    支持 vector / group / path、填充与描边、nonzero/evenodd 填充规则、
+    以及带资源引用的填充（含 aapt2 拆分出来的 <gradient> 渐变）。
+
+    优先使用 PyQt6 原生 QPainterPath / QPainter 进行 C++ 矢量光栅化；
+    若遇到异常自动平滑回退到 Pillow 渲染链路。
+    """
+    try:
+        return _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res, index)
+    except Exception as e:
+        logging.warning("Qt 矢量光栅化异常，回退 Pillow 渲染: %s", e)
+        return _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res, index)
 
 
 def _trim_to_content(img, size):
