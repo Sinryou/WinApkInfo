@@ -10,7 +10,6 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from version import __version__
 from core.aapt import kill_running_aapt2, get_disk_cache_info, clear_disk_cache
-from core.signature import get_apk_full_signature_report
 from core.resources import local_resource_path, load_sdk_versions
 from core.apk_parser import _sanitize_apk_name, parse_aapt2_output
 from ui.workers import IconWorker, ApkInfoWorker
@@ -103,27 +102,19 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("支持架构：", self.le_arch)   # 加入表单
         layout.addLayout(form)
 
-        # 多行信息分组：使用 QTabWidget 提升界面空间利用率与信息组织
-        self.tab_widget = QtWidgets.QTabWidget()
+        # 多行信息分组：权限、特性、语言/密度、其它
+        grid = QtWidgets.QGridLayout()
 
-        self.te_permissions = self._mk_grouped_text("权限列表（uses-permission）")
+        self.te_permissions = self._mk_grouped_text("权限（uses-permission）")
         self.te_features = self._mk_grouped_text("功能特性（uses-feature / implied）")
         self.te_locales = self._mk_grouped_text("本地化 / 屏幕 / 密度")
-        self.te_signature = self._mk_grouped_text("文件属性与签名证书（Metadata / Signature）")
         self.te_other = self._mk_grouped_text("其它关键信息")
 
-        # 原始输出选项卡（带格式与只读设置）
-        self.te_raw = QtWidgets.QPlainTextEdit()
-        self.te_raw.setReadOnly(True)
-        self.te_raw.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-
-        self.tab_widget.addTab(self.te_permissions["edit"], "权限列表")
-        self.tab_widget.addTab(self.te_features["edit"], "功能特性")
-        self.tab_widget.addTab(self.te_locales["edit"], "屏幕与本地化")
-        self.tab_widget.addTab(self.te_signature["edit"], "文件属性与签名")
-        self.tab_widget.addTab(self.te_other["edit"], "其它关键信息")
-        self.tab_widget.addTab(self.te_raw, "aapt2 原始输出")
-        layout.addWidget(self.tab_widget, stretch=1)
+        grid.addWidget(self.te_permissions["group"], 0, 0)
+        grid.addWidget(self.te_features["group"], 0, 1)
+        grid.addWidget(self.te_locales["group"], 1, 0)
+        grid.addWidget(self.te_other["group"], 1, 1)
+        layout.addLayout(grid)
 
         # 在底部按钮上方加重命名功能
         rename_group = QtWidgets.QGroupBox("APK 重命名")
@@ -137,6 +128,15 @@ class MainWindow(QtWidgets.QMainWindow):
         rename_layout.addWidget(self.rename_preview, stretch=1)
         rename_layout.addWidget(btn_rename)
         layout.addWidget(rename_group)
+
+        # 原始输出
+        # raw_group = QtWidgets.QGroupBox("aapt2 原始输出")
+        # vg = QtWidgets.QVBoxLayout(raw_group)
+        self.te_raw = QtWidgets.QPlainTextEdit()
+        self.te_raw.setReadOnly(True)
+        self.te_raw.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        # vg.addWidget(self.te_raw)
+        # layout.addWidget(raw_group, stretch=1)
 
         # 底部按钮
         btn_row = QtWidgets.QHBoxLayout()
@@ -415,17 +415,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.te_other["edit"].setPlainText("\n".join(other) if other else "(无)")
 
-        # 提取图标与文件哈希/签名报告
+        # 提取图标
         self.btn_export_icon.setVisible(False)
         apk_path = self._current_apk_path()
         if apk_path and os.path.isfile(apk_path):
-            try:
-                sig_report = get_apk_full_signature_report(apk_path)
-                self.te_signature["edit"].setPlainText(sig_report)
-            except Exception as e:
-                logging.warning("生成签名与哈希报告失败: %s", e)
-                self.te_signature["edit"].setPlainText(f"生成签名与哈希报告失败: {e}")
-
             try:
                 icons = info.get("icons", {})
                 if icons:
@@ -438,8 +431,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._start_icon_worker(apk_path, icon_path)
             except Exception as e:
                 logging.exception("提取图标失败: %s", e)
-        else:
-            self.te_signature["edit"].setPlainText("(无可用 APK 文件)")
 
         # 生成重命名预览
         app_name = self.le_app_name.text().strip() or "App"
@@ -454,9 +445,6 @@ class MainWindow(QtWidgets.QMainWindow):
         lines.append(f"SDK: {self.le_sdk.text()}")
         lines.append(f"启动 Activity: {self.le_launch.text()}")
         lines.append(f"支持架构: {self.le_arch.text()}")
-        lines.append("")
-        lines.append("[文件属性与签名]")
-        lines.append(self.te_signature["edit"].toPlainText() or "(无)")
         lines.append("")
         lines.append("[权限]")
         lines.append(self.te_permissions["edit"].toPlainText() or "(无)")
