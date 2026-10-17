@@ -7,9 +7,20 @@ import json
 import logging
 import threading
 import zipfile
+import contextlib
 from pathlib import Path
 
 from core.aapt import Aapt2Error
+
+
+@contextlib.contextmanager
+def _open_apk_zip(apk_path: str, zf=None):
+    """上下文管理器：若已提供有效 zf 句柄则复用，否则临时打开并在退出时关闭。"""
+    if zf is not None:
+        yield zf
+    else:
+        with zipfile.ZipFile(apk_path, "r") as local_zf:
+            yield local_zf
 
 # 密度从低到高，用于在多个密度变体中挑选最高分辨率
 _DPI_ORDER = ["ldpi", "mdpi", "tvdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
@@ -181,12 +192,12 @@ _sniff_cache = {}
 _sniff_cache_lock = threading.Lock()
 
 
-def _sniff_file_kind(apk_path: str, inner_path: str):
+def _sniff_file_kind(apk_path: str, inner_path: str, zf=None):
     """
     用魔数识别 APK 内文件类型（AndResGuard 等混淆后文件没有扩展名）。
     返回 "image" / "xml" / None。结果按 (apk 路径, mtime, 文件路径) 缓存，
-    避免同一次提取链路里反复打开同一个 zip（不持有 ZipFile 句柄，
-    以免影响 Windows 上的重命名操作）。
+    避免同一次提取链路里反复打开同一个 zip（不长期持有 ZipFile 句柄，
+    以免影响 Windows 上的重命名操作）。支持传入已有 zf 句柄以复用 I/O。
     """
     try:
         key = (os.path.abspath(apk_path), os.stat(apk_path).st_mtime_ns, inner_path)
@@ -196,8 +207,8 @@ def _sniff_file_kind(apk_path: str, inner_path: str):
         if key in _sniff_cache:
             return _sniff_cache[key]
     try:
-        with zipfile.ZipFile(apk_path, "r") as zf:
-            head = zf.open(inner_path).read(16)
+        with _open_apk_zip(apk_path, zf) as local_zf:
+            head = local_zf.open(inner_path).read(16)
     except Exception:
         return None
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":

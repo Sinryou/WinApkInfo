@@ -14,7 +14,7 @@ from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
     _ResourceIndex, extract_resource_entry, _density_of,
     _pick_best_density, _sniff_file_kind, get_resource_info,
-    _BITMAP_EXTS, _MAX_DEREF_DEPTH
+    _BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
 )
 from core.vector import rasterize_vector_layer
 
@@ -58,7 +58,7 @@ def find_adaptive_layer_addr(xml_output: str, layer: str):
     return None
 
 
-def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int, index=None):
+def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int, index=None, zf=None):
     """
     若 xml_path 指向 <scale>/<layer-list> 等包装 drawable，且其 android:drawable
     引用了另一个资源，则跟随引用继续解析（<scale> 的缩放参数一并带回）。
@@ -87,13 +87,13 @@ def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int
             float(sh.group(1)) if sh else 100.0,
             int(sg.group(1), 16) if sg else 0x11,  # 默认居中
         )
-    kind, value, scale2 = resolve_icon_layer(apk_path, full_res, m.group(1), depth + 1, index)
+    kind, value, scale2 = resolve_icon_layer(apk_path, full_res, m.group(1), depth + 1, index, zf=zf)
     if not kind:
         return (None, None, None)
     return (kind, value, scale or scale2)
 
 
-def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0, index=None):
+def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0, index=None, zf=None):
     """
     把一个图标层资源完整解析成可渲染形态：
         ("color", "#AARRGGBB", None)
@@ -106,7 +106,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
     <scale> 包装继续跟随 android:drawable 引用；深度受限防止循环。
     另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）
     以及应用内资源别名（`() @0x7f......`，颜色资源常见的间接层）。
-    index 为 _ResourceIndex 时条目查询 O(1)。
+    index 为 _ResourceIndex 时条目查询 O(1)。支持传入已有 zf 句柄以复用 I/O。
     """
     rid = (res_id or "").lower()
     if rid.startswith("0x01"):
@@ -124,21 +124,21 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
         return ("vector", value, None) if kind == "vector" else (None, None, None)
     if kind == "ref" and value:
         # 应用内别名：继续跟随（目标可能是颜色/位图/矢量，也可能是框架颜色）
-        return resolve_icon_layer(apk_path, full_res, value, depth + 1, index)
+        return resolve_icon_layer(apk_path, full_res, value, depth + 1, index, zf=zf)
     if kind == "string_file":
         ext = os.path.splitext(value)[1].lower()
         if ext in _BITMAP_EXTS:
             return ("image", value, None)
         if ext == ".xml":
-            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
-        sniffed = _sniff_file_kind(apk_path, value)
+            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index, zf=zf)
+        sniffed = _sniff_file_kind(apk_path, value, zf=zf)
         if sniffed == "image":
             return ("image", value, None)
         if sniffed == "xml":
-            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
+            return _resolve_xml_wrapper(apk_path, full_res, value, depth, index, zf=zf)
         return (None, None, None)
     if kind == "vector" and value:
-        kind2, value2, scale2 = _resolve_xml_wrapper(apk_path, full_res, value, depth, index)
+        kind2, value2, scale2 = _resolve_xml_wrapper(apk_path, full_res, value, depth, index, zf=zf)
         if kind2:
             return (kind2, value2, scale2)
         return ("vector", value, None)
@@ -185,7 +185,7 @@ def find_mipmap_fallback(full_res: str, icon_xml_path: str, index=None):
 
 
 
-def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None):
+def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None, zf=None):
     """
     根据输入判断是颜色、矢量还是图片：
     - 颜色：返回一个填充颜色的 Image
@@ -202,7 +202,7 @@ def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None):
             return img
         raise ValueError(f"矢量图标栅格化失败: {res_path_or_color['value']}")
     # 位图文件
-    with zipfile.ZipFile(apk_path, "r") as apk:
+    with _open_apk_zip(apk_path, zf) as apk:
         with apk.open(res_path_or_color["value"]) as f:
             img = Image.open(f).convert("RGBA")
     return img.resize((size, size), Image.LANCZOS)
@@ -251,38 +251,39 @@ def _place_by_gravity(size: int, w: int, h: int, gravity: int):
     return x, y
 
 
-def extract_icon_bytes(apk_path, foreground, background, size=_ICON_SIZE, fg_scale=None, full_res=None, index=None):
+def extract_icon_bytes(apk_path, foreground, background, size=_ICON_SIZE, fg_scale=None, full_res=None, index=None, zf=None):
     """
     自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流。
 
     fg_scale: (width%, height%, gravity)，来自 <scale> 包装 drawable；
               None 表示前景按整层尺寸渲染。
     """
-    # 加载前景
-    foreground_img = load_resource(apk_path, foreground, size, full_res, index)
-    # 加载背景
-    background_img = load_resource(apk_path, background, size, full_res, index)
+    with _open_apk_zip(apk_path, zf) as shared_zf:
+        # 加载前景
+        foreground_img = load_resource(apk_path, foreground, size, full_res, index, zf=shared_zf)
+        # 加载背景
+        background_img = load_resource(apk_path, background, size, full_res, index, zf=shared_zf)
 
-    if fg_scale:
-        w_pct, h_pct, gravity = fg_scale
-        w = max(1, int(size * w_pct / 100.0))
-        h = max(1, int(size * h_pct / 100.0))
-        if (w, h) != (size, size):
-            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-            small = foreground_img.resize((w, h), Image.LANCZOS)
-            canvas.alpha_composite(small, _place_by_gravity(size, w, h, gravity))
-            foreground_img = canvas
+        if fg_scale:
+            w_pct, h_pct, gravity = fg_scale
+            w = max(1, int(size * w_pct / 100.0))
+            h = max(1, int(size * h_pct / 100.0))
+            if (w, h) != (size, size):
+                canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                small = foreground_img.resize((w, h), Image.LANCZOS)
+                canvas.alpha_composite(small, _place_by_gravity(size, w, h, gravity))
+                foreground_img = canvas
 
-    # 合成 (背景在下，前景在上)
-    final_img = Image.alpha_composite(background_img, foreground_img)
+        # 合成 (背景在下，前景在上)
+        final_img = Image.alpha_composite(background_img, foreground_img)
 
-    # 裁掉纯色/透明空边，避免生成的图标带白边
-    # final_img = _trim_to_content(final_img, size)
+        # 裁掉纯色/透明空边，避免生成的图标带白边
+        # final_img = _trim_to_content(final_img, size)
 
-    # 转字节流
-    output = io.BytesIO()
-    final_img.save(output, format="PNG")
-    return output.getvalue()
+        # 转字节流
+        output = io.BytesIO()
+        final_img.save(output, format="PNG")
+        return output.getvalue()
 
 def parse_aapt2_output(text: str) -> dict:
     """

@@ -10,7 +10,7 @@ from PIL import Image
 from PyQt6 import QtCore, QtGui
 
 from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2_dump_xmltree
-from core.resources import _ResourceIndex
+from core.resources import _ResourceIndex, _open_apk_zip
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
     _ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
@@ -103,7 +103,7 @@ class IconWorker(QtCore.QThread):
         except Exception:
             return False
 
-    def _extract_adaptive_icon(self, apk_path: str, icon_path: str) -> bytes:
+    def _extract_adaptive_icon(self, apk_path: str, icon_path: str, zf=None) -> bytes:
         """
         XML 图标提取（自适应图标或普通 VectorDrawable）：
         1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
@@ -142,8 +142,8 @@ class IconWorker(QtCore.QThread):
             self._check_cancel()
             # 一次性索引全量输出，后续所有资源条目查询 O(1)
             index = _ResourceIndex(full_res)
-            fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index)
-            bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index)
+            fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
+            bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
             self._check_cancel()
             if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
                 try:
@@ -154,6 +154,7 @@ class IconWorker(QtCore.QThread):
                         fg_scale=fg_scale,
                         full_res=full_res,
                         index=index,
+                        zf=zf,
                     )
                 except _Cancelled:
                     raise
@@ -171,35 +172,35 @@ class IconWorker(QtCore.QThread):
             index = _ResourceIndex(full_res)
         fallback = find_mipmap_fallback(full_res, icon_path, index)
         if fallback:
-            with zipfile.ZipFile(apk_path, "r") as zf:
-                img = Image.open(zf.open(fallback)).convert("RGBA")
+            with _open_apk_zip(apk_path, zf) as shared_zf:
+                img = Image.open(shared_zf.open(fallback)).convert("RGBA")
             img = img.resize((_ICON_SIZE, _ICON_SIZE), Image.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue()
         return b""
 
-    def _extract(self, apk_path: str, icon_path: str):
+    def _extract(self, apk_path: str, icon_path: str, zf=None):
         """执行一次提取，返回 (QImage, 导出用 PNG 字节)。"""
         img = QtGui.QImage()
         data = b""
-        if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
-            with zipfile.ZipFile(apk_path, "r") as zf:
-                raw = zf.open(icon_path).read()
-            # 与自适应/矢量链路统一导出规格（_ICON_SIZE²）；PIL 解不了时
-            # 保留原始字节，交给 Qt 解码器兜底。
-            data = _normalize_icon_png(raw) or raw
-            if not self._load_image(img, data):
-                raise ValueError(f"图标文件无法解码为图片: {icon_path}")
+        with _open_apk_zip(apk_path, zf) as shared_zf:
+            if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                raw = shared_zf.open(icon_path).read()
+                # 与自适应/矢量链路统一导出规格（_ICON_SIZE²）；PIL 解不了时
+                # 保留原始字节，交给 Qt 解码器兜底。
+                data = _normalize_icon_png(raw) or raw
+                if not self._load_image(img, data):
+                    raise ValueError(f"图标文件无法解码为图片: {icon_path}")
 
-        elif icon_path.lower().endswith('.xml'):
-            data = self._extract_adaptive_icon(apk_path, icon_path)
-            if not data:
-                raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
-            if not self._load_image(img, data):
-                raise ValueError("合成后的图标无法解码为图片")
-        else:
-            raise ValueError(f"不支持的图标类型: {icon_path}")
+            elif icon_path.lower().endswith('.xml'):
+                data = self._extract_adaptive_icon(apk_path, icon_path, zf=shared_zf)
+                if not data:
+                    raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
+                if not self._load_image(img, data):
+                    raise ValueError("合成后的图标无法解码为图片")
+            else:
+                raise ValueError(f"不支持的图标类型: {icon_path}")
         return img, data
 
     def run(self):

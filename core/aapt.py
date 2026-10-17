@@ -250,9 +250,38 @@ class _Aapt2OutputCache:
 
 
 def _default_disk_cache_dir():
-    """磁盘缓存目录；设置 WINAPKINFO_NO_DISK_CACHE=1 可禁用。"""
+    """磁盘缓存目录；设置 WINAPKINFO_NO_DISK_CACHE=1 可禁用。
+
+    规范化使用各操作系统标准的应用缓存目录：
+    - Windows: %LOCALAPPDATA%/WinApkInfo/cache
+    - Linux/macOS: QStandardPaths.CacheLocation 或 ~/.cache/WinApkInfo
+    避免写入系统临时目录 tempfile.gettempdir() 后被 Windows 磁盘清理/存储感知程序频繁误删。
+    """
     if os.environ.get("WINAPKINFO_NO_DISK_CACHE"):
         return None
+
+    # Windows 平台标准应用缓存目录
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "WinApkInfo", "cache")
+
+    # 非 Windows 或未定义 LOCALAPPDATA 时，优先借助 QStandardPaths
+    try:
+        from PyQt6.QtCore import QStandardPaths
+        base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        if base:
+            return os.path.join(base, "WinApkInfo", "cache") if "winapkinfo" not in base.lower() else base
+    except Exception:
+        pass
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return os.path.join(xdg_cache, "WinApkInfo")
+
+    home = os.path.expanduser("~")
+    if os.path.isdir(os.path.join(home, ".cache")):
+        return os.path.join(home, ".cache", "WinApkInfo")
+
     return os.path.join(tempfile.gettempdir(), "winapk_info_cache")
 
 

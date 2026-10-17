@@ -83,6 +83,7 @@ from core.resources import (
     _DPI_ORDER,
     _MAX_DEREF_DEPTH,
     get_resource_info,
+    _open_apk_zip,
 )
 
 # 导出 core.vector 符号
