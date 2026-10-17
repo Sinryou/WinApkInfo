@@ -527,12 +527,36 @@ def _build_fill_mask(W, H, subpaths, fill_rule="nonzero"):
     return Image.fromarray(arr, "L")
 
 
-def _parse_gradient(xml_out):
-    """解析 aapt2 拆分出来的 <gradient> drawable（$xxx__0.xml），失败返回 None。"""
+def _parse_gradient(xml_out, resolve_color=None):
+    """解析 aapt2 拆分出来的 <gradient> drawable（$xxx__0.xml），失败返回 None。
+
+    resolve_color: 可选的颜色解析回调，用于把 ``@0x7f...`` 这类资源引用
+    解析成 RGBA。渐变颜色既可能写成 ``#AARRGGBB``，也可能是
+    ``@color/...``；后者在 xmltree 里只留资源地址，需要调用方补解析。
+    """
     elems = _parse_vector_elements(xml_out)
     if not elems or elems[0]["tag"] != "gradient":
         return None
     attrs = elems[0]["attrs"]
+
+    def _color(raw):
+        """解析 #hex 或经回调解析资源引用；失败返回 None。"""
+        if not raw:
+            return None
+        try:
+            return parse_android_color(raw)
+        except ValueError:
+            pass
+        if resolve_color is not None:
+            try:
+                resolved = resolve_color(raw)
+            except Exception as e:
+                logging.debug("解析渐变颜色失败 %r: %s", raw, e)
+                return None
+            if resolved:
+                return resolved
+        return None
+
     grad = {
         # type 是枚举：必须走 _attr_int（内部用 _attr_enum），
         # 用 _attr_float 会把 0x00000001 解析成 0 → 径向/扫描渐变退化成线性。
@@ -553,11 +577,18 @@ def _parse_gradient(xml_out):
         a = el["attrs"]
         if "color" not in a:
             continue
-        try:
-            c = parse_android_color(a["color"])
-        except ValueError:
+        c = _color(a["color"])
+        if c is None:
             continue
         grad["stops"].append((_attr_float(a, "offset", 0.0), c))
+    if not grad["stops"]:
+        # Android 的 <gradient> 也支持直接用 startColor / centerColor /
+        # endColor 描述颜色（aapt2 xmltree 不会把它们改写成 <item>）。
+        # 旧实现只读 <item>，这类渐变会因 stops 为空被整层跳过。
+        for name, offset in (("startColor", 0.0), ("centerColor", 0.5), ("endColor", 1.0)):
+            c = _color(attrs.get(name))
+            if c is not None:
+                grad["stops"].append((offset, c))
     if not grad["stops"]:
         return None
     grad["stops"].sort(key=lambda s: s[0])
@@ -602,6 +633,42 @@ def _sample_gradient_stops_vec(stops, t):
     return colors[idx] + (colors[idx + 1] - colors[idx]) * k
 
 
+def _linear_gradient_line(W, H, grad, m):
+    """返回线性渐变在像素空间的 (sx, sy, dx, dy, dd)。
+
+    显式的 startX/startY/endX/endY 直接经矩阵映射；两者都没有时，
+    按 android:angle 在整幅画布上构造一条从一端到另一端的渐变线，
+    保证 t 仍覆盖 0..1（0° = 左→右，90° = 下→上）。
+    """
+    sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
+    ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
+    dx, dy = ex - sx, ey - sy
+    dd = dx * dx + dy * dy
+    if dd < 1e-9:
+        a = math.radians(grad["angle"])
+        ux, uy = math.cos(a), -math.sin(a)
+        # 画布在方向向量上的投影长度，保证渐变线覆盖整个画面
+        length = max(abs(W * ux) + abs(H * uy), 1.0)
+        sx = W / 2.0 - ux * length / 2.0
+        sy = H / 2.0 - uy * length / 2.0
+        dx, dy = ux * length, uy * length
+        dd = length * length
+    return sx, sy, dx, dy, dd
+
+
+def _scale_alpha(img, factor):
+    """只缩放 alpha 通道，保持 RGB 不变。
+
+    Pillow 的 ``Image.point`` 对 RGBA 会同时处理四个通道；直接用它乘
+    fillAlpha 会把渐变颜色本身也调暗。半透明渐变必须只改 A 通道。
+    """
+    if factor >= 0.999:
+        return img
+    r, g, b, a = img.split()
+    a = a.point(lambda v: int(round(v * factor)))
+    return Image.merge("RGBA", (r, g, b, a))
+
+
 def _render_gradient(W, H, grad, m):
     """按 viewport 坐标渲染 W×H 渐变图（m 把 viewport 坐标映射到像素坐标）。
 
@@ -613,14 +680,7 @@ def _render_gradient(W, H, grad, m):
     gt = grad["type"]
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
     if gt == 0:  # linear
-        sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
-        ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
-        dx, dy = ex - sx, ey - sy
-        dd = dx * dx + dy * dy
-        if dd < 1e-9:  # 无起点终点，退回角度方向
-            a = math.radians(grad["angle"])
-            dx, dy = math.cos(a), -math.sin(a)
-            dd = 1.0
+        sx, sy, dx, dy, dd = _linear_gradient_line(W, H, grad, m)
         t = ((xx - sx) * dx + (yy - sy) * dy) / dd
     elif gt == 1:  # radial
         cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
@@ -641,14 +701,7 @@ def _render_gradient_py(W, H, grad, m):
     stops = grad["stops"]
     gt = grad["type"]
     if gt == 0:  # linear
-        sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
-        ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
-        dx, dy = ex - sx, ey - sy
-        dd = dx * dx + dy * dy
-        if dd < 1e-9:  # 无起点终点，退回角度方向
-            a = math.radians(grad["angle"])
-            dx, dy = math.cos(a), -math.sin(a)
-            dd = 1.0
+        sx, sy, dx, dy, dd = _linear_gradient_line(W, H, grad, m)
         for y in range(H):
             for x in range(W):
                 t = ((x - sx) * dx + (y - sy) * dy) / dd
@@ -716,9 +769,32 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
         return _resolve_vector_fill(apk_path, full_res, "@" + target, index, depth + 1)
     if info["type"] in ("vector", "string_file", "image") and info["value"]:
         # 可能是 aapt2 拆分出来的渐变 drawable（$xxx__0.xml）
-        grad = _parse_gradient(run_aapt2_dump_xmltree(apk_path, info["value"]))
+        grad = _parse_gradient(
+            run_aapt2_dump_xmltree(apk_path, info["value"]),
+            resolve_color=lambda raw: _resolve_gradient_color(
+                apk_path, full_res, raw, index, depth
+            ),
+        )
         if grad:
             return ("gradient", grad)
+    return None
+
+
+def _resolve_gradient_color(apk_path, full_res, value, index=None, depth=0):
+    """把渐变的 startColor/centerColor/endColor 解析成 RGBA。
+
+    渐变颜色可能是资源引用，_parse_gradient 本身只认识 #hex；
+    这里复用 _resolve_vector_fill 的引用链解析，并限制递归深度。
+    """
+    if depth >= _MAX_DEREF_DEPTH:
+        return None
+    try:
+        resolved = _resolve_vector_fill(apk_path, full_res, value, index, depth + 1)
+    except Exception as e:
+        logging.debug("解析渐变颜色失败 %r: %s", value, e)
+        return None
+    if resolved and resolved[0] == "color":
+        return resolved[1]
     return None
 
 
@@ -746,28 +822,45 @@ def _extend_square_caps(pts, half):
     return out
 
 
-def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
-    """描边一条路径，端点按 strokeLineCap 处理。
+def _stroke_mask(size, subpaths, wpx, cap):
+    """把描边路径画到 L 模式掩码上，供纯色/渐变描边共用。
 
     butt(0) 原样、round(1) 两端补圆、square(2) 沿首末线段方向各延长半个
-    线宽（等价于方形端点）。旧实现只识别 round，square 被静默降级成 butt。
-
-    拐角统一用 Pillow 的 round join 近似：ImageDraw 不提供 miter/bevel，
-    Android 默认的 miter 在尖锐折角处会比这里略"尖"，属已知近似。
+    线宽（等价于方形端点）。
     """
-    stroke = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(stroke)
-    col = (color[0], color[1], color[2], int(round(color[3] * alpha)))
+    mask = Image.new("L", size, 0)
+    d = ImageDraw.Draw(mask)
     r = wpx / 2.0
     for pts in subpaths:
         if len(pts) < 2:
             continue
         draw_pts = _extend_square_caps(pts, r) if cap == 2 else pts
-        d.line([(round(p[0]), round(p[1])) for p in draw_pts], fill=col, width=wpx, joint="curve")
+        d.line([(round(p[0]), round(p[1])) for p in draw_pts], fill=255, width=wpx, joint="curve")
         if cap == 1:  # round
             for p in (pts[0], pts[-1]):
-                d.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=col)
-    layer.alpha_composite(stroke)
+                d.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=255)
+    return mask
+
+
+def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
+    """描边一条路径，端点按 strokeLineCap 处理。
+
+    拐角统一用 Pillow 的 round join 近似：ImageDraw 不提供 miter/bevel，
+    Android 默认的 miter 在尖锐折角处会比这里略"尖"，属已知近似。
+    """
+    if alpha <= 0 or color[3] <= 0:
+        return
+    mask = _stroke_mask(layer.size, subpaths, wpx, cap)
+    if alpha < 0.999:
+        mask = mask.point(lambda v: int(round(v * alpha)))
+    if color[3] < 255:
+        mask = mask.point(lambda v: int(round(v * color[3] / 255.0)))
+    # 只把覆盖率写进 alpha 通道，RGB 保持描边原色；
+    # 不能用 Image.composite(tint, transparent, mask)，否则 RGB 会被一起
+    # 拉向透明黑，半透明描边会变暗。
+    tint = Image.new("RGBA", layer.size, (color[0], color[1], color[2], 255))
+    tint.putalpha(mask)
+    layer.alpha_composite(tint)
 
 
 def _qimage_to_pil(qimg: QtGui.QImage) -> Image.Image:
@@ -781,8 +874,12 @@ def _qimage_to_pil(qimg: QtGui.QImage) -> Image.Image:
     return Image.frombuffer("RGBA", (w, h), bytes(b), "raw", "RGBA", 0, 1)
 
 
-def _create_qbrush(fill, m, falpha: float):
-    """根据解析后的 fill ('color' 或 'gradient') 创建对应的 QBrush。"""
+def _create_qbrush(fill, m, falpha: float, width=None, height=None):
+    """根据解析后的 fill ('color' 或 'gradient') 创建对应的 QBrush。
+
+    width/height 是目标画布尺寸：只有 angle、没有 start/end 的线性渐变
+    需要借助画布尺寸构造覆盖整幅图的渐变线。
+    """
     if fill[0] == "color":
         c = fill[1]
         ca = int(round(c[3] * falpha))
@@ -794,13 +891,15 @@ def _create_qbrush(fill, m, falpha: float):
         grad = fill[1]
         gt = grad["type"]
         if gt == 0:  # linear
-            sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
-            ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
-            dx, dy = ex - sx, ey - sy
-            if dx * dx + dy * dy < 1e-9:
-                a = math.radians(grad["angle"])
-                dx, dy = math.cos(a) * 1000.0, -math.sin(a) * 1000.0
+            if width is not None and height is not None:
+                sx, sy, dx, dy, _dd = _linear_gradient_line(width, height, grad, m)
                 ex, ey = sx + dx, sy + dy
+            else:
+                sx, sy = _mat_apply(m, grad["startX"], grad["startY"])
+                ex, ey = _mat_apply(m, grad["endX"], grad["endY"])
+                if (ex - sx) ** 2 + (ey - sy) ** 2 < 1e-9:
+                    a = math.radians(grad["angle"])
+                    ex, ey = sx + math.cos(a) * 1000.0, sy - math.sin(a) * 1000.0
             qgrad = QtGui.QLinearGradient(QtCore.QPointF(sx, sy), QtCore.QPointF(ex, ey))
         elif gt == 1:  # radial
             cx, cy = _mat_apply(m, grad["centerX"], grad["centerY"])
@@ -1030,7 +1129,7 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
                 fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
                 if fill is not None:
                     falpha = pa * _attr_float(a, "fillAlpha", 1.0)
-                    brush = _create_qbrush(fill, m, falpha)
+                    brush = _create_qbrush(fill, m, falpha, W, H)
                     if brush is not None:
                         painter.fillPath(qpath, brush)
 
@@ -1061,7 +1160,7 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
                         pen.setWidthF(wpx)
                         pen.setCapStyle(cap)
                         pen.setJoinStyle(join)
-                        brush = _create_qbrush(sc, m, sa)
+                        brush = _create_qbrush(sc, m, sa, W, H)
                         if brush is not None:
                             pen.setBrush(brush)
                             painter.strokePath(qpath, pen)
@@ -1149,14 +1248,12 @@ def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=N
                             layer.alpha_composite(Image.composite(tint, transparent, mask))
                     else:  # gradient 填充
                         mask = _build_fill_mask(W, H, tsubs, fill_rule)
-                        gimg = _render_gradient(W, H, fill[1], m)
-                        if falpha < 0.999:
-                            gimg = gimg.point(lambda v: int(round(v * falpha)))
-                        layer.alpha_composite(Image.composite(gimg, transparent, mask))
+                        gimg = _scale_alpha(_render_gradient(W, H, fill[1], m), falpha)
+                        gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
+                        layer.alpha_composite(gimg)
             if "strokeColor" in a:
                 sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
-                if sc is not None and sc[0] == "color":
-                    stroke_color = sc[1]
+                if sc is not None:
                     sw = _attr_float(a, "strokeWidth", 0.0)
                     sa = pa * _attr_float(a, "strokeAlpha", 1.0)
                     if sw > 0 and sa > 0:
@@ -1164,7 +1261,16 @@ def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=N
                         # 不能只用 sx/sy，否则带 group scale 的图标描边会粗成实心块。
                         wpx = max(1, int(round(sw * _mat_scale(m))))
                         cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
-                        _draw_stroke(layer, tsubs, stroke_color, sa, wpx, cap)
+                        if sc[0] == "color":
+                            _draw_stroke(layer, tsubs, sc[1], sa, wpx, cap)
+                        elif sc[0] == "gradient":
+                            mask = _stroke_mask(layer.size, tsubs, wpx, cap)
+                            if sa < 0.999:
+                                mask = mask.point(lambda v: int(round(v * sa)))
+                            gimg = _render_gradient(W, H, sc[1], m)
+                            # 只把描边覆盖率写进 alpha，保留渐变 RGB，避免描边发暗
+                            gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
+                            layer.alpha_composite(gimg)
     return layer.resize((size, size), Image.LANCZOS)
 
 

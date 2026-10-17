@@ -7,6 +7,7 @@ import glob
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 # 确保项目根目录在 sys.path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,6 +126,83 @@ class TestIconTypeSniffing(unittest.TestCase):
             self.assertTrue(data.startswith(b"\x89PNG"))
         finally:
             os.remove(apk_path)
+
+
+class TestGradientRendering(unittest.TestCase):
+    """渐变解析与渲染的回归守护。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+
+    _XML = """E: gradient (line=1)
+  A: http://schemas.android.com/apk/res/android:startColor(0x0101)=#ff0000ff
+  A: http://schemas.android.com/apk/res/android:centerColor(0x0101)=#ff00ff00
+  A: http://schemas.android.com/apk/res/android:endColor(0x0101)=#ffff0000
+  A: http://schemas.android.com/apk/res/android:angle(0x0101)=90.0
+"""
+
+    _VECTOR = """E: vector (line=1)
+  A: http://schemas.android.com/apk/res/android:viewportWidth(0x0101)=100.0
+  A: http://schemas.android.com/apk/res/android:viewportHeight(0x0101)=100.0
+  E: path (line=2)
+    A: http://schemas.android.com/apk/res/android:pathData(0x0101)="M0,0 L100,0 L100,100 L0,100 Z"
+    A: http://schemas.android.com/apk/res/android:fillColor(0x0101)=@0x7f010001
+"""
+
+    _FULL_RES = """resource 0x7f010001 res/grad
+    () (file) res/grad.xml type=XML
+"""
+
+    def test_start_center_end_colors(self):
+        grad = vec_mod._parse_gradient(self._XML)
+        self.assertIsNotNone(grad)
+        self.assertEqual([round(stop[0], 2) for stop in grad["stops"]], [0.0, 0.5, 1.0])
+        self.assertEqual(grad["stops"][0][1], (0, 0, 255, 255))
+        self.assertEqual(grad["stops"][-1][1], (255, 0, 0, 255))
+
+    def test_angle_only_linear_gradient_spans_canvas(self):
+        grad = {
+            "type": 0, "startX": 0.0, "startY": 0.0, "endX": 0.0, "endY": 0.0,
+            "centerX": 0.0, "centerY": 0.0, "radius": 0.0, "angle": 90.0,
+            "stops": [(0.0, (0, 0, 255, 255)), (1.0, (255, 0, 0, 255))],
+        }
+        img = vec_mod._render_gradient(8, 8, grad, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0))
+        # angle=90 表示下→上：底部应接近 startColor，顶部应接近 endColor
+        self.assertNotEqual(img.getpixel((0, 0)), img.getpixel((0, 7)))
+
+    def test_scale_alpha_keeps_rgb(self):
+        src = Image.new("RGBA", (1, 1), (255, 0, 0, 255))
+        out = vec_mod._scale_alpha(src, 0.5)
+        self.assertEqual(out.getpixel((0, 0))[:3], (255, 0, 0))
+        self.assertEqual(out.getpixel((0, 0))[3], 128)
+
+    def test_stroke_mask_and_color_stroke(self):
+        subpaths = [[(2, 8), (14, 8)]]
+        mask = vec_mod._stroke_mask((16, 16), subpaths, 4, 0)
+        self.assertIsNotNone(mask.getbbox())
+
+        layer = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+        vec_mod._draw_stroke(layer, subpaths, (255, 0, 0, 255), 0.5, 4, 0)
+        pixel = layer.getpixel((8, 8))
+        self.assertEqual(pixel[:3], (255, 0, 0))
+        self.assertEqual(pixel[3], 128)
+
+    def test_start_end_gradient_renders_in_both_backends(self):
+        """startColor/endColor + angle 必须同时被 Qt 与 Pillow 渲染链路识别。"""
+
+        def dump_xml(_apk, path):
+            return self._XML if path == "res/grad.xml" else self._VECTOR
+
+        for renderer in (vec_mod._rasterize_vector_layer_pil, vec_mod._rasterize_vector_layer_qt):
+            with mock.patch.object(vec_mod, "run_aapt2_dump_xmltree", side_effect=dump_xml):
+                img = renderer("fake.apk", "res/icon.xml", 64, full_res=self._FULL_RES)
+            self.assertIsNotNone(img)
+            # angle=90 表示下→上：顶部偏 endColor 红，底部偏 startColor 蓝
+            top = img.getpixel((32, 2))
+            bottom = img.getpixel((32, 61))
+            self.assertGreater(top[0], top[2], f"{renderer.__name__} top={top}")
+            self.assertGreater(bottom[2], bottom[0], f"{renderer.__name__} bottom={bottom}")
 
 
 class TestRegressionSuite(unittest.TestCase):
