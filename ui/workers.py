@@ -224,28 +224,76 @@ class IconWorker(QtCore.QThread):
                 self.iconReady.emit(image, data, gen)
 
 class ApkInfoWorker(QtCore.QThread):
-    """后台线程：运行 aapt2 dump badging，避免阻塞 UI"""
-    resultReady = QtCore.pyqtSignal(str)
-    failed = QtCore.pyqtSignal(str)
+    """后台常驻或单次执行解析线程：运行 aapt2 dump badging，支持请求代数覆盖。"""
+    resultReady = QtCore.pyqtSignal(str, int)
+    failed = QtCore.pyqtSignal(str, int)
 
-    def __init__(self, apk_path, parent=None):
+    def __init__(self, apk_path: str = None, parent=None):
         super().__init__(parent)
         self.apk_path = apk_path
+        self._cond = threading.Condition()
+        self._pending = None      # (apk_path, gen)
+        self._gen = 0
+        self._current_gen = 0
+        self._stopping = False
+        if apk_path:
+            self._gen = 1
+            self._pending = (apk_path, 1)
+
+    def request(self, apk_path: str) -> int:
+        """登记一次解析请求（覆盖尚未开始的旧请求），返回本次代数。"""
+        with self._cond:
+            self._gen += 1
+            self._pending = (apk_path, self._gen)
+            self._cond.notify_all()
+            return self._gen
+
+    def stop(self):
+        """请求工作线程结束。"""
+        with self._cond:
+            self._stopping = True
+            self._pending = None
+            self._cond.notify_all()
+
+    def _take_pending(self):
+        with self._cond:
+            while not self._stopping and self._pending is None:
+                self._cond.wait(0.5)
+            if self._stopping:
+                return None
+            item, self._pending = self._pending, None
+            self._current_gen = item[1]
+            return item
+
+    def _is_stale(self, gen: int) -> bool:
+        with self._cond:
+            return self._stopping or gen != self._gen
 
     def run(self):
-        # closeEvent 会 requestInterruption()：旧实现从不检查，中断请求形同虚设，
-        # 只能靠 kill_running_aapt2() 兜底。这里在起子进程前和投递结果前各检查一次。
-        if self.isInterruptionRequested():
-            return
-        try:
-            output = run_aapt2_dump_badging(self.apk_path)
-        except FileNotFoundError as e:
-            self.failed.emit(str(e))
-            return
-        except Exception as e:
-            self.failed.emit(f"执行 aapt2 失败：\n{e}")
-            return
-        if self.isInterruptionRequested():
-            return  # 关窗途中：结果不再投递（控件随时可能被销毁）
-        self.resultReady.emit(output)
+        while True:
+            if self.isInterruptionRequested() or self._stopping:
+                return
+            item = self._take_pending()
+            if item is None:
+                return
+            apk_path, gen = item
+            if self._is_stale(gen):
+                continue
+            try:
+                if self.isInterruptionRequested():
+                    return
+                output = run_aapt2_dump_badging(apk_path)
+            except FileNotFoundError as e:
+                if not self._is_stale(gen):
+                    self.failed.emit(str(e), gen)
+                continue
+            except Exception as e:
+                if not self._is_stale(gen):
+                    self.failed.emit(f"执行 aapt2 失败：\n{e}", gen)
+                continue
+            if not self._is_stale(gen) and not self.isInterruptionRequested():
+                self.resultReady.emit(output, gen)
+            with self._cond:
+                if self.apk_path and not self._pending:
+                    return
 

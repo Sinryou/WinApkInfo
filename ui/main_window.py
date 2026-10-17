@@ -16,7 +16,7 @@ from ui.workers import IconWorker, ApkInfoWorker
 from ui.widgets import DropLineEdit
 
 # 关闭窗口时等待后台线程收尾的时间（毫秒）
-_CLOSE_WAIT_MS = 5000
+_CLOSE_WAIT_MS = 2000
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
@@ -27,8 +27,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._busy = False
         # 当前已解析 APK 的路径：process_apk 显式记录，不再靠回读输入框
         self._apk_path = ""
-        # 线程对象必须长期持有引用：若线程仍在运行时 Python 引用被替换/回收，
-        # PyQt 会在 QThread 析构时报 "QThread: Destroyed while thread is still running"。
+        # 基础解析线程（单常驻线程 + 最新请求覆盖）与向后兼容引用列表
+        self._apk_worker = None
+        self._apk_gen = 0
         self._apk_workers = []
         # 图标提取是常驻线程（单线程 + 最新请求覆盖），首次使用时创建
         self._icon_worker = None
@@ -185,19 +186,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path or not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
-        if self._busy:
-            QtWidgets.QMessageBox.information(self, "提示", "正在解析 APK，请稍候再试。")
-            return
         self._apk_path = path
+        # 若已有任务正在解析，强制中断前序 aapt2 子进程以快速让路，不再弹模态弹窗打断用户
+        if self._busy:
+            kill_running_aapt2()
         try:
             self.set_busy(True)
-            self._prune_workers()
-            worker = ApkInfoWorker(path)
-            self._apk_workers.append(worker)
-            worker.resultReady.connect(self.on_apk_info_ready)
-            worker.failed.connect(self.on_apk_info_failed)
-            worker.finished.connect(functools.partial(self._on_apk_worker_finished, worker))
-            worker.start()
+            self._start_apk_worker(path)
         except Exception as e:
             logging.exception("启动解析线程失败: %s", e)
             self.set_busy(False)  # 否则界面会一直停在"忙碌"状态
@@ -215,20 +210,20 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.unsetCursor()
 
-    def _on_apk_worker_finished(self, worker):
-        """线程执行完毕后及时从列表移除并调度释放，避免残留在 _apk_workers 中造成累积与迟滞清理。"""
-        try:
-            if worker in self._apk_workers:
-                self._apk_workers.remove(worker)
-        except Exception:
-            pass
-        worker.deleteLater()
+    def _start_apk_worker(self, apk_path: str):
+        """把 APK 解析请求交给常驻线程，最新请求覆盖旧请求。"""
+        if self._apk_worker is None:
+            self._apk_worker = ApkInfoWorker()
+            self._apk_worker.resultReady.connect(self.on_apk_info_ready)
+            self._apk_worker.failed.connect(self.on_apk_info_failed)
+            self._apk_workers = [self._apk_worker]
+            self._apk_worker.start()
+        self._apk_gen = self._apk_worker.request(apk_path)
 
-    def _prune_workers(self):
-        """清理已结束的解析线程对象；运行中的保留引用，防止 QThread 被 GC 时崩溃。"""
-        for t in [t for t in self._apk_workers if not t.isRunning()]:
-            t.deleteLater()
-            self._apk_workers.remove(t)
+    def _stop_apk_worker(self):
+        """请求常驻解析线程结束（关闭窗口/退出时调用）。"""
+        if self._apk_worker is not None:
+            self._apk_worker.stop()
 
     def _start_icon_worker(self, apk_path: str, icon_path: str):
         """把图标提取请求交给常驻线程，最新请求覆盖旧请求。
@@ -257,6 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
         取消检查点退出，因此只需有界等待。
         """
         self._stop_icon_worker()
+        self._stop_apk_worker()
         threads = list(self._apk_workers)
         for t in threads:
             if t.isRunning():
@@ -274,13 +270,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 break
         event.accept()
 
-    def shutdown_background(self, timeout_ms: int = 10000) -> bool:
+    def shutdown_background(self, timeout_ms: int = 5000) -> bool:
         """退出前等待后台线程真正结束。
 
         QThread 在运行中被析构会让进程崩溃，因此事件循环结束后仍要确认。
         返回是否全部结束。
         """
         self._stop_icon_worker()
+        self._stop_apk_worker()
         kill_running_aapt2()
         all_done = True
         for t in self._apk_workers + ([self._icon_worker] if self._icon_worker else []):
@@ -289,7 +286,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 all_done = False
         return all_done
 
-    def on_apk_info_ready(self, output: str):
+    def on_apk_info_ready(self, output: str, gen: int = 0):
+        if gen != 0 and gen != self._apk_gen:
+            return  # 延迟到达的旧请求结果，丢弃
         try:
             self.te_raw.setPlainText(output)
             info = parse_aapt2_output(output)
@@ -302,7 +301,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # 无论成功失败都要恢复界面，否则按钮会永久禁用
             self.set_busy(False)
 
-    def on_apk_info_failed(self, message: str):
+    def on_apk_info_failed(self, message: str, gen: int = 0):
+        if gen != 0 and gen != self._apk_gen:
+            return
         QtWidgets.QMessageBox.critical(self, "错误", message)
         self.set_busy(False)
 
