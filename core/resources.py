@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""静态资源定位、SDK 版本表、资源索引与条目解析。"""
+import os
+import sys
+import re
+import json
+import logging
+import threading
+import zipfile
+from pathlib import Path
+
+from core.aapt import Aapt2Error
+
+# 密度从低到高，用于在多个密度变体中挑选最高分辨率
+_DPI_ORDER = ["ldpi", "mdpi", "tvdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
+
+
+def local_resource_path(relative_path):
+    """兼容打包前后路径。
+    
+    PyInstaller 打包模式下以 sys._MEIPASS 为根目录；
+    未打包模式下以项目根目录为基准。
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base_path = getattr(sys, "_MEIPASS", project_root)
+    return os.path.join(base_path, relative_path)
+
+
+_sdk_versions_cache = None
+_sdk_load_warned = False
+
+
+def load_sdk_versions():
+    """读取 resources/android_sdk_versions.json，**成功才缓存**。
+
+    旧实现把"文件缺失/解析失败"得到的空表也写进缓存，之后永不重试，
+    SDK 就只剩裸 API 级别可看（例如打包漏带 resources 时）。
+    现在失败只返回空表并留下提示，下次调用会重新尝试。
+    """
+    global _sdk_versions_cache, _sdk_load_warned
+    # 兼容测试中对 main._sdk_versions_cache 的重置与 mocking
+    main_mod = sys.modules.get("main")
+    if main_mod is not None and hasattr(main_mod, "_sdk_versions_cache"):
+        cached = getattr(main_mod, "_sdk_versions_cache")
+        if cached is None:
+            _sdk_versions_cache = None
+        elif _sdk_versions_cache is None:
+            _sdk_versions_cache = cached
+
+    if _sdk_versions_cache:
+        return _sdk_versions_cache
+
+    sdk_map = {}
+    res_func = getattr(main_mod, "local_resource_path", local_resource_path) if main_mod else local_resource_path
+    sdk_file = Path(res_func("resources/android_sdk_versions.json"))
+    if not sdk_file.exists():
+        if not _sdk_load_warned:
+            logging.warning("未找到 %s，SDK 版本将只显示 API 级别", sdk_file)
+            _sdk_load_warned = True
+        return sdk_map
+    try:
+        with open(sdk_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 建立 {apiLevel: (版本, codename)} 映射
+        for item in data:
+            api = str(item.get("apiLevel"))
+            version = item.get("version", "")
+            codename = item.get("codename") or ""
+            # 去掉"Android "前缀
+            if version.startswith("Android "):
+                version = version.replace("Android ", "", 1)
+            # codename 去空格
+            codename = codename.replace(" ", "") if codename else ""
+            # 拼接成 "8.0 Pie" 或 "14 UpsideDownCake"
+            if codename:
+                sdk_map[api] = f"{version} {codename}"
+            else:
+                sdk_map[api] = version
+        if sdk_map:
+            _sdk_versions_cache = sdk_map   # 仅在真正解析出内容时缓存
+            if main_mod is not None:
+                try:
+                    main_mod._sdk_versions_cache = sdk_map
+                except Exception:
+                    pass
+        else:
+            logging.warning("%s 内容为空，SDK 版本将只显示 API 级别", sdk_file)
+    except Exception as e:
+        logging.warning("读取 android_sdk_versions.json 出错: %s", e)
+    return sdk_map
+
+
+def _entry_span(lines, start):
+    """返回资源条目 [start, end) 行区间：到下一个 `resource 0x` 或 `type ... id=` 分节行前。"""
+    end = start + 1
+    while end < len(lines):
+        s = lines[end].strip()
+        if s.startswith("resource 0x") or re.match(r"^type\s+\w+\s+id=", s):
+            break
+        end += 1
+    return start, end
+
+
+class _ResourceIndex:
+    """一次性解析 `aapt2 dump resources` 全量输出，提供 O(1) 的条目查询。
+
+    图标解析链路会对同一份全量输出做多次线性扫描（每个资源 id 一次、
+    每条文件路径一次），对大型 APK 是全量文本的重复开销。
+    """
+
+    __slots__ = ("by_id", "by_file")
+
+    def __init__(self, full_output: str):
+        self.by_id = {}
+        self.by_file = {}
+        lines = (full_output or "").splitlines()
+        n = len(lines)
+        i = 0
+        while i < n:
+            m = re.match(r"resource\s+(0x[0-9a-fA-F]+)(?:\s+\S+)?", lines[i].strip())
+            if not m:
+                i += 1
+                continue
+            rid = m.group(1).lower()
+            a, b = _entry_span(lines, i)
+            entry = "\n".join(lines[a:b])
+            self.by_id[rid] = entry
+            for line in lines[a:b]:
+                fm = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
+                if fm:
+                    self.by_file.setdefault(fm.group(2), entry)
+            i = b
+
+
+def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
+    """
+    从 `aapt2 dump resources` 全量输出中精确截取某个资源条目。
+
+    条目以 `resource 0x{id} <pkg>/<name>` 行开始，到下一个 `resource 0x` 行
+    或 `type <type> id=..` 分节行之前结束（含其所有密度变体行）。
+    找不到返回空字符串。传入 index（_ResourceIndex）时 O(1) 查询。
+    """
+    if index is not None:
+        return index.by_id.get(res_id.lower(), "")
+
+    lines = (full_output or "").splitlines()
+    rid = res_id.lower()
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("resource ") and s.split()[1].lower() == rid:
+            start = i
+            break
+    if start is None:
+        return ""
+
+    a, b = _entry_span(lines, start)
+    return "\n".join(lines[a:b])
+
+
+def _density_of(qualifier: str) -> str:
+    """从配置限定符中提取密度（如 "xxhdpi"、"anydpi-v26"、"hdpi-v25"）。"""
+    m = re.search(r"(ldpi|mdpi|tvdpi|hdpi|xhdpi|xxhdpi|xxxhdpi|nodpi|anydpi)", qualifier or "")
+    return m.group(1) if m else ""
+
+
+def _pick_best_density(variants: dict):
+    """variants: {density: path}，优先返回最高标准密度，其次 nodpi/默认，最后取末条。"""
+    for dpi in reversed(_DPI_ORDER):
+        if dpi in variants:
+            return variants[dpi]
+    for dpi in ("nodpi", ""):
+        if dpi in variants:
+            return variants[dpi]
+    if variants:
+        return next(reversed(variants.values()))
+    return None
+
+
+_sniff_cache = {}
+_sniff_cache_lock = threading.Lock()
+
+
+def _sniff_file_kind(apk_path: str, inner_path: str):
+    """
+    用魔数识别 APK 内文件类型（AndResGuard 等混淆后文件没有扩展名）。
+    返回 "image" / "xml" / None。结果按 (apk 路径, mtime, 文件路径) 缓存，
+    避免同一次提取链路里反复打开同一个 zip（不持有 ZipFile 句柄，
+    以免影响 Windows 上的重命名操作）。
+    """
+    try:
+        key = (os.path.abspath(apk_path), os.stat(apk_path).st_mtime_ns, inner_path)
+    except OSError:
+        return None
+    with _sniff_cache_lock:
+        if key in _sniff_cache:
+            return _sniff_cache[key]
+    try:
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            head = zf.open(inner_path).read(16)
+    except Exception:
+        return None
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        kind = "image"
+    elif head[:4] == b"\x89PNG":
+        kind = "image"
+    elif head[:2] == b"\xff\xd8":
+        kind = "image"
+    elif head[:4] == b"GIF8":
+        kind = "image"
+    elif head[:4] == b"\x03\x00\x08\x00":  # Android 二进制 XML 头
+        kind = "xml"
+    else:
+        kind = None
+    with _sniff_cache_lock:
+        if len(_sniff_cache) > 512:
+            _sniff_cache.clear()
+        _sniff_cache[key] = kind
+    return kind
+
+
+# aapt2 dump resources 里「文件型」条目会标注 type=PNG / type=XML；
+# 但 WebP 等位图不标注任何 type（形如 `(xxhdpi) (file) res/Sn.webp`），
+# 所以位图识别必须按扩展名兜底，不能只看 type=PNG。
+_BITMAP_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
+
+# 混淆包中字符串引用/包装 XML 的最大解引用深度，防止循环引用
+_MAX_DEREF_DEPTH = 3
+
+
+def get_resource_info(entry_text: str) -> dict:
+    """
+    解析一个 aapt2 dump resources 资源条目（extract_resource_entry 的返回值）。
+
+    返回：
+        dict: {
+            "type": "color",       "value": "#AARRGGBB"
+            "type": "image",       "value": 最高密度位图路径（png/webp/jpg/gif）
+            "type": "vector",      "value": xml 路径（矢量 drawable，无法直接栅格化）
+            "type": "string_file", "value": 指向文件的字符串值（混淆包），需进一步解析
+            "type": "ref",         "value": 另一个资源地址（如 "@0x0106003b"）
+            "type": "unknown",     "value": None
+        }
+
+    "ref" 是 Android 资源别名：`aapt2 dump resources` 对颜色别名输出
+    `() @0x0106003b`（RootMyVivo 的 launcher 颜色就全部是这种写法），
+    旧实现不识别该行，导致颜色层被判为 unknown、整张图标透明。
+    """
+    lines = (entry_text or "").splitlines()
+
+    bitmaps = {}        # density -> path
+    xml_files = []      # path
+    string_files = []   # (density, value)
+    color = None
+    ref = None
+
+    file_re = re.compile(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+?)(?:\s+type=(\w+))?\s*$")
+    str_re = re.compile(r"^\s*\(([^)]*)\)\s*\"([^\"]+)\"\s*$")
+    # #RGB / #ARGB / #RRGGBB / #AARRGGBB 都是合法颜色
+    color_re = re.compile(r"^\s*\(\s*\)\s*(#[0-9a-fA-F]{3,8})\s*$")
+    ref_re = re.compile(r"^\s*\(\s*\)\s*@?(0x[0-9a-fA-F]+)\s*$")
+
+    for line in lines[1:]:  # 跳过 `resource 0x..` 头部行
+        m = file_re.match(line)
+        if m:
+            qual, path, typ = m.group(1).strip(), m.group(2), m.group(3)
+            if typ == "PNG" or path.lower().endswith(_BITMAP_EXTS):
+                bitmaps[_density_of(qual)] = path
+            else:
+                xml_files.append(path)
+            continue
+        m = str_re.match(line)
+        if m:
+            string_files.append((m.group(1).strip(), m.group(2)))
+            continue
+        if color is None:
+            m = color_re.match(line)
+            if m:
+                color = m.group(1)
+                continue
+        if ref is None:
+            m = ref_re.match(line)
+            if m:
+                ref = m.group(1).lower()
+
+    if bitmaps:
+        return {"type": "image", "value": _pick_best_density(bitmaps)}
+    if color:
+        return {"type": "color", "value": color}
+    if xml_files:
+        return {"type": "vector", "value": xml_files[0]}
+    if ref:
+        return {"type": "ref", "value": ref}
+    if string_files:
+        return {"type": "string_file", "value": string_files[0][1]}
+    return {"type": "unknown", "value": None}
+
