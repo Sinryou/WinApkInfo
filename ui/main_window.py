@@ -437,22 +437,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.te_other["edit"].setPlainText("\n".join(other) if other else "(无)")
 
-        # 提取图标
+        # 提取图标：先无条件清空上一轮的图标/提示。新 APK 没有图标时，
+        # 旧的 pixmap、导出字节和上次的失败提示都不能继续留在界面上。
+        self.icon_label.clear()
+        self.lbl_icon_hint.clear()
+        self.lbl_icon_hint.setToolTip("")
+        self._current_icon_bytes = None
         self.btn_export_icon.setVisible(False)
-        apk_path = self._current_apk_path()
-        if apk_path and os.path.isfile(apk_path):
-            try:
-                icons = info.get("icons", {})
-                if icons:
-                    # 选择最大 density 的 icon
-                    best = max(icons.items(), key=lambda x: int(x[0]))
-                    icon_path = best[1]
 
-                    self.icon_label.clear()  # 先清空（含上次失败提示文本）
-                    self.lbl_icon_hint.clear()
-                    self._start_icon_worker(apk_path, icon_path)
+        apk_path = self._current_apk_path()
+        if not icons:
+            self.lbl_icon_hint.setText("未找到可用图标")
+            self.lbl_icon_hint.setToolTip(
+                "该 APK 的 badging 输出中没有 application-icon 或 application icon 条目"
+            )
+        elif apk_path and os.path.isfile(apk_path):
+            try:
+                # 选择最大 density 的 icon（adaptive icon 的 anydpi XML 会排在最高位）
+                best = max(icons.items(), key=lambda x: int(x[0]))
+                self._start_icon_worker(apk_path, best[1])
             except Exception as e:
                 logging.exception("提取图标失败: %s", e)
+        else:
+            self.lbl_icon_hint.setText("未找到可读取的 APK 文件")
 
         # 生成重命名预览
         app_name = self.le_app_name.text().strip() or "App"
