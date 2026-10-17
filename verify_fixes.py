@@ -258,14 +258,24 @@ def wait_for(app, predicate, timeout=60.0):
 # --------------------------------------------------------------------------
 def check_env():
     C.title("0. 环境")
-    C.check("aapt2 可用", bool(m.find_aapt2()), m.find_aapt2())
+    try:
+        aapt2_path = m.find_aapt2()
+        C.check("aapt2 可用", True, aapt2_path)
+    except Exception as e:
+        # 没有 aapt2 时不要在这里抛异常中断整套用例；后续依赖 aapt2 的
+        # 真实样本用例会自行跳过。
+        C.skip("aapt2 可用", str(e))
     C.check("numpy 可用（矢量栅格化向量化路径）", m.np is not None, "numpy %s" % (np.__version__,))
     C.check("PyQt6 / Pillow 版本", True,
             "PyQt6 %s · Qt %s · Pillow %s" % (
                 QtCore.PYQT_VERSION_STR, QtCore.QT_VERSION_STR, Image.__version__))
     apks = sample_apks()
-    C.check("样本 APK", len(apks) > 0, "%d 个（%s）" % (
-        len(apks), os.path.basename(SAMPLE_DIR) if apks else "目录缺失"))
+    if apks:
+        C.check("样本 APK", True, "%d 个（%s）" % (len(apks), os.path.basename(SAMPLE_DIR)))
+    else:
+        # testSample/ 被 .gitignore 排除，CI 与精简环境中没有样本；
+        # --quick 的全部用例都应能在无样本时通过。
+        C.skip("样本 APK", "testSample 不存在或为空（CI/精简环境）")
 
 
 def check_p0_1():
@@ -529,7 +539,7 @@ def check_p1_7(app):
     C.title("P1-7 process_apk(path) 使用传入路径")
     apks = sample_apks()
     if not apks:
-        C.check("样本 APK 可用", False, "testSample 为空")
+        C.skip("样本 APK 可用", "testSample 为空（CI/精简环境）")
         return
     target = pick_apk(apks)
     win = m.MainWindow()
@@ -615,7 +625,11 @@ def check_p2_10():
     shutil.which = counting_which
     try:
         m.find_aapt2.cache_clear()
-        p1 = m.find_aapt2()
+        try:
+            p1 = m.find_aapt2()
+        except Exception as e:
+            C.skip("aapt2 查找结果可缓存", str(e))
+            return
         calls_after_first = calls["n"]
         t0 = time.time()
         p2 = m.find_aapt2()
@@ -632,8 +646,13 @@ def check_p2_10():
     os.makedirs(tmp_dir, exist_ok=True)
     try:
         m.find_aapt2.cache_clear()
+        try:
+            found = m.find_aapt2()
+        except Exception as e:
+            C.skip("同名目录不会被误判为可执行文件", str(e))
+            return
         C.check("同名目录不会被误判为可执行文件",
-                os.path.normcase(m.find_aapt2()) != os.path.normcase(tmp_dir))
+                os.path.normcase(found) != os.path.normcase(tmp_dir))
     finally:
         os.rmdir(tmp_dir)
 

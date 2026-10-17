@@ -47,6 +47,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Surface the real failure in GitHub Actions annotations. Without this the
+# step can show only "Process completed with exit code 1", while full logs
+# require a signed-in GitHub session.
+trap {
+    $message = $_.Exception.Message
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        Write-Host "::error::$message"
+    }
+    else {
+        Write-Host "ERROR: $message" -ForegroundColor Red
+    }
+    Write-Host $_.ScriptStackTrace
+    exit 1
+}
+
 $ProjectRoot = $PSScriptRoot
 $BuildRoot = Join-Path $ProjectRoot "build"
 $DistRoot = Join-Path $ProjectRoot "dist"
@@ -162,6 +177,30 @@ if ($Clean) {
 New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
 
+# Resolve aapt2 before the regression checks: verify_fixes.py calls
+# find_aapt2(), which only looks at the script directory and PATH. CI runners
+# have aapt2 in the Android SDK but usually not on PATH, so export the
+# resolved directory to child processes or the test run aborts immediately.
+Write-Step "Locating aapt2.exe"
+$resolvedAapt2 = Resolve-Aapt2Path -Explicit $Aapt2Path
+if (-not $resolvedAapt2) {
+    if (-not $AllowMissingAapt2) {
+        throw @"
+aapt2.exe was not found.
+
+Put it at tools\aapt2.exe, pass -Aapt2Path <file>, install it on PATH,
+or install the Android SDK build-tools. To build an incomplete package
+anyway, pass -AllowMissingAapt2.
+"@
+    }
+    Write-Warning "aapt2.exe not found; the package will rely on aapt2 from PATH."
+}
+else {
+    Write-Host "aapt2: $resolvedAapt2"
+    $aapt2Dir = Split-Path -Parent $resolvedAapt2
+    $env:PATH = "$aapt2Dir;$env:PATH"
+}
+
 if (-not $SkipTests) {
     Write-Step "Running regression checks"
     $testArgs = @((Join-Path $ProjectRoot "verify_fixes.py"))
@@ -179,24 +218,6 @@ Write-Step "Generating Windows version resources"
 $versionFile = Join-Path $BuildRoot "version_info.txt"
 & $Python (Join-Path $ProjectRoot "scripts\gen_version_info.py") $Version $versionFile
 Assert-LastExitCode "generate version_info.txt"
-
-Write-Step "Locating aapt2.exe"
-$resolvedAapt2 = Resolve-Aapt2Path -Explicit $Aapt2Path
-if (-not $resolvedAapt2) {
-    if (-not $AllowMissingAapt2) {
-        throw @"
-aapt2.exe was not found.
-
-Put it at tools\aapt2.exe, pass -Aapt2Path <file>, install it on PATH,
-or install the Android SDK build-tools. To build an incomplete package
-anyway, pass -AllowMissingAapt2.
-"@
-    }
-    Write-Warning "aapt2.exe not found; the package will rely on aapt2 from PATH."
-}
-else {
-    Write-Host "aapt2: $resolvedAapt2"
-}
 
 Write-Step "Building with PyInstaller ($Mode)"
 $env:WINAPKINFO_VERSION = $Version
