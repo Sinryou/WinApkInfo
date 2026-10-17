@@ -57,6 +57,15 @@ from core.aapt import (
     run_aapt2_dump_badging,
     run_aapt2_dump_resource,
     run_aapt2_dump_xmltree,
+    get_disk_cache_info,
+    clear_disk_cache,
+)
+
+# 导出 core.signature 符号
+from core.signature import (
+    get_file_meta_and_hashes,
+    extract_apk_signatures,
+    get_apk_full_signature_report,
 )
 
 # 导出 core.colors 符号

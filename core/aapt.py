@@ -410,3 +410,43 @@ def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str):
 
     _aapt2_cache.put(key, text)
     return text
+
+
+def get_disk_cache_info() -> dict:
+    """返回磁盘缓存统计信息：{'dir': str, 'count': int, 'total_bytes': int, 'total_mb': float}。"""
+    disk_dir = _default_disk_cache_dir()
+    if not disk_dir or not os.path.isdir(disk_dir):
+        return {"dir": disk_dir or "", "count": 0, "total_bytes": 0, "total_mb": 0.0}
+    try:
+        names = [n for n in os.listdir(disk_dir) if n.endswith(".txt")]
+        total = sum(os.path.getsize(os.path.join(disk_dir, n)) for n in names)
+        return {
+            "dir": disk_dir,
+            "count": len(names),
+            "total_bytes": total,
+            "total_mb": round(total / (1024 * 1024), 2),
+        }
+    except Exception as e:
+        logging.warning("获取磁盘缓存信息失败: %s", e)
+        return {"dir": disk_dir, "count": 0, "total_bytes": 0, "total_mb": 0.0}
+
+
+def clear_disk_cache() -> int:
+    """清空磁盘缓存与内存缓存，返回释放的字节数。"""
+    _aapt2_cache.clear()
+    disk_dir = _default_disk_cache_dir()
+    if not disk_dir or not os.path.isdir(disk_dir):
+        return 0
+    freed = 0
+    try:
+        for n in os.listdir(disk_dir):
+            if n.endswith(".txt") or n.startswith(".tmp"):
+                p = os.path.join(disk_dir, n)
+                try:
+                    freed += os.path.getsize(p)
+                    os.remove(p)
+                except OSError:
+                    pass
+    except Exception as e:
+        logging.warning("清空磁盘缓存失败: %s", e)
+    return freed

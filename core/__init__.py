@@ -17,6 +17,13 @@ from core.aapt import (
     run_aapt2_dump_badging,
     run_aapt2_dump_resource,
     run_aapt2_dump_xmltree,
+    get_disk_cache_info,
+    clear_disk_cache,
+)
+from core.signature import (
+    get_file_meta_and_hashes,
+    extract_apk_signatures,
+    get_apk_full_signature_report,
 )
 from core.colors import (
     parse_android_color,
