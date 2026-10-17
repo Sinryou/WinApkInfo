@@ -18,9 +18,9 @@ from ui.widgets import DropLineEdit
 # 关闭窗口时等待后台线程收尾的时间（毫秒）
 _CLOSE_WAIT_MS = 5000
 
-class MainWindow(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.setWindowTitle("APK 信息查看器（aapt2）")
         self.setWindowIcon(QtGui.QIcon(local_resource_path("resources/logo.ico")))
         self.resize(700, 700)
@@ -36,7 +36,9 @@ class MainWindow(QtWidgets.QWidget):
         self.setup_ui()
 
     def setup_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
+        central_widget = QtWidgets.QWidget(self)
+        self.setCentralWidget(central_widget)
+        layout = QtWidgets.QVBoxLayout(central_widget)
 
         # 顶部：文件选择/拖放
         file_row = QtWidgets.QHBoxLayout()
