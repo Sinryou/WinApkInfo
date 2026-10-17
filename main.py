@@ -302,7 +302,7 @@ def _aapt2_cache_key(apk_path: str, kind: str, arg=None):
 
 def local_resource_path(relative_path):
     """兼容打包前后路径"""
-    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
 _sdk_versions_cache = None
@@ -2656,6 +2656,7 @@ class MainWindow(QtWidgets.QWidget):
             self._apk_workers.append(worker)
             worker.resultReady.connect(self.on_apk_info_ready)
             worker.failed.connect(self.on_apk_info_failed)
+            worker.finished.connect(functools.partial(self._on_apk_worker_finished, worker))
             worker.start()
         except Exception as e:
             logging.exception("启动解析线程失败: %s", e)
@@ -2673,6 +2674,15 @@ class MainWindow(QtWidgets.QWidget):
             self.te_raw.setPlainText("正在解析 APK，请稍候…")
         else:
             self.unsetCursor()
+
+    def _on_apk_worker_finished(self, worker):
+        """线程执行完毕后及时从列表移除并调度释放，避免残留在 _apk_workers 中造成累积与迟滞清理。"""
+        try:
+            if worker in self._apk_workers:
+                self._apk_workers.remove(worker)
+        except Exception:
+            pass
+        worker.deleteLater()
 
     def _prune_workers(self):
         """清理已结束的解析线程对象；运行中的保留引用，防止 QThread 被 GC 时崩溃。"""
@@ -3131,6 +3141,7 @@ def main():
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
             filename=os.path.join(tempfile.gettempdir(), "winapkinfo.log"),
+            encoding="utf-8",
         )
 
     # 构建/排障入口：--version 输出版本，--self-test 检查打包产物是否完整
