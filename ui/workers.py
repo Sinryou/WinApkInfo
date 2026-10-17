@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""后台解析工作线程（ApkInfoWorker、IconWorker）。"""
+"""后台解析工作线程（ApkInfoWorker、IconWorker，基于标准 Qt Worker-Object 架构）。"""
 import io
 import time
 import zipfile
@@ -18,72 +18,124 @@ from core.apk_parser import (
 )
 
 class _Cancelled(Exception):
-    """内部取消信号：请求被更新的请求覆盖、或窗口关闭时抛出让 run() 丢弃本轮。"""
+    """内部取消信号：请求被更新的请求覆盖、或窗口关闭时抛出让工作者丢弃本轮。"""
+
+
+class _IconWorkerCore(QtCore.QObject):
+    """在工作线程中实际执行图标提取的 Worker Object。
+
+    遵循 Qt 官方推荐的标准 Worker-Object 模式：
+    - 作为 QObject 实体，通过 moveToThread 移入工作线程中执行；
+    - 无 UI 控件依赖，槽函数 _do_work 运行在工作线程独立的 Qt 事件循环中；
+    - 请求通过 Qt 队列连接（QueuedConnection）跨线程派发，彻底消除 threading.Condition
+      忙等、轮询与裸锁等待；
+    - 针对连续快速请求，支持代数（Generation）自增与最新请求覆盖，自动丢弃过期未完成任务。
+    """
+    iconReady = QtCore.pyqtSignal(QtGui.QImage, bytes, int)
+    failed = QtCore.pyqtSignal(str, int)
+    _trigger = QtCore.pyqtSignal()
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+        self._lock = threading.Lock()
+        self._pending = None      # (apk_path, icon_path, gen)
+        self._gen = 0             # 最新请求代数
+        self._current_gen = 0     # 正在处理的代数
+        self._stopping = False
+        self._trigger.connect(self._do_work, QtCore.Qt.ConnectionType.QueuedConnection)
+
+    def request(self, apk_path: str, icon_path: str) -> int:
+        """登记一次提取请求（最新请求覆盖尚未开始的旧请求），返回本次代数。"""
+        with self._lock:
+            self._gen += 1
+            self._pending = (apk_path, icon_path, self._gen)
+            gen = self._gen
+        self._trigger.emit()
+        return gen
+
+    def stop(self):
+        """请求工作线程停止，清空尚未处理的待办请求。"""
+        with self._lock:
+            self._stopping = True
+            self._pending = None
+
+    def is_stale(self, gen: int) -> bool:
+        with self._lock:
+            return self._stopping or gen != self._gen
+
+    def check_cancel(self):
+        """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
+        with self._lock:
+            stale = self._stopping or self._current_gen != self._gen
+        if stale or self._owner.isInterruptionRequested():
+            raise _Cancelled
+
+    @QtCore.pyqtSlot()
+    def _do_work(self):
+        """工作线程槽函数：由 Qt 事件循环自动调度处理。"""
+        with self._lock:
+            if self._stopping or self._pending is None:
+                return
+            apk_path, icon_path, gen = self._pending
+            self._pending = None
+            self._current_gen = gen
+
+        if self.is_stale(gen) or self._owner.isInterruptionRequested():
+            return
+
+        try:
+            self.check_cancel()
+            image, data = self._owner._extract(apk_path, icon_path)
+        except _Cancelled:
+            return  # 已有更新请求或已中断：丢弃本轮结果
+        except Exception as e:
+            logging.exception("子线程提取图标失败: %s", e)
+            if not self.is_stale(gen):
+                self.failed.emit(str(e), gen)
+            return
+
+        if not self.is_stale(gen):
+            self.iconReady.emit(image, data, gen)
 
 
 class IconWorker(QtCore.QThread):
-    """常驻的图标提取线程：只保留「最新一次请求」，旧请求自动作废。
+    """常驻的图标提取工作线程（Worker-Object 门面与生命周期管理）。
 
-    旧实现每次都新建 QThread 并 requestInterruption 旧线程，虽然结果有代数
-    保护，但快速连续解析时线程与 aapt2 子进程会堆积（实测连续 20 次请求
-    = 20 个线程同时在跑）。改为单线程 + 最新请求覆盖：
-
-    - request() 由 UI 线程调用：写入待处理请求并唤醒工作线程，返回代数；
-    - 工作线程每轮取走请求；运行期间通过 _check_cancel() 检测到有更新请求
-      （或已请求停止）就抛 _Cancelled 提前放弃，再取最新请求；
-    - 只有仍是当前代数的结果才会 emit，UI 侧再用 _icon_gen 做一次投递延迟
-      校验（信号排队期间可能又来了新请求）。
-
-    注意：不要命名为 finished——会遮蔽 QThread 内建 finished 信号，
-    破坏 thread.finished.connect(deleteLater) 等惯用法。
+    架构特点：
+    - 业务逻辑与执行状态封装在 _IconWorkerCore(QObject) 中，通过 moveToThread 移入自身；
+    - 线程自身运行标准 Qt 事件循环（默认 exec()），完全移除了底层的 threading.Condition 轮询；
+    - 请求派发与结果回传完全通过 Qt 信号槽队列机制，零 CPU 占用挂起；
+    - 对外提供稳定的 QThread 线程控制接口（start, stop, wait, isRunning）与向后兼容方法。
     """
     iconReady = QtCore.pyqtSignal(QtGui.QImage, bytes, int)  # 成功（QImage 在槽内转 QPixmap；字节流供导出）
     failed = QtCore.pyqtSignal(str, int)  # 提取失败时发出，供 UI 可见提示
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._cond = threading.Condition()
-        self._pending = None      # (apk_path, icon_path, gen)
-        self._gen = 0             # 最新请求代数
-        self._current_gen = 0     # 正在处理的代数
-        self._stopping = False
+        self._core = _IconWorkerCore(self)
+        self._core.moveToThread(self)
+        self._core.iconReady.connect(self.iconReady)
+        self._core.failed.connect(self.failed)
+        self.finished.connect(self._core.deleteLater)
 
     # ---------------- UI 线程接口 ----------------
     def request(self, apk_path: str, icon_path: str) -> int:
         """登记一次提取请求（覆盖尚未开始的旧请求），返回本次代数。"""
-        with self._cond:
-            self._gen += 1
-            self._pending = (apk_path, icon_path, self._gen)
-            self._cond.notify_all()
-            return self._gen
+        return self._core.request(apk_path, icon_path)
 
     def stop(self):
         """请求工作线程结束（关闭窗口时调用）。"""
-        with self._cond:
-            self._stopping = True
-            self._pending = None
-            self._cond.notify_all()
-
-    # ---------------- 工作线程 ----------------
-    def _take_pending(self):
-        """取走待处理请求；返回 None 表示应退出线程。"""
-        with self._cond:
-            while not self._stopping and self._pending is None:
-                self._cond.wait(0.5)
-            if self._stopping:
-                return None
-            item, self._pending = self._pending, None
-            self._current_gen = item[2]
-            return item
+        self._core.stop()
+        self.requestInterruption()
+        self.quit()
 
     def _is_stale(self, gen: int) -> bool:
-        with self._cond:
-            return self._stopping or gen != self._gen
+        return self._core.is_stale(gen)
 
     def _check_cancel(self):
         """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
-        if self._is_stale(self._current_gen):
-            raise _Cancelled
+        self._core.check_cancel()
 
     @staticmethod
     def _load_image(img: QtGui.QImage, data: bytes) -> bool:
@@ -109,15 +161,13 @@ class IconWorker(QtCore.QThread):
         1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
            mipmap/ic_launcher 直接指向一个普通矢量 drawable，它的
            viewport 里已经画好了完整图标，没有 foreground/background 层；
-           旧实现只按 adaptive-icon 解析，找不到两层就判失败。
         2) 根元素是 <adaptive-icon> 时，从 xmltree 解析 foreground/background
            资源地址，完整解析每一层（支持混淆字符串引用、无扩展名文件、
            <scale> 包装），两层都能渲染（位图/颜色/矢量）时合成完整图标；
         3) 结构不是标准 adaptive-icon、或任一层渲染失败时，回退到
            icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
 
-        `dump resources` 只在确实需要时执行（旧实现在拿到 fg/bg 地址前
-        就 dump，非自适应图标也白白跑一次全量输出）。
+        `dump resources` 只在确实需要时执行。
         """
         self._check_cancel()
         xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
@@ -159,9 +209,7 @@ class IconWorker(QtCore.QThread):
                 except _Cancelled:
                     raise
                 except Exception as e:
-                    # 层解析成功不代表能渲染：前景/背景可能是 <bitmap>、<shape>、
-                    # <animated-vector> 或 res/color 状态列表等根节点，栅格化会失败。
-                    # 这种情况下继续走下面的位图回退，而不是把整个图标判为失败。
+                    # 层解析成功不代表能渲染：回退到下面的位图回退
                     logging.warning("合成自适应图标失败，改用位图回退: %s", e)
 
         # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
@@ -187,8 +235,6 @@ class IconWorker(QtCore.QThread):
         with _open_apk_zip(apk_path, zf) as shared_zf:
             if icon_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
                 raw = shared_zf.open(icon_path).read()
-                # 与自适应/矢量链路统一导出规格（_ICON_SIZE²）；PIL 解不了时
-                # 保留原始字节，交给 Qt 解码器兜底。
                 data = _normalize_icon_png(raw) or raw
                 if not self._load_image(img, data):
                     raise ValueError(f"图标文件无法解码为图片: {icon_path}")
@@ -203,97 +249,113 @@ class IconWorker(QtCore.QThread):
                 raise ValueError(f"不支持的图标类型: {icon_path}")
         return img, data
 
-    def run(self):
-        """工作线程主循环：不断取最新请求执行，直到 stop()。"""
-        while True:
-            item = self._take_pending()
-            if item is None:
+
+class _ApkInfoWorkerCore(QtCore.QObject):
+    """在工作线程中实际执行 APK dump badging 的 Worker Object。"""
+    resultReady = QtCore.pyqtSignal(str, int)
+    failed = QtCore.pyqtSignal(str, int)
+    _trigger = QtCore.pyqtSignal()
+
+    def __init__(self, owner, single_shot: bool = False):
+        super().__init__()
+        self._owner = owner
+        self._single_shot = single_shot
+        self._lock = threading.Lock()
+        self._pending = None      # (apk_path, gen)
+        self._gen = 0
+        self._current_gen = 0
+        self._stopping = False
+        self._trigger.connect(self._do_work, QtCore.Qt.ConnectionType.QueuedConnection)
+
+    def request(self, apk_path: str) -> int:
+        """登记一次解析请求（覆盖尚未开始的旧请求），返回本次代数。"""
+        with self._lock:
+            self._gen += 1
+            self._pending = (apk_path, self._gen)
+            gen = self._gen
+        self._trigger.emit()
+        return gen
+
+    def stop(self):
+        """请求工作线程结束。"""
+        with self._lock:
+            self._stopping = True
+            self._pending = None
+
+    def is_stale(self, gen: int) -> bool:
+        with self._lock:
+            return self._stopping or gen != self._gen
+
+    @QtCore.pyqtSlot()
+    def _do_work(self):
+        """由 Qt 事件循环调度的后台执行槽函数。"""
+        with self._lock:
+            if self._stopping or self._pending is None:
                 return
-            apk_path, icon_path, gen = item
-            try:
-                self._check_cancel()
-                image, data = self._extract(apk_path, icon_path)
-            except _Cancelled:
-                continue  # 已有更新的请求（或窗口关闭）：丢弃这次结果
-            except Exception as e:
-                logging.exception("子线程提取图标失败: %s", e)
-                if not self._is_stale(gen):
-                    self.failed.emit(str(e), gen)
-                continue
-            if not self._is_stale(gen):
-                self.iconReady.emit(image, data, gen)
+            apk_path, gen = self._pending
+            self._pending = None
+            self._current_gen = gen
+
+        if self.is_stale(gen) or self._owner.isInterruptionRequested():
+            return
+
+        try:
+            output = run_aapt2_dump_badging(apk_path)
+        except FileNotFoundError as e:
+            if not self.is_stale(gen):
+                self.failed.emit(str(e), gen)
+            self._check_single_shot()
+            return
+        except Exception as e:
+            if not self.is_stale(gen):
+                self.failed.emit(f"执行 aapt2 失败：\n{e}", gen)
+            self._check_single_shot()
+            return
+
+        if not self.is_stale(gen) and not self._owner.isInterruptionRequested():
+            self.resultReady.emit(output, gen)
+
+        self._check_single_shot()
+
+    def _check_single_shot(self):
+        """单次执行模式下，在任务完成后自动退出事件循环。"""
+        if self._single_shot:
+            with self._lock:
+                if not self._pending:
+                    self._owner.quit()
+
 
 class ApkInfoWorker(QtCore.QThread):
-    """后台常驻或单次执行解析线程：运行 aapt2 dump badging，支持请求代数覆盖。"""
+    """后台常驻或单次执行解析工作线程（Worker-Object 门面）。
+
+    采用标准 Qt Worker-Object 模式：
+    - 业务逻辑封装在 _ApkInfoWorkerCore(QObject) 中并移入线程；
+    - 支持常驻长连接（单线程最新覆盖）与单次运行自动退出两种模式；
+    - 彻底告别轮询，由 Qt 事件循环响应任务。
+    """
     resultReady = QtCore.pyqtSignal(str, int)
     failed = QtCore.pyqtSignal(str, int)
 
     def __init__(self, apk_path: str = None, parent=None):
         super().__init__(parent)
         self.apk_path = apk_path
-        self._cond = threading.Condition()
-        self._pending = None      # (apk_path, gen)
-        self._gen = 0
-        self._current_gen = 0
-        self._stopping = False
+        self._core = _ApkInfoWorkerCore(self, single_shot=bool(apk_path))
+        self._core.moveToThread(self)
+        self._core.resultReady.connect(self.resultReady)
+        self._core.failed.connect(self.failed)
+        self.finished.connect(self._core.deleteLater)
         if apk_path:
-            self._gen = 1
-            self._pending = (apk_path, 1)
+            self.request(apk_path)
 
     def request(self, apk_path: str) -> int:
         """登记一次解析请求（覆盖尚未开始的旧请求），返回本次代数。"""
-        with self._cond:
-            self._gen += 1
-            self._pending = (apk_path, self._gen)
-            self._cond.notify_all()
-            return self._gen
+        return self._core.request(apk_path)
 
     def stop(self):
         """请求工作线程结束。"""
-        with self._cond:
-            self._stopping = True
-            self._pending = None
-            self._cond.notify_all()
-
-    def _take_pending(self):
-        with self._cond:
-            while not self._stopping and self._pending is None:
-                self._cond.wait(0.5)
-            if self._stopping:
-                return None
-            item, self._pending = self._pending, None
-            self._current_gen = item[1]
-            return item
+        self._core.stop()
+        self.requestInterruption()
+        self.quit()
 
     def _is_stale(self, gen: int) -> bool:
-        with self._cond:
-            return self._stopping or gen != self._gen
-
-    def run(self):
-        while True:
-            if self.isInterruptionRequested() or self._stopping:
-                return
-            item = self._take_pending()
-            if item is None:
-                return
-            apk_path, gen = item
-            if self._is_stale(gen):
-                continue
-            try:
-                if self.isInterruptionRequested():
-                    return
-                output = run_aapt2_dump_badging(apk_path)
-            except FileNotFoundError as e:
-                if not self._is_stale(gen):
-                    self.failed.emit(str(e), gen)
-                continue
-            except Exception as e:
-                if not self._is_stale(gen):
-                    self.failed.emit(f"执行 aapt2 失败：\n{e}", gen)
-                continue
-            if not self._is_stale(gen) and not self.isInterruptionRequested():
-                self.resultReady.emit(output, gen)
-            with self._cond:
-                if self.apk_path and not self._pending:
-                    return
-
+        return self._core.is_stale(gen)
