@@ -213,17 +213,53 @@ def _self_test(apk_path: str = None) -> int:
     return 0
 
 
+def _default_log_dir() -> str:
+    """返回标准日志目录（优先 %LOCALAPPDATA%/WinApkInfo）。"""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "WinApkInfo")
+
+    try:
+        from PyQt6.QtCore import QStandardPaths
+        base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+        if base:
+            return os.path.join(base, "WinApkInfo") if "winapkinfo" not in base.lower() else base
+    except Exception:
+        pass
+
+    home = os.path.expanduser("~")
+    if os.path.isdir(os.path.join(home, ".local", "state")):
+        return os.path.join(home, ".local", "state", "WinApkInfo")
+
+    return tempfile.gettempdir()
+
+
+def _default_log_path() -> str:
+    """返回日志文件的绝对路径（%LOCALAPPDATA%/WinApkInfo/winapkinfo.log），确保父目录存在。"""
+    log_dir = _default_log_dir()
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        log_dir = tempfile.gettempdir()
+    return os.path.join(log_dir, "winapkinfo.log")
+
+
 def main():
-    # 日志：控制台模式输出到 stderr；PyInstaller 窗口模式（无 stderr）落盘到临时目录
+    # 日志：控制台模式输出到 stderr，同时统一落盘到标准日志路径 %LOCALAPPDATA%/WinApkInfo/winapkinfo.log
+    log_path = _default_log_path()
+    handlers = []
     if sys.stderr is not None:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(message)s",
-            filename=os.path.join(tempfile.gettempdir(), "winapkinfo.log"),
-            encoding="utf-8",
-        )
+        handlers.append(logging.StreamHandler(sys.stderr))
+    try:
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    except OSError:
+        pass
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers if handlers else None,
+    )
 
     # 构建/排障入口：--version 输出版本，--self-test 检查打包产物是否完整
     if "--version" in sys.argv:

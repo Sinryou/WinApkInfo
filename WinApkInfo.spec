@@ -61,10 +61,32 @@ a = Analysis(
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
-    excludes=["tkinter"],
-    noarchive=False,
+    excludes=[
+        "tkinter",
+        "yaml",
+        "numpy",
+        "PyQt6.QtPdf",
+        "PyQt6.QtPdfWidgets",
+        "PyQt6.QtNetwork",
+        "PyQt6.QtQml",
+        "PyQt6.QtQuick",
+        "PyQt6.QtQuickWidgets",
+        "PyQt6.QtSql",
+        "PyQt6.QtTest",
+        "PyQt6.QtXml",
+        "PyQt6.QtBluetooth",
+        "PyQt6.QtNfc",
+        "PyQt6.QtPositioning",
+        "PyQt6.QtSensors",
+        "PyQt6.QtSerialPort",
+        "PyQt6.QtWebChannel",
+        "PyQt6.QtWebSockets",
+    ],
 )
+
+# 排除未使用的 Qt 动态库，进一步削减体积
+_EXCLUDED_BINARIES = {"qt6pdf.dll", "qt6network.dll"}
+a.binaries = [x for x in a.binaries if Path(x[0]).name.lower() not in _EXCLUDED_BINARIES]
 
 pyz = PYZ(a.pure)
 

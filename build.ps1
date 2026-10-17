@@ -147,7 +147,7 @@ $dependencyCheck = @'
 import importlib.util
 import sys
 
-missing = [name for name in ("PyInstaller", "PyQt6", "PIL", "numpy")
+missing = [name for name in ("PyInstaller", "PyQt6", "PIL")
            if importlib.util.find_spec(name) is None]
 if missing:
     sys.stderr.write("Missing Python packages: " + ", ".join(missing) + "\n")
@@ -264,7 +264,11 @@ if (Test-Path -LiteralPath $sampleDir -PathType Container) {
 $selfTest = Start-Process -FilePath $exePath -ArgumentList $selfTestArgument `
     -WorkingDirectory (Split-Path -Parent $exePath) -Wait -PassThru
 if ($selfTest.ExitCode -ne 0) {
-    $logPath = Join-Path $env:TEMP "winapkinfo.log"
+    $logPath = if ($env:LOCALAPPDATA) {
+        Join-Path $env:LOCALAPPDATA "WinApkInfo\winapkinfo.log"
+    } else {
+        Join-Path $env:TEMP "winapkinfo.log"
+    }
     throw "Packaged self-test failed (exit $($selfTest.ExitCode)). See $logPath"
 }
 Write-Host "Self-test passed."
