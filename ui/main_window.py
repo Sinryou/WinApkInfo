@@ -11,7 +11,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from version import __version__
 from core.aapt import kill_running_aapt2, get_disk_cache_info, clear_disk_cache
 from core.resources import local_resource_path, load_sdk_versions
-from core.apk_parser import _sanitize_apk_name, parse_aapt2_output
+from core.apk_parser import _sanitize_apk_name, parse_aapt2_output, _CHINESE_LOCALE_PRIORITY
 from ui.workers import IconWorker, ApkInfoWorker
 from ui.widgets import DropLineEdit
 
@@ -181,13 +181,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return self._apk_path or self.apk_path_edit.text().strip()
 
-    def process_apk(self, path: str):
-        if not path or not os.path.isfile(path):
-            QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
-            return
-        self._apk_path = path
-        # 开始新一轮解析前清空上一轮的可导出/可重命名状态：
-        # 否则新 APK 解析失败时，旧图标和旧文件名预览会被误认为属于新文件。
+    def _reset_result_state(self):
+        """清空上一轮的输出、图标、提示与重命名预览状态。"""
         self._raw_output = ""
         self._parse_ok_path = ""
         self._current_icon_bytes = None
@@ -196,6 +191,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_icon_hint.clear()
         self.lbl_icon_hint.setToolTip("")
         self.rename_preview.clear()
+
+    def process_apk(self, path: str):
+        if not path or not os.path.isfile(path):
+            QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
+            return
+        self._apk_path = path
+        # 开始新一轮解析前清空上一轮的可导出/可重命名状态：
+        # 否则新 APK 解析失败时，旧图标和旧文件名预览会被误认为属于新文件。
+        self._reset_result_state()
         # 若已有任务正在解析，强制中断前序 aapt2 子进程以快速让路，不再弹模态弹窗打断用户
         if self._busy:
             kill_running_aapt2()
@@ -302,9 +306,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             # 先记录原始输出：解析成功与否都不影响后续“重新解析”使用真实文本
             self._raw_output = output
-            self._parse_ok_path = self._apk_path
             info = parse_aapt2_output(output)
             self.fill_info(info)
+            self._parse_ok_path = self._apk_path
         except Exception as e:
             # slot 内未捕获异常会让 PyQt6 直接 qFatal() 结束进程，必须自行兜住
             logging.exception("处理 aapt2 输出失败: %s", e)
@@ -319,15 +323,8 @@ class MainWindow(QtWidgets.QMainWindow):
         logging.warning("解析 APK 失败（%s）：%s", self._apk_path, message)
         # 失败后必须清空本轮状态：否则“重新解析”会把占位文本当 badging，
         # 重命名预览也会把上一个 APK 的名字用到当前文件上。
-        self._raw_output = ""
         self._apk_path = ""
-        self._parse_ok_path = ""
-        self._current_icon_bytes = None
-        self.icon_label.clear()
-        self.btn_export_icon.setVisible(False)
-        self.lbl_icon_hint.clear()
-        self.lbl_icon_hint.setToolTip("")
-        self.rename_preview.clear()
+        self._reset_result_state()
         QtWidgets.QMessageBox.critical(self, "错误", message)
         self.set_busy(False)
 
@@ -393,8 +390,8 @@ class MainWindow(QtWidgets.QMainWindow):
         anyden = info.get("supports_any_density", "")
         loc_text = []
         loc_text.append(f"locales（{len(loc)}）: " + (", ".join(loc) if loc else "(无)"))
-        loc_text.append(f"screens: " + (", ".join(screens) if screens else "(无)"))
-        loc_text.append(f"densities: " + (", ".join(dens) if dens else "(无)"))
+        loc_text.append("screens: " + (", ".join(screens) if screens else "(无)"))
+        loc_text.append("densities: " + (", ".join(dens) if dens else "(无)"))
         if anyden:
             loc_text.append(f"supports-any-density: {anyden}")
         self.te_locales["edit"].setPlainText("\n".join(loc_text))
@@ -414,7 +411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             other.append("")
             other.append("[部分多语言应用名]")
             # 优先展示常见语言
-            preferred = ["zh-CN", "zh-HK", "zh-TW", "en-GB", "en-US", "ja", "ko"]
+            preferred = list(_CHINESE_LOCALE_PRIORITY) + ["en-GB", "en-US", "ja", "ko"]
             shown = set()
             for k in preferred:
                 if k in labels and labels[k]:
@@ -490,7 +487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = "\n".join(lines)
         cb = QtWidgets.QApplication.clipboard()
         cb.setText(summary)
-        QtWidgets.QMessageBox.information(self, "已复制", "已复制摘要到剪贴板。")
+        self.statusBar().showMessage("已复制摘要到剪贴板。", 3000)
 
     def do_rename(self):
         old_path = self._current_apk_path()

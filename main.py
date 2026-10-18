@@ -249,7 +249,12 @@ def main():
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler(sys.stderr))
     try:
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        from logging.handlers import RotatingFileHandler
+        handlers.append(
+            RotatingFileHandler(
+                log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+            )
+        )
     except OSError:
         pass
 

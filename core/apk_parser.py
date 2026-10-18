@@ -19,6 +19,7 @@ from core.resources import (
 from core.vector import rasterize_vector_layer
 
 _ICON_SIZE = 512
+_CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
 
 # Windows 保留设备名不能作为文件名（含带扩展名的形式，如 CON.apk）
 _RESERVED_NAMES = {
@@ -371,7 +372,7 @@ def parse_aapt2_output(text: str) -> dict:
     app_node_label = m_label_app.group(1) if m_label_app else ""
 
     # 选择优先中文
-    for pref in ("zh-CN", "zh-HK", "zh-TW"):
+    for pref in _CHINESE_LOCALE_PRIORITY:
         if info["app_name_labels"].get(pref):
             info["app_name"] = info["app_name_labels"][pref]
             break
