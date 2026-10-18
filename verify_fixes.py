@@ -30,6 +30,7 @@
           统一 512² 导出 / 子线程只用 QImage / 图标与架构兜底
     D1    新一轮解析开始时作废在途图标结果（代数推进 + 核心 cancel）
     D2    aapt2 子进程定向终止：让路只杀 badging，不误伤图标 dump
+    D3    解析期间允许拖入/选择新 APK，最新请求覆盖立即生效
 
 注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
 （GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
@@ -656,6 +657,50 @@ def check_p1_8(app):
     win.close()
 
 
+def check_d3_supersede(app):
+    C.title("D3 解析期间可继续选择/拖入 APK：最新请求覆盖生效")
+    tmpdir = tempfile.mkdtemp(prefix="winapkinfo-supersede-")
+    a_path = os.path.join(tmpdir, "a.apk")
+    b_path = os.path.join(tmpdir, "b.apk")
+    for path in (a_path, b_path):
+        with open(path, "wb") as f:
+            f.write(b"placeholder")
+
+    saved_badging = workers_mod.run_aapt2_dump_badging
+
+    def fake_badging(path):
+        if os.path.normcase(path) == os.path.normcase(a_path):
+            time.sleep(1.5)  # 模拟慢解析，保证覆盖发生在解析进行中
+            return "package: name='com.slow.a' versionCode='1' versionName='1.0'\n"
+        return "package: name='com.fast.b' versionCode='2' versionName='2.0'\n"
+
+    workers_mod.run_aapt2_dump_badging = fake_badging
+    try:
+        before_crit = sum(1 for k, _ in MODAL_CALLS if k == "critical")
+        win = main_window_mod.MainWindow()
+        win.process_apk(a_path)
+        C.check("解析进行中仍可编辑路径（拖放依赖控件可用）", win.apk_path_edit.isEnabled())
+        C.check("解析进行中仍可点击浏览按钮", win.btn_browse.isEnabled())
+        t0 = time.time()
+        win.process_apk(b_path)             # 覆盖前序请求
+        elapsed = time.time() - t0
+        C.check("覆盖请求立即返回（不等待旧解析）", elapsed < 0.2, "耗时=%.4fs" % elapsed)
+        ok = wait_for(app, lambda: not win._busy and win.le_pkg.text() == "com.fast.b", timeout=10)
+        C.check("界面最终显示最新请求的结果", ok,
+                "pkg=%r busy=%s" % (win.le_pkg.text(), win._busy))
+        time.sleep(1.8)                     # 等慢请求跑完，确认迟到结果被丢弃
+        consume_events(app, 0.05)
+        C.check("慢请求的迟到结果不覆盖新结果", win.le_pkg.text() == "com.fast.b",
+                "pkg=%r" % win.le_pkg.text())
+        after_crit = sum(1 for k, _ in MODAL_CALLS if k == "critical")
+        C.check("覆盖过程不弹错误对话框", after_crit == before_crit,
+                "critical %d -> %d" % (before_crit, after_crit))
+        win.close()
+    finally:
+        workers_mod.run_aapt2_dump_badging = saved_badging
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def check_p2_9():
     C.title("P2-9 填充掩码分块：结果一致 + 内存下降")
     random.seed(7)
@@ -1245,6 +1290,7 @@ def main():
     check_p1_6(app)
     check_p1_7(app)
     check_p1_8(app)
+    check_d3_supersede(app)
     check_p2_9()
     check_p2_10()
     if not args.quick:

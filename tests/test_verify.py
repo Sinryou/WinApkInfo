@@ -272,6 +272,9 @@ class TestRegressionSuite(unittest.TestCase):
     def test_p1_8_icon_failed_hint(self):
         self._run_check(verify_fixes.check_p1_8, self.app)
 
+    def test_d3_supersede(self):
+        self._run_check(verify_fixes.check_d3_supersede, self.app)
+
     def test_p2_9_fill_mask_chunking(self):
         self._run_check(verify_fixes.check_p2_9)
 

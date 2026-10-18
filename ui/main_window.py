@@ -222,8 +222,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._busy = busy
         self.btn_refresh.setEnabled(not busy)
         self.btn_export_icon.setEnabled(not busy)
-        self.btn_browse.setEnabled(not busy)
-        self.apk_path_edit.setEnabled(not busy)
+        # 输入框与浏览按钮保持可用：解析期间允许拖入/选择新 APK，新请求会
+        # 覆盖旧请求（process_apk 先让前序 badging 给新请求让路）。旧实现
+        # 把两者一起禁用，导致"最新请求覆盖"在真实操作中不可达——大包解析
+        # （最坏 60s 超时）期间用户完全无法切换文件。
         if busy:
             self.setCursor(QtCore.Qt.CursorShape.WaitCursor)
             self.statusBar().showMessage("正在解析 APK，请稍候…")
