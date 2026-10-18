@@ -30,17 +30,21 @@ _AAPT2_TIMEOUT = 60
 _AAPT2_CACHE_VERSION = 2
 
 # 正在运行的 aapt2 子进程句柄：关闭窗口时用于强制结束，
-# 这样工作线程能自己返回，无需（也不该）使用 QThread.terminate()
-_running_procs = set()
+# 这样工作线程能自己返回，无需（也不该）使用 QThread.terminate()。
+# 值为子进程的用途标签（badging/resources/xmltree）：新一轮解析让路时
+# 只终止基础解析的 badging，不误杀图标线程正在跑的 dump。
+_running_procs = {}
 _running_procs_lock = threading.Lock()
 
 
-def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT):
+def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT, tag=None):
     """运行 aapt2 子进程，返回 (returncode, stdout, stderr)。
 
     与 subprocess.run 的区别：
     - 带 timeout：超时先 kill 再抛 Aapt2Error；
-    - 运行期间把 Popen 登记到 _running_procs，便于关闭窗口时统一结束。
+    - 运行期间把 Popen 登记到 _running_procs（附用途标签），便于按需结束。
+
+    tag 用于定向终止：kill_running_aapt2(tags=...) 只会结束命中的进程。
     """
     try:
         proc = subprocess.Popen(
@@ -51,7 +55,7 @@ def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT):
         raise Aapt2Error(f"无法启动 aapt2：{e}")
 
     with _running_procs_lock:
-        _running_procs.add(proc)
+        _running_procs[proc] = tag
     try:
         try:
             out, err = proc.communicate(timeout=timeout)
@@ -62,13 +66,19 @@ def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT):
         return proc.returncode, out, err
     finally:
         with _running_procs_lock:
-            _running_procs.discard(proc)
+            _running_procs.pop(proc, None)
 
 
-def kill_running_aapt2():
-    """强制结束所有仍在运行的 aapt2 子进程（关闭窗口/退出时调用）。"""
+def kill_running_aapt2(tags=None):
+    """强制结束仍在运行的 aapt2 子进程。
+
+    tags 为 None 时结束全部子进程（关闭窗口/退出时使用）；传入标签集合
+    时只结束命中的子进程——例如新一轮解析让路只杀 badging，不波及图标
+    线程正在跑的 resources/xmltree，避免把图标提取误伤成失败。
+    """
     with _running_procs_lock:
-        procs = list(_running_procs)
+        procs = [p for p, tag in _running_procs.items()
+                 if tags is None or tag in tags]
     for p in procs:
         try:
             p.kill()
@@ -398,7 +408,7 @@ def run_aapt2_dump_badging(apk_path: str) -> str:
     if cached is not None:
         return cached
 
-    rc, out, err = _run_aapt2(cmd)
+    rc, out, err = _run_aapt2(cmd, tag="badging")
     if rc != 0:
         msg = (_decode_output(err or out)).strip() or f"aapt2 退出码 {rc}"
         raise Aapt2Error(msg)
@@ -429,7 +439,7 @@ def run_aapt2_dump_resource(apk_path: str):
         if cached is not None:
             return cached
 
-        rc, out, err = _run_aapt2([aapt2_path, "dump", "resources", apk_path])
+        rc, out, err = _run_aapt2([aapt2_path, "dump", "resources", apk_path], tag="resources")
         if rc != 0:
             raise Aapt2Error((_decode_output(err or out)).strip() or f"aapt2 退出码 {rc}")
         text = _decode_output(out)
@@ -454,7 +464,7 @@ def run_aapt2_dump_xmltree(apk_path: str, inner_file_path: str):
             return cached
 
         cmd = [aapt2_path, "dump", "xmltree", apk_path, "--file", inner_file_path]
-        rc, out, err = _run_aapt2(cmd)
+        rc, out, err = _run_aapt2(cmd, tag="xmltree")
         if rc != 0:
             raise Aapt2Error((_decode_output(err or out)).strip() or f"aapt2 退出码 {rc}")
         text = _decode_output(out)

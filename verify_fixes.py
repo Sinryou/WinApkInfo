@@ -29,6 +29,7 @@
           strokeLineCap=square / 文件名净化 / dump 失败返回 None /
           统一 512² 导出 / 子线程只用 QImage / 图标与架构兜底
     D1    新一轮解析开始时作废在途图标结果（代数推进 + 核心 cancel）
+    D2    aapt2 子进程定向终止：让路只杀 badging，不误伤图标 dump
 
 注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
 （GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
@@ -490,6 +491,33 @@ def check_p1_5(app):
         killed = True
     el = time.time() - t0
     C.check("kill_running_aapt2 能中断运行中的子进程", killed and el < 5, "耗时=%.2fs" % el)
+
+    # D2：定向终止——新一轮解析让路只应结束 badging，不误杀图标线程的
+    # resources/xmltree（旧实现无差别 kill，图标提取会被误判失败）。
+    def _wait_registered(tag, timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            with aapt_mod._running_procs_lock:
+                if any(t == tag for t in aapt_mod._running_procs.values()):
+                    return True
+            time.sleep(0.01)
+        return False
+
+    icon_proc = threading.Thread(
+        target=lambda: aapt_mod._run_aapt2(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout=30, tag="xmltree"),
+        daemon=True)
+    icon_proc.start()
+    C.check("图标线程子进程按标签登记", _wait_registered("xmltree"))
+    aapt_mod.kill_running_aapt2(tags=("badging",))
+    time.sleep(0.2)
+    with aapt_mod._running_procs_lock:
+        still_running = any(t == "xmltree" for t in aapt_mod._running_procs.values())
+    C.check("让路时只杀 badging，不误伤图标 dump", still_running)
+    aapt_mod.kill_running_aapt2()
+    icon_proc.join(timeout=5)
+    C.check("关窗式全量终止仍能结束图标 dump", not icon_proc.is_alive())
 
     import ast
     has_terminate = False
