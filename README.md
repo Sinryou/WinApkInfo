@@ -31,8 +31,8 @@
   - 根据应用名 + 版本号自动生成新文件名  
   - 一键重命名原始 APK 文件  
 
-- **aapt2 原始输出**  
-  - 提供完整文本输出，方便进一步分析  
+- **复制摘要 / 重新解析**  
+  - 一键复制当前解析结果；无需重跑 aapt2 即可用最近一次输出重新解析界面
 
 ## 运行环境
 
@@ -78,7 +78,7 @@ dist/WinApkInfo-<version>-windows-x64-onefile.zip
 dist/WinApkInfo-<version>-windows-x64-<mode>.zip.sha256
 ```
 
-脚本会依次执行：检查依赖 → 运行回归检查（`verify_fixes.py --quick`）→ 生成 Windows 文件版本信息 → 打包 `resources/` 与 `aapt2.exe` → 运行 `WinApkInfo.exe --self-test` → 生成 zip 与 SHA256。
+脚本会依次执行：检查依赖 → 运行 ruff 与 pytest（默认跳过需要 `testSample/` 的端到端用例，传 `-FullTests` 才包含）→ 生成 Windows 文件版本信息 → 打包 `resources/` 与 `aapt2.exe` → 运行 `WinApkInfo.exe --self-test` → 生成 zip 与 SHA256。
 
 常用参数：
 
@@ -88,7 +88,7 @@ dist/WinApkInfo-<version>-windows-x64-<mode>.zip.sha256
 | `-Aapt2Path <file>` | 指定要随包携带的 `aapt2.exe` |
 | `-Version <x.y.z>` | 覆盖 `version.py` 中的版本号 |
 | `-SkipTests` | 跳过构建前回归检查 |
-| `-FullTests` | 运行需要 `testSample/` 的完整回归；不传则只跑合成用例 |
+| `-FullTests` | 额外包含需要 `testSample/` 的端到端回归；不传时这些用例会被跳过 |
 | `-AllowMissingAapt2` | 允许构建不含 `aapt2.exe` 的包（仅排障用） |
 | `-NoZip` | 只生成 `dist/`，不创建 zip |
 | `-Clean` | 构建前删除 `build/` 与 `dist/` |
@@ -99,10 +99,11 @@ dist/WinApkInfo-<version>-windows-x64-<mode>.zip.sha256
 ### 自检与回归
 
 ```powershell
-python verify_fixes.py --quick   # 不依赖 testSample，适合 CI
-python verify_fixes.py           # 含真实 APK 端到端，需要 testSample/
-python main.py --version         # 打印版本
-python main.py --self-test       # 检查 aapt2 与随包资源
+python -m pytest tests -m "not e2e"            # 不依赖 testSample，适合 CI
+python -m pytest tests -m e2e                  # 仅真实 APK 端到端，需要 testSample/
+python main.py --version                       # 打印版本
+python main.py --self-test                     # 检查 aapt2 与随包资源
+python main.py --self-test testSample\xxx.apk  # 附带样本的完整自检
 ```
 
 `testSample/` 不入库。没有真实样本时（例如 CI），`build.ps1` 会用仓库内置的
@@ -113,7 +114,9 @@ python main.py --self-test       # 检查 aapt2 与随包资源
 
 ### 持续集成
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) 会在 Windows runner 上构建 `onedir` 与 `onefile` 两种产物并上传 artifact；推送 `v*` 标签时会自动创建 GitHub Release 并附带 zip 与校验文件。
+[`.github/workflows/build.yml`](.github/workflows/build.yml) 先在 Windows runner 上运行
+lint 与测试，通过后再并行构建 `onedir` 与 `onefile` 两种产物并上传 artifact；
+推送 `v*` 标签时会自动创建 GitHub Release 并附带 zip 与校验文件。
 
 ```powershell
 git tag v1.1.2

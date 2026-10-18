@@ -6,7 +6,8 @@
 .DESCRIPTION
     Pipeline steps:
       1. Verify Python and build dependencies.
-      2. Run quick regression checks (verify_fixes.py --quick).
+      2. Run linter (ruff) and the pytest suite; sample-dependent end-to-end
+         cases are only included with -FullTests.
       3. Generate Windows version resources from version.py.
       4. Locate aapt2.exe and bundle it with the application.
       5. Build with PyInstaller (onedir or onefile).
@@ -181,7 +182,7 @@ if ($Clean) {
 New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
 
-# Resolve aapt2 before the regression checks: verify_fixes.py calls
+# Resolve aapt2 before the regression checks: the pytest suite calls
 # find_aapt2(), which only looks at the script directory and PATH. CI runners
 # have aapt2 in the Android SDK but usually not on PATH, so export the
 # resolved directory to child processes or the test run aborts immediately.
@@ -210,8 +211,14 @@ if (-not $SkipTests) {
     & $Python -m ruff check $ProjectRoot
     Assert-LastExitCode "ruff check"
 
-    Write-Step "Running regression checks (pytest)"
-    & $Python -m pytest (Join-Path $ProjectRoot "tests") -v
+    # 默认只跑不依赖 testSample 的合成用例；-FullTests 时额外包含
+    # marker 为 e2e 的真实样本端到端用例。
+    $pytestArgs = @((Join-Path $ProjectRoot "tests"), "-v", "-ra")
+    if (-not $FullTests) {
+        $pytestArgs += @("-m", "not e2e")
+    }
+    Write-Step "Running regression tests (pytest)"
+    & $Python -m pytest @pytestArgs
     Assert-LastExitCode "pytest"
 }
 else {
