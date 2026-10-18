@@ -231,35 +231,79 @@ class TestGradientRendering(unittest.TestCase):
 
 
 class TestRegressionSuite(unittest.TestCase):
-    """执行全部合成用例回归检查（验证通过率）。"""
+    """执行全部合成用例与回归检查（支持 pytest 与 unittest 逐项执行）。"""
 
     @classmethod
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
         verify_fixes.silence_dialogs()
 
-    def test_quick_regressions(self):
+    def _run_check(self, func, *args):
         verify_fixes.C.results = []
         verify_fixes.C.skipped = []
-        verify_fixes.check_env()
-        verify_fixes.check_p0_1()
-        verify_fixes.check_p0_2()
-        verify_fixes.check_p0_3()
-        verify_fixes.check_p1_4(self.app)
-        verify_fixes.check_p1_5(self.app)
-        verify_fixes.check_p1_6(self.app)
-        verify_fixes.check_p1_7(self.app)
-        verify_fixes.check_p1_8(self.app)
-        verify_fixes.check_p2_9()
-        verify_fixes.check_p2_10()
-        verify_fixes.check_p2_12()
-        verify_fixes.check_a1(self.app)
-        verify_fixes.check_b1(self.app)
-        verify_fixes.check_b2(False)
-        verify_fixes.check_b3()
-        verify_fixes.check_new_fixes()
+        func(*args)
         failed = [r for r in verify_fixes.C.results if not r[2]]
         self.assertEqual(len(failed), 0, f"存在回归失败项: {failed}")
+
+    def test_env(self):
+        self._run_check(verify_fixes.check_env)
+
+    def test_p0_1_fill_type(self):
+        self._run_check(verify_fixes.check_p0_1)
+
+    def test_p0_2_smooth_control_points(self):
+        self._run_check(verify_fixes.check_p0_2)
+
+    def test_p0_3_stroke_line_cap(self):
+        self._run_check(verify_fixes.check_p0_3)
+
+    def test_p1_4_slot_exception(self):
+        self._run_check(verify_fixes.check_p1_4, self.app)
+
+    def test_p1_5_aapt2_timeout_and_abort(self):
+        self._run_check(verify_fixes.check_p1_5, self.app)
+
+    def test_p1_6_icon_worker_channel(self):
+        self._run_check(verify_fixes.check_p1_6, self.app)
+
+    def test_p1_7_process_apk_path(self):
+        self._run_check(verify_fixes.check_p1_7, self.app)
+
+    def test_p1_8_icon_failed_hint(self):
+        self._run_check(verify_fixes.check_p1_8, self.app)
+
+    def test_p2_9_fill_mask_chunking(self):
+        self._run_check(verify_fixes.check_p2_9)
+
+    def test_p2_10_find_aapt2_cache(self):
+        self._run_check(verify_fixes.check_p2_10)
+
+    def test_p2_11_disk_cache(self):
+        self._run_check(verify_fixes.check_p2_11)
+
+    def test_p2_12_rgba_resize_premultiplication(self):
+        self._run_check(verify_fixes.check_p2_12)
+
+    def test_a1_excepthook_thread_safety(self):
+        self._run_check(verify_fixes.check_a1, self.app)
+
+    def test_b1_non_vector_fallback(self):
+        self._run_check(verify_fixes.check_b1, self.app)
+
+    def test_b2_cache_byte_cap(self):
+        self._run_check(verify_fixes.check_b2, False)
+
+    def test_b3_sdk_versions_reload(self):
+        self._run_check(verify_fixes.check_b3)
+
+    def test_new_fixes_regression(self):
+        self._run_check(verify_fixes.check_new_fixes)
+
+    def test_end_to_end(self):
+        samples = verify_fixes.sample_apks()
+        if not samples:
+            self.skipTest("testSample 目录无 APK 样本")
+        self._run_check(verify_fixes.check_end_to_end, self.app, 2)
 
 
 if __name__ == "__main__":

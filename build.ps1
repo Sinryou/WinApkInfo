@@ -147,11 +147,11 @@ $dependencyCheck = @'
 import importlib.util
 import sys
 
-missing = [name for name in ("PyInstaller", "PyQt6", "PIL")
+missing = [name for name in ('PyInstaller', 'PyQt6', 'PIL', 'ruff', 'pytest')
            if importlib.util.find_spec(name) is None]
 if missing:
-    sys.stderr.write("Missing Python packages: " + ", ".join(missing) + "\n")
-    sys.stderr.write("Install them with: python -m pip install -r requirements-dev.txt\n")
+    sys.stderr.write('Missing Python packages: ' + ', '.join(missing) + '\n')
+    sys.stderr.write('Install them with: python -m pip install -r requirements-dev.txt\n')
     raise SystemExit(1)
 print(sys.version.split()[0])
 '@
@@ -206,16 +206,16 @@ else {
 }
 
 if (-not $SkipTests) {
-    Write-Step "Running regression checks"
-    $testArgs = @((Join-Path $ProjectRoot "verify_fixes.py"))
-    if (-not $FullTests) {
-        $testArgs += "--quick"
-    }
-    & $Python @testArgs
-    Assert-LastExitCode "regression checks"
+    Write-Step "Running linter (ruff check)"
+    & $Python -m ruff check $ProjectRoot
+    Assert-LastExitCode "ruff check"
+
+    Write-Step "Running regression checks (pytest)"
+    & $Python -m pytest (Join-Path $ProjectRoot "tests") -v
+    Assert-LastExitCode "pytest"
 }
 else {
-    Write-Host "Skipping regression checks (-SkipTests)." -ForegroundColor Yellow
+    Write-Host "Skipping tests and linting (-SkipTests)." -ForegroundColor Yellow
 }
 
 Write-Step "Generating Windows version resources"

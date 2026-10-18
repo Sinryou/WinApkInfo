@@ -26,7 +26,7 @@ _DPI_ORDER = ["ldpi", "mdpi", "tvdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
 
 def local_resource_path(relative_path):
     """兼容打包前后路径。
-    
+
     PyInstaller 打包模式下以 sys._MEIPASS 为根目录；
     未打包模式下以项目根目录为基准。
     """
