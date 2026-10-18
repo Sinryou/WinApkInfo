@@ -2,7 +2,6 @@
 """Android VectorDrawable 矢量图解析与光栅化引擎。"""
 import math
 import re
-import io
 import logging
 from PIL import Image, ImageChops, ImageDraw
 
@@ -14,7 +13,7 @@ except ImportError:
 from core.aapt import run_aapt2_dump_xmltree, run_aapt2_dump_resource
 from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    _ResourceIndex, extract_resource_entry, get_resource_info, _MAX_DEREF_DEPTH
+    extract_resource_entry, get_resource_info, _MAX_DEREF_DEPTH
 )
 from PyQt6 import QtCore, QtGui
 

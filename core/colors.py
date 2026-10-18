@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """Android 颜色解析与框架预设颜色表。"""
-import re
-
 
 def parse_android_color(color_str: str):
     """

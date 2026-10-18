@@ -74,9 +74,13 @@ SAMPLE_DIR = os.path.join(REPO, "testSample")
 import numpy as np
 from PIL import Image, ImageDraw
 
-import main as m
 import core.aapt as aapt_mod
+import core.apk_parser as apk_parser_mod
+import core.colors as colors_mod
+import core.resources as resources_mod
 import core.vector as vector_mod
+import ui.main_window as main_window_mod
+import ui.workers as workers_mod
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 
@@ -140,7 +144,7 @@ def silence_dialogs():
 
 def flat(d):
     """把路径数据展开成一维点列（跨子路径按顺序拼接），用于等价性对照。"""
-    subs = m._flatten_subpaths(m._parse_path_commands(m._tokenize_path_data(d)), 1.0)
+    subs = vector_mod._flatten_subpaths(vector_mod._parse_path_commands(vector_mod._tokenize_path_data(d)), 1.0)
     return [p for sub in subs for p in sub]
 
 
@@ -182,7 +186,7 @@ def max_dev(pa, pr):
 def reference_fill_mask(W, H, subpaths, fill_rule="nonzero"):
     """按行广播的旧实现，作为分块版本的结果基准。"""
     arr = np.zeros((H, W), dtype=np.uint8)
-    edges = m._collect_edges(subpaths)
+    edges = vector_mod._collect_edges(subpaths)
     if not edges:
         return arr
     x1 = np.array([e[0] for e in edges]); y1 = np.array([e[1] for e in edges])
@@ -248,7 +252,7 @@ def pick_apk(apks, largest=False):
 
 def icon_xml_of(apk):
     """取 badging 里密度最高的 xml 图标路径。"""
-    badging = m.run_aapt2_dump_badging(apk)
+    badging = aapt_mod.run_aapt2_dump_badging(apk)
     icons = re.findall(r"application-icon-(\d+):'([^']+)'", badging)
     xmls = [p for _, p in sorted(icons, key=lambda x: int(x[0]), reverse=True)
             if p.lower().endswith(".xml")]
@@ -278,7 +282,7 @@ def wait_for(app, predicate, timeout=60.0):
 def check_env():
     C.title("0. 环境")
     try:
-        aapt2_path = m.find_aapt2()
+        aapt2_path = aapt_mod.find_aapt2()
         C.check("aapt2 可用", True, aapt2_path)
     except Exception as e:
         # 没有 aapt2 时不要在这里抛异常中断整套用例；后续依赖 aapt2 的
@@ -299,12 +303,12 @@ def check_env():
 
 def check_p0_1():
     C.title("P0-1 fillType 枚举（evenOdd）")
-    C.check("_attr_enum 归一化", [m._attr_enum(v) for v in ("1", "0x00000001", "evenodd", None)] ==
+    C.check("_attr_enum 归一化", [vector_mod._attr_enum(v) for v in ("1", "0x00000001", "evenodd", None)] ==
             ["1", "1", "evenodd", ""],
-            "_attr_enum('0x00000001')='%s'" % m._attr_enum("0x00000001"))
+            "_attr_enum('0x00000001')='%s'" % vector_mod._attr_enum("0x00000001"))
 
     def rule_of(raw):
-        return "evenodd" if m._attr_enum(raw) in ("1", "evenodd") else "nonzero"
+        return "evenodd" if vector_mod._attr_enum(raw) in ("1", "evenodd") else "nonzero"
 
     C.check("fillType=1 → evenodd", rule_of("1") == "evenodd")
     C.check("fillType=0x00000001 → evenodd", rule_of("0x00000001") == "evenodd")
@@ -313,9 +317,9 @@ def check_p0_1():
 
     # 语义：两个同向同心子路径，evenOdd 应保留中间的洞
     subs = [circle(64, 64, 50), circle(64, 64, 20)]
-    nz = int(m._build_fill_mask(128, 128, subs, "nonzero").histogram()[1:][0]) if False else \
-        int(sum(m._build_fill_mask(128, 128, subs, "nonzero").histogram()[1:]))
-    eo = int(sum(m._build_fill_mask(128, 128, subs, "evenodd").histogram()[1:]))
+    nz = int(vector_mod._build_fill_mask(128, 128, subs, "nonzero").histogram()[1:][0]) if False else \
+        int(sum(vector_mod._build_fill_mask(128, 128, subs, "nonzero").histogram()[1:]))
+    eo = int(sum(vector_mod._build_fill_mask(128, 128, subs, "evenodd").histogram()[1:]))
     C.check("同向圆环 evenOdd 面积 < nonzero", eo < nz, "evenOdd=%d px, nonzero=%d px" % (eo, nz))
 
     # 解析链路：aapt2 xmltree 文本 → _parse_vector_elements → fillType 原始值
@@ -323,7 +327,7 @@ def check_p0_1():
             '  E: path (line=3)\n'
             '    A: http://schemas.android.com/apk/res/android:pathData(0x01010001)="M0,0 L1,1 Z"\n'
             '    A: http://schemas.android.com/apk/res/android:fillType(0x0101019c)=1\n')
-    attrs = m._parse_vector_elements(fake)[1]["attrs"]
+    attrs = vector_mod._parse_vector_elements(fake)[1]["attrs"]
     C.check("xmltree 解析 fillType 原始值", attrs.get("fillType") == "1",
             "fillType=%r → %s" % (attrs.get("fillType"), rule_of(attrs.get("fillType"))))
 
@@ -345,7 +349,7 @@ def check_p0_1():
             if raw[:4] != b"\x03\x00\x08\x00" or b"fillType" not in raw:
                 continue
             dumps += 1
-            out = m.run_aapt2_dump_xmltree(target, name)
+            out = aapt_mod.run_aapt2_dump_xmltree(target, name)
             if re.search(r"fillType\(0x[0-9a-fA-F]+\)=1", out):
                 hit = name
                 break
@@ -377,7 +381,6 @@ def check_p0_2():
     worst = 0.0
     for _ in range(30):
         parts = ["M%.3f,%.3f" % (random.uniform(0, 100), random.uniform(0, 100))]
-        x, y = 0.0, 0.0
         for _ in range(random.randint(1, 4)):
             kind = random.choice("CCSSTTQQ")
             args = [random.uniform(-40, 40) for _ in range(_ARITY[kind])]
@@ -389,13 +392,13 @@ def check_p0_2():
 
 def check_p0_3():
     C.title("P0-3 strokeLineCap 枚举")
-    tbl = {raw: m._VECTOR_CAPS.get(m._attr_enum(raw), 0)
+    tbl = {raw: vector_mod._VECTOR_CAPS.get(vector_mod._attr_enum(raw), 0)
            for raw in ("butt", "round", "square", "0", "1", "2", "0x00000001")}
     C.check("十进制 1 → round(1)", tbl["1"] == 1)
     C.check("十进制 2 → square(2)", tbl["2"] == 2)
     C.check("十进制 0/butt → 0", tbl["0"] == 0 and tbl["butt"] == 0)
     C.check("名字与 0x 写法仍兼容", tbl["round"] == 1 and tbl["0x00000001"] == 1)
-    C.check("未知值回退 butt", m._VECTOR_CAPS.get(m._attr_enum("9"), 0) == 0, "%r" % tbl)
+    C.check("未知值回退 butt", vector_mod._VECTOR_CAPS.get(vector_mod._attr_enum("9"), 0) == 0, "%r" % tbl)
 
     apks = sample_apks(3)
     for apk in apks:
@@ -403,14 +406,14 @@ def check_p0_3():
             xml_path = icon_xml_of(apk)
             if not xml_path:
                 continue
-            out = m.run_aapt2_dump_xmltree(apk, xml_path)
+            out = aapt_mod.run_aapt2_dump_xmltree(apk, xml_path)
         except Exception:
             continue
         caps = set()
-        for el in m._parse_vector_elements(out):
+        for el in vector_mod._parse_vector_elements(out):
             v = el["attrs"].get("strokeLineCap")
             if v is not None:
-                caps.add((v, m._VECTOR_CAPS.get(m._attr_enum(v), 0)))
+                caps.add((v, vector_mod._VECTOR_CAPS.get(vector_mod._attr_enum(v), 0)))
         if caps:
             C.check("真实 XML 中的 strokeLineCap 映射", all(c != 0 for _, c in caps if _ != "0"),
                     "%s → %s" % (os.path.basename(apk), sorted(caps)))
@@ -419,16 +422,16 @@ def check_p0_3():
 
 def check_p1_4(app):
     C.title("P1-4 slot 内异常不再终止进程")
-    C.check("install_excepthook 存在且可安装", callable(getattr(m, "install_excepthook", None)))
+    C.check("install_excepthook 存在且可安装", callable(getattr(main_window_mod, "install_excepthook", None)))
     old_hook = sys.excepthook
-    m.install_excepthook()
+    main_window_mod.install_excepthook()
     C.check("安装后 sys.excepthook 被替换", sys.excepthook is not old_hook)
     sys.excepthook = old_hook
 
     apks = sample_apks(1)
     if not apks:
         return
-    win = m.MainWindow()
+    win = main_window_mod.MainWindow()
     win.apk_path_edit.setText(apks[0])
     import ui.main_window as ui_main_mod
     orig = ui_main_mod.parse_aapt2_output
@@ -445,7 +448,7 @@ def check_p1_4(app):
         ui_main_mod.parse_aapt2_output = orig
         win.close()
     # 正常路径不受影响
-    win2 = m.MainWindow()
+    win2 = main_window_mod.MainWindow()
     win2.apk_path_edit.setText(apks[0])
     win2.process_apk(apks[0])
     wait_for(app, lambda: not win2._busy, timeout=30)
@@ -458,12 +461,12 @@ def check_p1_5(app):
     t0 = time.time()
     timed_out = False
     try:
-        m._run_aapt2([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1.0)
-    except m.Aapt2Error:
+        aapt_mod._run_aapt2([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1.0)
+    except aapt_mod.Aapt2Error:
         timed_out = True
     el = time.time() - t0
     C.check("超时抛 Aapt2Error 且及时返回", timed_out and el < 5, "耗时=%.2fs" % el)
-    C.check("超时后进程登记表已清空", len(m._running_procs) == 0)
+    C.check("超时后进程登记表已清空", len(aapt_mod._running_procs) == 0)
 
     import threading
 
@@ -472,33 +475,38 @@ def check_p1_5(app):
         # 固定延迟会赶在子进程登记进 _running_procs 之前执行，什么也杀不到，
         # 于是这里要等满 30s 超时（表现为本用例随机 FAIL）。改为轮询登记表。
         deadline = time.time() + 10
-        while time.time() < deadline and not m._running_procs:
+        while time.time() < deadline and not aapt_mod._running_procs:
             time.sleep(0.01)
-        m.kill_running_aapt2()
+        aapt_mod.kill_running_aapt2()
 
     threading.Thread(target=kill_once_registered, daemon=True).start()
     t0 = time.time()
     killed = False
     try:
-        rc, out, err = m._run_aapt2([sys.executable, "-c", "import time; time.sleep(30)"], timeout=30)
+        rc, out, err = aapt_mod._run_aapt2([sys.executable, "-c", "import time; time.sleep(30)"], timeout=30)
         killed = True
-    except m.Aapt2Error:
+    except aapt_mod.Aapt2Error:
         killed = True
     el = time.time() - t0
     C.check("kill_running_aapt2 能中断运行中的子进程", killed and el < 5, "耗时=%.2fs" % el)
 
     import ast
-    tree = ast.parse(open(os.path.join(REPO, "main.py"), encoding="utf-8").read())
-    has_terminate = any(
-        isinstance(node, ast.Attribute) and node.attr == "terminate" for node in ast.walk(tree))
+    has_terminate = False
+    for fname in ("main.py", os.path.join("ui", "main_window.py")):
+        path = os.path.join(REPO, fname)
+        if os.path.isfile(path):
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            if any(isinstance(node, ast.Attribute) and node.attr == "terminate" for node in ast.walk(tree)):
+                has_terminate = True
+                break
     C.check("源码中不存在 QThread.terminate 调用", not has_terminate,
             "AST 扫描（注释/docstring 不算）")
-    C.check("shutdown_background 存在", hasattr(m.MainWindow, "shutdown_background"))
+    C.check("shutdown_background 存在", hasattr(main_window_mod.MainWindow, "shutdown_background"))
 
     apks = sample_apks()
     target = pick_apk(apks, largest=True) if apks else None
     if target:
-        win = m.MainWindow()
+        win = main_window_mod.MainWindow()
         win.apk_path_edit.setText(target)
         win.process_apk(target)
         consume_events(app, 0.2)          # 让 aapt2 真正跑起来
@@ -515,16 +523,16 @@ def check_p1_6(app):
     C.title("P1-6 / B4 图标提交通道：不阻塞 UI、单线程、最新请求覆盖")
 
     calls = []
-    original_extract = m.IconWorker._extract
+    original_extract = workers_mod.IconWorker._extract
 
     def slow_extract(self, apk_path, icon_path):
         calls.append(icon_path)
         time.sleep(0.2)
         return QtGui.QImage(4, 4, QtGui.QImage.Format.Format_ARGB32), icon_path.encode()
 
-    m.IconWorker._extract = slow_extract
+    workers_mod.IconWorker._extract = slow_extract
     try:
-        win = m.MainWindow()
+        win = main_window_mod.MainWindow()
         t0 = time.time()
         win._start_icon_worker("a.apk", "res/A.xml")     # 先让它真的开始
         time.sleep(0.05)
@@ -552,7 +560,7 @@ def check_p1_6(app):
         win.close()
         C.check("关窗后常驻线程退出", win.shutdown_background(5000))
     finally:
-        m.IconWorker._extract = original_extract
+        workers_mod.IconWorker._extract = original_extract
 
 
 def check_p1_7(app):
@@ -562,7 +570,7 @@ def check_p1_7(app):
         C.skip("样本 APK 可用", "testSample 为空（CI/精简环境）")
         return
     target = pick_apk(apks)
-    win = m.MainWindow()
+    win = main_window_mod.MainWindow()
     win.apk_path_edit.clear()             # 输入框故意留空
     win.process_apk(target)
     ok = wait_for(app, lambda: bool(win._current_icon_bytes), timeout=45)
@@ -570,7 +578,7 @@ def check_p1_7(app):
             "图标字节=%d _icon_gen=%d" % (len(win._current_icon_bytes or b""), win._icon_gen))
     C.check("_current_apk_path 记录传入路径", os.path.normcase(win._current_apk_path()) ==
             os.path.normcase(target))
-    win2 = m.MainWindow()
+    win2 = main_window_mod.MainWindow()
     win2.apk_path_edit.setText(target)
     C.check("_apk_path 为空时回退输入框", os.path.normcase(win2._current_apk_path()) ==
             os.path.normcase(target))
@@ -584,7 +592,7 @@ def check_p1_8(app):
         return
     target = apks[0]
     before = sum(1 for k, _ in MODAL_CALLS if k == "warning")
-    win = m.MainWindow()
+    win = main_window_mod.MainWindow()
     win.show()
     win.apk_path_edit.setText(target)
     win._apk_path = target
@@ -608,7 +616,7 @@ def check_p2_9():
                  for _ in range(random.randint(3, 40))] for _ in range(random.choice([2, 3, 5, 9]))]
         W = H = random.choice([64, 128, 300])
         for rule in ("nonzero", "evenodd"):
-            got = np.asarray(m._build_fill_mask(W, H, subs, rule))
+            got = np.asarray(vector_mod._build_fill_mask(W, H, subs, rule))
             exp = reference_fill_mask(W, H, subs, rule)
             if not np.array_equal(got, exp):
                 bad += 1
@@ -616,15 +624,15 @@ def check_p2_9():
 
     subs = [[(random.uniform(0, 60), random.uniform(0, 60)) for _ in range(6)] for _ in range(3)]
     py_mask = Image.new("L", (64, 64), 0)
-    m._fill_mask_py(py_mask, subs, "evenodd")
+    vector_mod._fill_mask_py(py_mask, subs, "evenodd")
     C.check("纯 Python 回退与 numpy 版一致",
-            np.array_equal(np.asarray(py_mask), np.asarray(m._build_fill_mask(64, 64, subs, "evenodd"))))
+            np.array_equal(np.asarray(py_mask), np.asarray(vector_mod._build_fill_mask(64, 64, subs, "evenodd"))))
 
     import tracemalloc
     pts = [(float((i * 7919) % 1024), float((i * 104729) % 1024)) for i in range(20000)]
     tracemalloc.start()
     t0 = time.time()
-    m._build_fill_mask(1024, 1024, [pts], "nonzero")
+    vector_mod._build_fill_mask(1024, 1024, [pts], "nonzero")
     el = time.time() - t0
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -644,15 +652,15 @@ def check_p2_10():
     saved = shutil.which
     shutil.which = counting_which
     try:
-        m.find_aapt2.cache_clear()
+        aapt_mod.find_aapt2.cache_clear()
         try:
-            p1 = m.find_aapt2()
+            p1 = aapt_mod.find_aapt2()
         except Exception as e:
             C.skip("aapt2 查找结果可缓存", str(e))
             return
         calls_after_first = calls["n"]
         t0 = time.time()
-        p2 = m.find_aapt2()
+        p2 = aapt_mod.find_aapt2()
         el = time.time() - t0
         # 本地 tools/aapt2.exe 存在时第一次不会走 PATH（calls_after_first=0），
         # 因此断言"第二次调用没有新增搜索"，而不是固定等于 1。
@@ -665,9 +673,9 @@ def check_p2_10():
     tmp_dir = os.path.join(REPO, "_verify_fake_aapt2_dir")
     os.makedirs(tmp_dir, exist_ok=True)
     try:
-        m.find_aapt2.cache_clear()
+        aapt_mod.find_aapt2.cache_clear()
         try:
-            found = m.find_aapt2()
+            found = aapt_mod.find_aapt2()
         except Exception as e:
             C.skip("同名目录不会被误判为可执行文件", str(e))
             return
@@ -680,7 +688,7 @@ def check_p2_10():
 CHILD_CODE = r'''
 import os, sys, glob, re, subprocess
 sys.path.insert(0, sys.argv[1])
-import main as m
+import core.aapt as aapt_mod
 spawns = {"n": 0}
 _orig = subprocess.Popen
 class CountingPopen(_orig):
@@ -689,10 +697,10 @@ class CountingPopen(_orig):
         super().__init__(*a, **k)
 subprocess.Popen = CountingPopen
 apk = sys.argv[2]
-badging = m.run_aapt2_dump_badging(apk)
+badging = aapt_mod.run_aapt2_dump_badging(apk)
 xmls = [p for _, p in re.findall(r"application-icon-(\d+):'([^']+)'", badging) if p.endswith(".xml")]
-m.run_aapt2_dump_xmltree(apk, xmls[0])
-m.run_aapt2_dump_resource(apk)
+aapt_mod.run_aapt2_dump_xmltree(apk, xmls[0])
+aapt_mod.run_aapt2_dump_resource(apk)
 print("SPAWNS=%d" % spawns["n"])
 '''
 
@@ -711,7 +719,7 @@ def _run_child(apk, env_extra=None):
 
 def check_p2_11():
     C.title("P2-11 磁盘级 dump 缓存（跨进程复用）")
-    real_disk_dir = m._aapt2_cache._disk_dir
+    real_disk_dir = aapt_mod._aapt2_cache._disk_dir
     C.check("磁盘缓存默认启用", bool(real_disk_dir), str(real_disk_dir))
     if not real_disk_dir:
         return
@@ -730,13 +738,11 @@ def check_p2_11():
 
     saved_env = os.environ.get("WINAPKINFO_CACHE_DIR")
     saved_cache = aapt_mod._aapt2_cache
-    saved_main_cache = m._aapt2_cache
     os.environ["WINAPKINFO_CACHE_DIR"] = work_cache
     try:
         # 子进程通过 WINAPKINFO_CACHE_DIR 使用同一个临时缓存；
         # 父进程的全局缓存也临时替换，避免 clear/get 落到真实目录。
         aapt_mod._aapt2_cache = aapt_mod._Aapt2OutputCache(disk_dir=work_cache)
-        m._aapt2_cache = aapt_mod._aapt2_cache
 
         cold = _run_child(apk)
         warm = _run_child(apk)
@@ -757,20 +763,19 @@ def check_p2_11():
                 "WINAPKINFO_NO_DISK_CACHE=1 → 子进程=%d" % disabled)
         os.environ["WINAPKINFO_NO_DISK_CACHE"] = "1"
         try:
-            C.check("_default_disk_cache_dir 尊重禁用开关", m._default_disk_cache_dir() is None)
+            C.check("_default_disk_cache_dir 尊重禁用开关", aapt_mod._default_disk_cache_dir() is None)
         finally:
             os.environ.pop("WINAPKINFO_NO_DISK_CACHE", None)
 
-        m._aapt2_cache.clear()
+        aapt_mod._aapt2_cache.clear()
         C.check("内存层清空后仍能命中磁盘（mtime 已精确还原）",
-                m._aapt2_cache.get(m._aapt2_cache_key(apk, "badging")) is not None)
-        key = m._aapt2_cache_key(apk, "badging")
+                aapt_mod._aapt2_cache.get(aapt_mod._aapt2_cache_key(apk, "badging")) is not None)
+        key = aapt_mod._aapt2_cache_key(apk, "badging")
         C.check("缓存键包含文件大小、schema 版本与 aapt2 标识",
                 len(key) == 7 and key[5] >= 1 and isinstance(key[6], tuple),
                 "键字段=%d" % len(key))
     finally:
         aapt_mod._aapt2_cache = saved_cache
-        m._aapt2_cache = saved_main_cache
         if saved_env is None:
             os.environ.pop("WINAPKINFO_CACHE_DIR", None)
         else:
@@ -800,10 +805,10 @@ A1_CHILD = r'''
 import os, sys
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, sys.argv[1])
-import main as m
+from ui.main_window import install_excepthook
 from PyQt6 import QtCore, QtWidgets
 app = QtWidgets.QApplication(sys.argv[:1])
-m.install_excepthook()
+install_excepthook()
 class Boom(QtCore.QThread):
     def run(self):
         raise RuntimeError("boom-in-thread")
@@ -826,9 +831,9 @@ def check_a1(app):
             "存活 %d/%d（修复前 1/6，实测退出码 %s）" % (
                 surv, len(codes), ["0x%08X" % (c & 0xFFFFFFFF) for c, _ in codes]))
 
-    C.check("_on_gui_thread 在 GUI 线程返回 True", m._on_gui_thread())
+    C.check("_on_gui_thread 在 GUI 线程返回 True", main_window_mod._on_gui_thread())
     off_thread = []
-    threading.Thread(target=lambda: off_thread.append(m._on_gui_thread())).start()
+    threading.Thread(target=lambda: off_thread.append(main_window_mod._on_gui_thread())).start()
     time.sleep(0.2)
     C.check("_on_gui_thread 在子线程返回 False", off_thread == [False], "%r" % off_thread)
 
@@ -837,7 +842,7 @@ def check_a1(app):
     QtWidgets.QMessageBox.critical = staticmethod(
         lambda *a, **k: shown.append(QtCore.QThread.currentThread() is app.thread()))
     try:
-        m.install_excepthook()
+        main_window_mod.install_excepthook()
         import ui.main_window as ui_main_mod
         C.check("钩子已安装且提示器在 GUI 线程创建", ui_main_mod._error_dialog is not None)
         sys.excepthook(RuntimeError, RuntimeError("gui-boom"), None)
@@ -869,8 +874,8 @@ def check_b1(app):
     core_apk_parser.run_aapt2_dump_xmltree = fake_dump
     core_vector.run_aapt2_dump_xmltree = fake_dump
     try:
-        unwrapped = m._resolve_xml_wrapper("x.apk", "", "res/x.xml", 0, None)
-        raster = m.rasterize_vector_layer("x.apk", "res/x.xml", 128, "", None)
+        unwrapped = apk_parser_mod._resolve_xml_wrapper("x.apk", "", "res/x.xml", 0, None)
+        raster = vector_mod.rasterize_vector_layer("x.apk", "res/x.xml", 128, "", None)
     finally:
         core_apk_parser.run_aapt2_dump_xmltree = saved_parser
         core_vector.run_aapt2_dump_xmltree = saved_vector
@@ -880,22 +885,22 @@ def check_b1(app):
     apks = sample_apks()
     target = None
     for apk in sorted(apks, key=os.path.getsize):
-        badging = m.run_aapt2_dump_badging(apk)
+        badging = aapt_mod.run_aapt2_dump_badging(apk)
         icons = sorted(re.findall(r"application-icon-(\d+):'([^']+)'", badging),
                        key=lambda x: -int(x[0]))
         xml = next((p for _, p in icons if p.lower().endswith(".xml")), None)
         if not xml:
             continue
-        full = m.run_aapt2_dump_resource(apk)
-        idx = m._ResourceIndex(full)
-        out = m.run_aapt2_dump_xmltree(apk, xml)
-        fg = m.find_adaptive_layer_addr(out, "foreground")
-        bg = m.find_adaptive_layer_addr(out, "background")
+        full = aapt_mod.run_aapt2_dump_resource(apk)
+        idx = resources_mod._ResourceIndex(full)
+        out = aapt_mod.run_aapt2_dump_xmltree(apk, xml)
+        fg = apk_parser_mod.find_adaptive_layer_addr(out, "foreground")
+        bg = apk_parser_mod.find_adaptive_layer_addr(out, "background")
         if not (fg and bg):
             continue
-        fk, _, _ = m.resolve_icon_layer(apk, full, fg, index=idx)
-        bk, _, _ = m.resolve_icon_layer(apk, full, bg, index=idx)
-        if "vector" in (fk, bk) and m.find_mipmap_fallback(full, xml, idx):
+        fk, _, _ = apk_parser_mod.resolve_icon_layer(apk, full, fg, index=idx)
+        bk, _, _ = apk_parser_mod.resolve_icon_layer(apk, full, bg, index=idx)
+        if "vector" in (fk, bk) and apk_parser_mod.find_mipmap_fallback(full, xml, idx):
             target = apk
             break
     if not target:
@@ -903,7 +908,7 @@ def check_b1(app):
         return
 
     def extract(force_fail):
-        win = m.MainWindow()
+        win = main_window_mod.MainWindow()
         win.apk_path_edit.setText(target)
         import ui.workers as ui_workers
         import core.apk_parser as core_apk_parser
@@ -940,7 +945,7 @@ def check_b2(full_mode):
     tmp = os.path.join(REPO, "_verify_cache_tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     try:
-        c = m._Aapt2OutputCache(capacity=4, disk_dir=tmp, disk_limit=3,
+        c = aapt_mod._Aapt2OutputCache(capacity=4, disk_dir=tmp, disk_limit=3,
                                 disk_max_bytes=500, disk_max_entry=100)
         for i in range(12):
             c.put(("key", i), "x" * 60)
@@ -953,7 +958,7 @@ def check_b2(full_mode):
                 len(os.listdir(tmp)) == len(files) and c.get(("big",)) is not None,
                 "仍在内存层可命中")
 
-        mem = m._Aapt2OutputCache(capacity=10, disk_dir=None, mem_max_bytes=100)
+        mem = aapt_mod._Aapt2OutputCache(capacity=10, disk_dir=None, mem_max_bytes=100)
         mem.put(("m1",), "x" * 60)
         mem.put(("m2",), "x" * 60)
         C.check("内存层字节上限生效",
@@ -963,24 +968,24 @@ def check_b2(full_mode):
         shutil.rmtree(tmp, ignore_errors=True)
 
     C.check("默认上限：单条 8MB / 磁盘 200MB / 内存 64MB",
-            m._Aapt2OutputCache.DISK_MAX_ENTRY == 8 * 1024 * 1024 and
-            m._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024 and
-            m._Aapt2OutputCache.MEM_MAX_BYTES == 64 * 1024 * 1024)
+            aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY == 8 * 1024 * 1024 and
+            aapt_mod._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024 and
+            aapt_mod._Aapt2OutputCache.MEM_MAX_BYTES == 64 * 1024 * 1024)
     if not full_mode:
         return
-    disk_dir = m._aapt2_cache._disk_dir
+    disk_dir = aapt_mod._aapt2_cache._disk_dir
     apks = sample_apks()
     if not (disk_dir and apks):
         return
     largest = pick_apk(apks, largest=True)
-    m.run_aapt2_dump_badging(largest)
-    m.run_aapt2_dump_resource(largest)      # 该 dump 约 36MB，应只留内存
+    aapt_mod.run_aapt2_dump_badging(largest)
+    aapt_mod.run_aapt2_dump_resource(largest)      # 该 dump 约 36MB，应只留内存
     files = [(os.path.getsize(os.path.join(disk_dir, f)), f) for f in os.listdir(disk_dir)]
     biggest = max((s for s, _ in files), default=0)
     total = sum(s for s, _ in files)
-    C.check("真实样本：单条不超过 8MB", biggest <= m._Aapt2OutputCache.DISK_MAX_ENTRY,
+    C.check("真实样本：单条不超过 8MB", biggest <= aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY,
             "最大 %.1f MB" % (biggest / 1048576))
-    C.check("真实样本：总量不超过 200MB", total <= m._Aapt2OutputCache.DISK_MAX_BYTES,
+    C.check("真实样本：总量不超过 200MB", total <= aapt_mod._Aapt2OutputCache.DISK_MAX_BYTES,
             "合计 %.1f MB / %d 条" % (total / 1048576, len(files)))
 
 
@@ -1010,9 +1015,9 @@ def check_new_fixes():
 
     # --- 渐变 type 枚举（旧实现用 _attr_float，0x 写法被截成 0）---
     C.check("_attr_int 识别十进制/0x 枚举",
-            m._attr_int("1") == 1 and m._attr_int("0x00000001") == 1 and
-            m._attr_int(None, 9) == 9,
-            "_attr_int('0x00000001')=%s" % m._attr_int("0x00000001"))
+            vector_mod._attr_int("1") == 1 and vector_mod._attr_int("0x00000001") == 1 and
+            vector_mod._attr_int(None, 9) == 9,
+            "_attr_int('0x00000001')=%s" % vector_mod._attr_int("0x00000001"))
     for raw, want in (("1", 1), ("0x00000001", 1), ("2", 2), ("0x00000002", 2)):
         xml = ('E: gradient (line=1)\n'
                '  A: http://schemas.android.com/apk/res/android:type(0x0101019c)=%s\n'
@@ -1020,19 +1025,19 @@ def check_new_fixes():
                '    A: http://schemas.android.com/apk/res/android:color(0x0101019d)=#ffff0000\n'
                '  E: item (line=3)\n'
                '    A: http://schemas.android.com/apk/res/android:color(0x0101019d)=#ff0000ff\n' % raw)
-        g = m._parse_gradient(xml)
+        g = vector_mod._parse_gradient(xml)
         C.check("gradient type=%-12s -> %d" % (raw, want), bool(g) and g["type"] == want,
                 "解析结果 %s（0=linear 1=radial 2=sweep）" % (g and g["type"]))
 
     # --- Android 合法的 #RGB / #ARGB 简写 ---
     C.check("parse_android_color 支持 #RGB/#ARGB",
-            m.parse_android_color("#f00") == (255, 0, 0, 255) and
-            m.parse_android_color("#8f00") == (255, 0, 0, 0x88) and
-            m.parse_android_color("#ff112233") == (0x11, 0x22, 0x33, 0xff) and
-            m.parse_android_color("#112233") == (0x11, 0x22, 0x33, 255))
+            colors_mod.parse_android_color("#f00") == (255, 0, 0, 255) and
+            colors_mod.parse_android_color("#8f00") == (255, 0, 0, 0x88) and
+            colors_mod.parse_android_color("#ff112233") == (0x11, 0x22, 0x33, 0xff) and
+            colors_mod.parse_android_color("#112233") == (0x11, 0x22, 0x33, 255))
     for bad in ("#gggggg", "#12345", "", "#"):
         try:
-            m.parse_android_color(bad)
+            colors_mod.parse_android_color(bad)
             raised = False
         except ValueError:
             raised = True
@@ -1040,8 +1045,8 @@ def check_new_fixes():
 
     # --- 畸形 pathData 容错 ---
     try:
-        m._tokenize_path_data("M0,0 L1.2.3 4,4")
-        m._flatten_subpaths(m._parse_path_commands(m._tokenize_path_data("M0,0 L1.2.3 4,4")), 1.0)
+        vector_mod._tokenize_path_data("M0,0 L1.2.3 4,4")
+        vector_mod._flatten_subpaths(vector_mod._parse_path_commands(vector_mod._tokenize_path_data("M0,0 L1.2.3 4,4")), 1.0)
         ok = True
     except Exception as e:
         ok = False
@@ -1052,54 +1057,54 @@ def check_new_fixes():
     # --- strokeLineCap=square ---
     closed = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]
     C.check("闭合子路径不做 square 端点外推",
-            m._extend_square_caps(closed, 2.0) == closed)
-    ext = m._extend_square_caps([(0.0, 0.0), (10.0, 0.0)], 3.0)
+            vector_mod._extend_square_caps(closed, 2.0) == closed)
+    ext = vector_mod._extend_square_caps([(0.0, 0.0), (10.0, 0.0)], 3.0)
     C.check("square 端点沿线段方向外推半个线宽",
             ext[0] == (-3.0, 0.0) and ext[-1] == (13.0, 0.0), "%r" % (ext,))
 
     # --- 文件名净化 ---
-    sanitized = m._sanitize_apk_name('a/b:c*?"<>|')
+    sanitized = apk_parser_mod._sanitize_apk_name('a/b:c*?"<>|')
     C.check("文件名净化：非法字符被替换",
             not any(ch in sanitized for ch in '\\/:*?"<>|') and sanitized.endswith(".apk"),
             sanitized)
     C.check("文件名净化：结尾点/空格与保留设备名",
-            m._sanitize_apk_name("name... ") == "name.apk" and
-            m._sanitize_apk_name("CON") == "_CON.apk" and
-            m._sanitize_apk_name("  ") == "" and
-            m._sanitize_apk_name("微信_8.0.1") == "微信_8.0.1.apk",
-            "%r %r" % (m._sanitize_apk_name("name... "), m._sanitize_apk_name("CON")))
+            apk_parser_mod._sanitize_apk_name("name... ") == "name.apk" and
+            apk_parser_mod._sanitize_apk_name("CON") == "_CON.apk" and
+            apk_parser_mod._sanitize_apk_name("  ") == "" and
+            apk_parser_mod._sanitize_apk_name("微信_8.0.1") == "微信_8.0.1.apk",
+            "%r %r" % (apk_parser_mod._sanitize_apk_name("name... "), apk_parser_mod._sanitize_apk_name("CON")))
 
     # --- dump 失败必须可区分 ---
     C.check("dump 失败返回 None（不再把错误文本当输出）",
-            m.run_aapt2_dump_resource("__no_such__.apk") is None and
-            m.run_aapt2_dump_xmltree("__no_such__.apk", "res/x.xml") is None)
+            aapt_mod.run_aapt2_dump_resource("__no_such__.apk") is None and
+            aapt_mod.run_aapt2_dump_xmltree("__no_such__.apk", "res/x.xml") is None)
     try:
-        m._aapt2_cache_key("__no_such__.apk", "badging")
+        aapt_mod._aapt2_cache_key("__no_such__.apk", "badging")
         err = None
     except Exception as e:
         err = e
     C.check("缓存键对缺失文件抛 Aapt2Error（不是裸 OSError）",
-            isinstance(err, m.Aapt2Error), repr(err))
+            isinstance(err, aapt_mod.Aapt2Error), repr(err))
 
     # --- 统一导出规格 ---
     src = io.BytesIO()
     Image.new("RGB", (37, 91), (10, 20, 30)).save(src, format="PNG")
-    out = m._normalize_icon_png(src.getvalue())
+    out = apk_parser_mod._normalize_icon_png(src.getvalue())
     out_size = Image.open(io.BytesIO(out)).size if out else None
     C.check("位图图标归一化为 512×512", out_size == (512, 512), "%s" % (out_size,))
     C.check("不可解码的字节返回 None（由调用方回退原始字节）",
-            m._normalize_icon_png(b"not an image") is None)
+            apk_parser_mod._normalize_icon_png(b"not an image") is None)
 
     # --- 子线程只碰 QImage ---
     C.check("图标链路改用 QImage（子线程不再创建 QPixmap）",
-            hasattr(m.IconWorker, "_load_image") and not hasattr(m.IconWorker, "_load_pixmap"))
+            hasattr(workers_mod.IconWorker, "_load_image") and not hasattr(workers_mod.IconWorker, "_load_pixmap"))
 
     # --- 无 application-icon-* 时的图标兜底 + 架构去重 ---
     fake = ("package: name='a.b' versionCode='1' versionName='1.0'\n"
             "application: label='X' icon='res/mipmap/ic_launcher.xml'\n"
             "native-code: 'arm64-v8a' 'armeabi-v7a'\n"
             "alt-native-code: 'arm64-v8a'\n")
-    info = m.parse_aapt2_output(fake)
+    info = apk_parser_mod.parse_aapt2_output(fake)
     C.check("无 application-icon-* 时回退 application 节点 icon",
             info["icons"].get("0") == "res/mipmap/ic_launcher.xml", "%r" % info["icons"])
     C.check("native-code / alt-native-code 架构去重",
@@ -1107,7 +1112,7 @@ def check_new_fixes():
             "%r" % info["architectures"])
 
     # --- package 行属性顺序容错（versionCodeMajor 插在中间时不再整行丢失）---
-    info_pkg = m.parse_aapt2_output(
+    info_pkg = apk_parser_mod.parse_aapt2_output(
         "package: name='com.a' versionCode='7' versionCodeMajor='0' versionName='2.3.4'\n")
     C.check("package 行含 versionCodeMajor 仍解析出包名/版本",
             info_pkg["package_name"] == "com.a" and
@@ -1120,7 +1125,7 @@ def check_new_fixes():
     fake_res = ("resource 0x7f0e0001 res/mipmap/ic_launcher\n"
                 "    (anydpi-v26) (file) res/mipmap-anydpi-v26/ic_launcher.xml type=XML\n"
                 "    (xxxhdpi) (file) res/mipmap-xxxhdpi-v4/ic_launcher.png type=PNG\n")
-    fb = m.find_mipmap_fallback(fake_res, "res/mipmap-anydpi-v26/ic_launcher.xml")
+    fb = apk_parser_mod.find_mipmap_fallback(fake_res, "res/mipmap-anydpi-v26/ic_launcher.xml")
     C.check("find_mipmap_fallback 无 index 也能返回最高密度位图",
             fb == "res/mipmap-xxxhdpi-v4/ic_launcher.png", "%r" % fb)
 
@@ -1137,11 +1142,11 @@ def check_end_to_end(app, limit):
     for apk in apks:
         name = os.path.basename(apk)
         t0 = time.time()
-        win = m.MainWindow()
+        win = main_window_mod.MainWindow()
         win.apk_path_edit.setText(apk)
         win.process_apk(apk)
-        got = wait_for(app, lambda: bool(win._current_icon_bytes) or
-                       win.lbl_icon_hint.text() != "", timeout=90)
+        wait_for(app, lambda: bool(win._current_icon_bytes) or
+                 win.lbl_icon_hint.text() != "", timeout=90)
         el = time.time() - t0
         data = win._current_icon_bytes or b""
         size = None

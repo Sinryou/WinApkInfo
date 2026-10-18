@@ -4,7 +4,6 @@ import os
 import sys
 import time
 import logging
-import functools
 from pathlib import Path
 from PyQt6 import QtCore, QtGui, QtWidgets
 

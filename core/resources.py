@@ -10,8 +10,6 @@ import zipfile
 import contextlib
 from pathlib import Path
 
-from core.aapt import Aapt2Error
-
 
 @contextlib.contextmanager
 def _open_apk_zip(apk_path: str, zf=None):

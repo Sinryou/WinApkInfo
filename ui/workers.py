@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """后台解析工作线程（ApkInfoWorker、IconWorker，基于标准 Qt Worker-Object 架构）。"""
 import io
-import time
-import zipfile
 import threading
 import logging
 import re

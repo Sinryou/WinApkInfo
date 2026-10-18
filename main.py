@@ -11,149 +11,21 @@
   - ui.widgets: 自定义 UI 控件（DropLineEdit）；
   - ui.main_window: 主窗口（MainWindow）与全局异常捕获钩子。
 
-本入口模块同时向后兼容导出所有核心符号，供测试套件与打包脚本无缝调用。
 """
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import tempfile
-import logging
-
-from version import __version__
 
 from PyQt6 import QtWidgets
 
-# 只保留兼容层 __getattr__ 需要用到的模块引用；
-# 其余符号通过下面的 from ... import 显式导出，避免任何 core.* 导入
-# 都被这里的别名提前拉起一遍。
-import core.resources as _resources_mod
-import ui.main_window as _main_window_mod
-
-# 导出 core.aapt 符号
-from core.aapt import (
-    _SUBPROCESS_FLAGS,
-    Aapt2Error,
-    _AAPT2_TIMEOUT,
-    _running_procs,
-    _running_procs_lock,
-    _run_aapt2,
-    kill_running_aapt2,
-    _decode_output,
-    _Aapt2OutputCache,
-    _default_disk_cache_dir,
-    _aapt2_cache_key,
-    _aapt2_cache,
-    find_aapt2,
-    run_aapt2_dump_badging,
-    run_aapt2_dump_resource,
-    run_aapt2_dump_xmltree,
-    get_disk_cache_info,
-    clear_disk_cache,
-)
-
-# 导出 core.signature 符号
-from core.signature import (
-    get_file_meta_and_hashes,
-    extract_apk_signatures,
-    get_apk_full_signature_report,
-)
-
-# 导出 core.colors 符号
-from core.colors import (
-    parse_android_color,
-    _FRAMEWORK_COLOR_MAP,
-)
-
-# 导出 core.resources 符号
-from core.resources import (
-    local_resource_path,
-    load_sdk_versions,
-    _LazyEntryMap,
-    _entry_span,
-    _ResourceIndex,
-    extract_resource_entry,
-    _density_of,
-    _pick_best_density,
-    _sniff_cache,
-    _sniff_cache_lock,
-    _sniff_file_kind,
-    _BITMAP_EXTS,
-    _DPI_ORDER,
-    _MAX_DEREF_DEPTH,
-    get_resource_info,
-    _open_apk_zip,
-)
-
-# 导出 core.vector 符号
-from core.vector import (
-    _VECTOR_CAPS,
-    _parse_vector_elements,
-    _attr_float,
-    _attr_enum,
-    _attr_int,
-    _tokenize_path_data,
-    _parse_path_commands,
-    _bezier_points,
-    _quad_points,
-    _arc_points,
-    _flatten_subpaths,
-    _mat_mul,
-    _mat_apply,
-    _mat_scale,
-    _group_matrix,
-    _MASK_CHUNK_ROWS,
-    _collect_edges,
-    _fill_mask_py,
-    _build_fill_mask,
-    _parse_gradient,
-    _sample_gradient_stops,
-    _sample_gradient_stops_vec,
-    _render_gradient,
-    _render_gradient_py,
-    _resolve_vector_fill,
-    _extend_square_caps,
-    _draw_stroke,
-    _cmds_to_qpainterpath,
-    rasterize_vector_layer,
-    _trim_to_content,
-)
-
-# 导出 core.apk_parser 符号
-from core.apk_parser import (
-    _ICON_SIZE,
-    _RESERVED_NAMES,
-    find_adaptive_layer_addr,
-    _resolve_xml_wrapper,
-    resolve_icon_layer,
-    _collect_bitmap_variants,
-    find_mipmap_fallback,
-    load_resource,
-    _normalize_icon_png,
-    _place_by_gravity,
-    extract_icon_bytes,
-    parse_aapt2_output,
-    _sanitize_apk_name,
-)
-
-# 导出 ui.workers 符号
-from ui.workers import (
-    _Cancelled,
-    IconWorker,
-    ApkInfoWorker,
-)
-
-# 导出 ui.widgets 符号
-from ui.widgets import (
-    DropLineEdit,
-)
-
-# 导出 ui.main_window 符号
-from ui.main_window import (
-    _CLOSE_WAIT_MS,
-    MainWindow,
-    _ErrorDialog,
-    _on_gui_thread,
-    install_excepthook,
-)
+from core.aapt import _decode_output, _run_aapt2, find_aapt2, run_aapt2_dump_badging
+from core.apk_parser import parse_aapt2_output
+from core.resources import load_sdk_versions, local_resource_path
+from ui.main_window import MainWindow, install_excepthook
+from ui.workers import IconWorker
+from version import __version__
 
 
 def _self_test(apk_path: str = None) -> int:
@@ -249,7 +121,6 @@ def main():
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler(sys.stderr))
     try:
-        from logging.handlers import RotatingFileHandler
         handlers.append(
             RotatingFileHandler(
                 log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
@@ -289,21 +160,6 @@ def main():
     # 事件循环结束后必须确认后台线程已退出：QThread 运行中被析构会让进程崩溃
     w.shutdown_background()
     return code
-
-
-def __getattr__(name: str):
-    """向后兼容属性动态读取（PEP 562）。
-
-    这些是可变全局：必须每次从定义模块读取，不能按值 from-import，
-    否则拿到的是导入瞬间的副本（SDK 缓存永远 None、警告标志永远 False）。
-    """
-    if name == "_error_dialog":
-        return _main_window_mod._error_dialog
-    if name == "_sdk_versions_cache":
-        return _resources_mod._sdk_versions_cache
-    if name == "_sdk_load_warned":
-        return _resources_mod._sdk_load_warned
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 if __name__ == "__main__":

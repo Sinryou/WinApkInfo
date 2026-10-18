@@ -211,8 +211,7 @@ def extract_apk_signatures(apk_path: str) -> dict:
                                     while pos < 4 + signers_len:
                                         signer_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
                                         signer_end = pos + signer_len
-                                        sd_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
-                                        sd_end = pos + sd_len
+                                        pos += 4  # signed_data_len
                                         digests_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4 + digests_len
                                         certs_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
                                         certs_end = pos + certs_len

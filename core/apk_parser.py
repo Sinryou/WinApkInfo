@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """APK 图标寻址、自适应图层合成、badging 解析与名称净化。"""
 import os
-import sys
 import re
 import io
-import zipfile
 import logging
-from pathlib import Path
-from PIL import Image, ImageChops
+from PIL import Image
 
-from core.aapt import run_aapt2_dump_resource, run_aapt2_dump_xmltree
+from core.aapt import run_aapt2_dump_xmltree
 from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    _ResourceIndex, _entry_span, extract_resource_entry, _density_of,
+    _entry_span, extract_resource_entry, _density_of,
     _pick_best_density, _sniff_file_kind, get_resource_info,
     _BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
 )

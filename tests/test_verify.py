@@ -20,7 +20,6 @@ import core.aapt as aapt_mod
 import core.signature as sig_mod
 import core.resources as res_mod
 import core.vector as vec_mod
-import ui.main_window as mw_mod
 import verify_fixes
 from PIL import Image
 from ui.workers import IconWorker

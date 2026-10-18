@@ -4,7 +4,6 @@ import os
 import sys
 import subprocess
 import threading
-import time
 import hashlib
 import tempfile
 import logging
