@@ -191,7 +191,14 @@ class IconWorker(QtCore.QThread):
         root_m = re.search(r"E:\s*(\S+)\s*\(", xml_out or "")
         if root_m and root_m.group(1) == "vector":
             self._check_cancel()
-            img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE)
+            # 矢量图标的 fillColor/strokeColor 常引用应用内资源（@0x7f...）。
+            # 这里先建一次资源索引并透传给渲染层：否则每次引用都会走
+            # extract_resource_entry 的无索引路径，对整个 dump（真实包约
+            # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
+            # 十几条引用就是数秒），并瞬时产生大量行字符串。
+            full_res = run_aapt2_dump_resource(apk_path)
+            index = _ResourceIndex(full_res) if full_res else None
+            img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE, full_res, index)
             if img is None:
                 return b""
             buf = io.BytesIO()

@@ -35,6 +35,7 @@ import core.apk_parser as apk_parser_mod
 import core.signature as sig_mod
 import core.resources as res_mod
 import core.vector as vec_mod
+import ui.workers as workers_mod
 from PIL import Image
 from tests import regression_checks
 from ui.workers import IconWorker
@@ -179,6 +180,40 @@ class TestIconTypeSniffing(unittest.TestCase):
             self.assertTrue(data.startswith(b"\x89PNG"))
         finally:
             os.remove(apk_path)
+
+
+_VECTOR_ICON_XML = (
+    "E: vector (line=1)\n"
+    "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108.0\n"
+)
+_VECTOR_FULL_RES = (
+    "resource 0x7f010001 res/color/c0\n"
+    "    () #ff0000\n"
+)
+
+
+def test_vector_icon_reuses_resource_index(monkeypatch):
+    """普通 VectorDrawable 图标必须复用一次性资源索引。
+
+    回归 1.1：root==vector 分支此前不传 full_res/index，每个
+    fillColor/strokeColor 引用都会走无索引路径，对整个 dump 重复
+    splitlines + 线性扫描（36MB dump 单次约 0.17s）。
+    """
+    captured = {}
+
+    def fake_rasterize(apk_path, xml_path, size, full_res=None, index=None):
+        captured["full_res"] = full_res
+        captured["index"] = index
+        return Image.new("RGBA", (size, size), (255, 0, 0, 255))
+
+    monkeypatch.setattr(workers_mod, "rasterize_vector_layer", fake_rasterize)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _VECTOR_ICON_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource", lambda apk: _VECTOR_FULL_RES)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert captured.get("index") is not None, "vector 图标分支必须透传资源索引"
+    assert captured.get("full_res") == _VECTOR_FULL_RES
+    assert data.startswith(b"\x89PNG")
 
 
 class TestMiniFixtureAPK(unittest.TestCase):
