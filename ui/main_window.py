@@ -181,7 +181,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._apk_path or self.apk_path_edit.text().strip()
 
     def _reset_result_state(self):
-        """清空上一轮的输出、图标、提示与重命名预览状态。"""
+        """清空上一轮的输出、图标、提示与重命名预览状态，并作废在途图标提取。"""
         self._raw_output = ""
         self._parse_ok_path = ""
         self._current_icon_bytes = None
@@ -190,6 +190,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_icon_hint.clear()
         self.lbl_icon_hint.setToolTip("")
         self.rename_preview.clear()
+        # 作废在途的图标请求：新一轮解析开始后，上一个 APK 的提取结果不能
+        # 再显示到界面上（旧实现不推进代数，结果会被 on_icon_loaded 当成
+        # 当前 APK 的图标接受，在新解析完成前闪现旧图标/旧导出按钮）。
+        self._icon_gen += 1
+        if self._icon_worker is not None:
+            self._icon_worker.cancel()
 
     def process_apk(self, path: str):
         if not path or not os.path.isfile(path):

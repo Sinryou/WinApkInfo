@@ -61,6 +61,17 @@ class _IconWorkerCore(QtCore.QObject):
             self._stopping = True
             self._pending = None
 
+    def cancel(self):
+        """作废在途/待办的提取任务，但保持线程继续运行。
+
+        新一轮解析开始时调用：当前文件已经换掉，上一个 APK 的图标任务
+        没有继续的必要。推进代数可让正在执行的提取在下个取消检查点提前
+        退出，也保证它完成后的结果不会再被投递（配合 UI 侧代数校验）。
+        """
+        with self._lock:
+            self._gen += 1
+            self._pending = None
+
     def is_stale(self, gen: int) -> bool:
         with self._lock:
             return self._stopping or gen != self._gen
@@ -130,6 +141,10 @@ class IconWorker(QtCore.QThread):
         self._core.stop()
         self.requestInterruption()
         self.quit()
+
+    def cancel(self):
+        """作废当前在途的提取任务（新一轮解析开始时调用）。"""
+        self._core.cancel()
 
     def _is_stale(self, gen: int) -> bool:
         return self._core.is_stale(gen)

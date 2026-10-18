@@ -28,6 +28,7 @@
     C     本轮修复回归：渐变 type 枚举 / #RGB 颜色 / 畸形 pathData 容错 /
           strokeLineCap=square / 文件名净化 / dump 失败返回 None /
           统一 512² 导出 / 子线程只用 QImage / 图标与架构兜底
+    D1    新一轮解析开始时作废在途图标结果（代数推进 + 核心 cancel）
 
 注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
 （GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
@@ -556,6 +557,26 @@ def check_p1_6(app):
                            b"stale", win._icon_gen - 1)
         consume_events(app, 0.05)
         C.check("过期代数结果被丢弃", win._current_icon_bytes == b"res/F19.xml")
+
+        # D1：新一轮解析开始（_reset_result_state）后，上一 APK 的在途结果
+        # 必须失效——修复前代数不推进，结果会被 on_icon_loaded 接受。
+        stale_gen = win._icon_gen
+        win._reset_result_state()
+        C.check("新一轮解析开始时推进图标代数", win._icon_gen != stale_gen,
+                "gen %d -> %d" % (stale_gen, win._icon_gen))
+        win.on_icon_loaded(QtGui.QImage(4, 4, QtGui.QImage.Format.Format_ARGB32),
+                           b"stale-across-parse", stale_gen)
+        consume_events(app, 0.05)
+        C.check("旧 APK 的迟到图标结果不再显示",
+                win._current_icon_bytes is None and not win.btn_export_icon.isVisibleTo(win),
+                "bytes=%r visible=%s" % (win._current_icon_bytes,
+                                         win.btn_export_icon.isVisibleTo(win)))
+        core = win._icon_worker._core
+        with core._lock:
+            core_gen = core._gen
+        win._icon_worker.cancel()
+        C.check("cancel 让在途核心任务立即过期", core.is_stale(core_gen),
+                "core gen %d -> %d" % (core_gen, core._gen))
 
         win.close()
         C.check("关窗后常驻线程退出", win.shutdown_background(5000))
