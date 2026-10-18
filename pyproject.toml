@@ -18,3 +18,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    "e2e: 需要 testSample/ 真实样本的端到端用例（默认构建不运行）",
+]

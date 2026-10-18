@@ -1,17 +1,30 @@
 # -*- coding: utf-8 -*-
-"""标准测试适配入口，支持 pytest 与 python -m unittest 自动发现执行。"""
+"""WinApkInfo 测试集（pytest 单轨入口）。
+
+包含三类用例：
+  - 合成用例（无需样本）：签名/哈希、缓存、资源索引、矢量光栅化、图标嗅探、渐变渲染；
+  - 回归检查（tests/regression_checks.py 的 check_*）：线程模型、缓存上限、
+    图标提取链路等历史修复的行为守护；
+  - 端到端用例（marker: e2e）：需要 testSample/ 真实样本，构建默认不运行。
+
+用法：
+    python -m pytest tests -q -m "not e2e"   # 不依赖 testSample，适合 CI
+    python -m pytest tests -q                # 含端到端（需 testSample/）
+"""
+import glob
 import io
 import os
 import re
-import sys
-import glob
 import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
 from unittest import mock
 
-# 确保项目根目录在 sys.path
+import pytest
+
+# 确保项目根目录在 sys.path（直接执行本文件时 conftest 尚未加载）
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
@@ -22,9 +35,22 @@ import core.apk_parser as apk_parser_mod
 import core.signature as sig_mod
 import core.resources as res_mod
 import core.vector as vec_mod
-import verify_fixes
 from PIL import Image
+from tests import regression_checks
 from ui.workers import IconWorker
+
+
+# 会话级 QApplication 引用：fixture 返回后仍需保活，避免测试中途被回收
+_APP = None
+
+
+@pytest.fixture(scope="session")
+def app():
+    """会话级 QApplication；同时把模态弹窗替换为记录器，避免无人值守时阻塞。"""
+    global _APP
+    _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+    regression_checks.silence_dialogs()
+    return _APP
 
 
 class TestSignatureAndMeta(unittest.TestCase):
@@ -275,84 +301,88 @@ class TestGradientRendering(unittest.TestCase):
             self.assertGreater(bottom[2], bottom[0], f"{renderer.__name__} bottom={bottom}")
 
 
-class TestRegressionSuite(unittest.TestCase):
-    """执行全部合成用例与回归检查（支持 pytest 与 unittest 逐项执行）。"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
-        verify_fixes.silence_dialogs()
-
-    def _run_check(self, func, *args):
-        verify_fixes.C.results = []
-        verify_fixes.C.skipped = []
-        func(*args)
-        failed = [r for r in verify_fixes.C.results if not r[2]]
-        self.assertEqual(len(failed), 0, f"存在回归失败项: {failed}")
-
-    def test_env(self):
-        self._run_check(verify_fixes.check_env)
-
-    def test_p0_1_fill_type(self):
-        self._run_check(verify_fixes.check_p0_1)
-
-    def test_p0_2_smooth_control_points(self):
-        self._run_check(verify_fixes.check_p0_2)
-
-    def test_p0_3_stroke_line_cap(self):
-        self._run_check(verify_fixes.check_p0_3)
-
-    def test_p1_4_slot_exception(self):
-        self._run_check(verify_fixes.check_p1_4, self.app)
-
-    def test_p1_5_aapt2_timeout_and_abort(self):
-        self._run_check(verify_fixes.check_p1_5, self.app)
-
-    def test_p1_6_icon_worker_channel(self):
-        self._run_check(verify_fixes.check_p1_6, self.app)
-
-    def test_p1_7_process_apk_path(self):
-        self._run_check(verify_fixes.check_p1_7, self.app)
-
-    def test_p1_8_icon_failed_hint(self):
-        self._run_check(verify_fixes.check_p1_8, self.app)
-
-    def test_d3_supersede(self):
-        self._run_check(verify_fixes.check_d3_supersede, self.app)
-
-    def test_p2_9_fill_mask_chunking(self):
-        self._run_check(verify_fixes.check_p2_9)
-
-    def test_p2_10_find_aapt2_cache(self):
-        self._run_check(verify_fixes.check_p2_10)
-
-    def test_p2_11_disk_cache(self):
-        self._run_check(verify_fixes.check_p2_11)
-
-    def test_p2_12_rgba_resize_premultiplication(self):
-        self._run_check(verify_fixes.check_p2_12)
-
-    def test_a1_excepthook_thread_safety(self):
-        self._run_check(verify_fixes.check_a1, self.app)
-
-    def test_b1_non_vector_fallback(self):
-        self._run_check(verify_fixes.check_b1, self.app)
-
-    def test_b2_cache_byte_cap(self):
-        self._run_check(verify_fixes.check_b2, False)
-
-    def test_b3_sdk_versions_reload(self):
-        self._run_check(verify_fixes.check_b3)
-
-    def test_new_fixes_regression(self):
-        self._run_check(verify_fixes.check_new_fixes)
-
-    def test_end_to_end(self):
-        samples = verify_fixes.sample_apks()
-        if not samples:
-            self.skipTest("testSample 目录无 APK 样本")
-        self._run_check(verify_fixes.check_end_to_end, self.app, 2)
+# ---------------------------------------------------------------------------
+# 回归检查（tests/regression_checks.py）：历史修复的行为守护
+# ---------------------------------------------------------------------------
+def test_env():
+    regression_checks.check_env()
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_p0_1_fill_type():
+    regression_checks.check_p0_1()
+
+
+def test_p0_2_smooth_control_points():
+    regression_checks.check_p0_2()
+
+
+def test_p0_3_stroke_line_cap():
+    regression_checks.check_p0_3()
+
+
+def test_p1_4_slot_exception(app):
+    regression_checks.check_p1_4(app)
+
+
+def test_p1_5_aapt2_timeout_and_abort(app):
+    regression_checks.check_p1_5(app)
+
+
+def test_p1_6_icon_worker_channel(app):
+    regression_checks.check_p1_6(app)
+
+
+def test_p1_7_process_apk_path(app):
+    regression_checks.check_p1_7(app)
+
+
+def test_p1_8_icon_failed_hint(app):
+    regression_checks.check_p1_8(app)
+
+
+def test_d3_supersede(app):
+    regression_checks.check_d3_supersede(app)
+
+
+def test_p2_9_fill_mask_chunking():
+    regression_checks.check_p2_9()
+
+
+def test_p2_10_find_aapt2_cache():
+    regression_checks.check_p2_10()
+
+
+def test_p2_11_disk_cache():
+    regression_checks.check_p2_11()
+
+
+def test_p2_12_rgba_resize_premultiplication():
+    regression_checks.check_p2_12()
+
+
+def test_a1_excepthook_thread_safety(app):
+    regression_checks.check_a1(app)
+
+
+def test_b1_non_vector_fallback(app):
+    regression_checks.check_b1(app)
+
+
+def test_b2_cache_byte_cap():
+    regression_checks.check_b2(False)
+
+
+def test_b3_sdk_versions_reload():
+    regression_checks.check_b3()
+
+
+def test_new_fixes_regression():
+    regression_checks.check_new_fixes()
+
+
+@pytest.mark.e2e
+def test_end_to_end(app):
+    """真实样本端到端（默认构建不跑；`-m e2e` 或完整运行才包含）。"""
+    if not regression_checks.sample_apks():
+        pytest.skip("testSample 目录无 APK 样本")
+    regression_checks.check_end_to_end(app, None)

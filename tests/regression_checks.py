@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""WinApkInfo 修复验证脚本。
+"""WinApkInfo 回归检查用例集（由 tests/test_verify.py 的 pytest 用例调用）。
 
-用法（在仓库根目录，使用系统 Python）：
-    python verify_fixes.py              # 完整验证（含真实 APK 端到端）
-    python verify_fixes.py --quick      # 只跑合成用例，不碰 testSample
-    python verify_fixes.py --samples 3  # 端到端最多测 3 个样本 APK
+这些检查来自历史提交的修复验证（P0/P1/P2/A/B/C/D 各节），集中放在独立模块里
+以复用测试辅助（sample_apks / wait_for / consume_events 等）。执行入口统一为
+pytest，不再提供独立脚本：
+
+    python -m pytest tests -q -m "not e2e"   # 不依赖 testSample（CI/构建默认）
+    python -m pytest tests -q                # 含端到端（需 testSample/）
 
 覆盖范围（与提交一一对应）：
     P0-1  fillType 枚举（evenOdd 生效）
@@ -34,12 +36,8 @@
 
 注意：样本识别一律按内容/大小，不依赖 testSample 里的文件名
 （GUI 的"执行重命名"会把样本改成 应用名_版本号.apk）。
-
-退出码：0 = 全部通过，1 = 存在失败项。
 """
-import argparse
 import io
-import logging
 import math
 import os
 import random
@@ -52,26 +50,12 @@ import threading
 import time
 import zipfile
 
-
-def _force_utf8_stdio():
-    """验证输出含中文，Windows CI 的 cp1252 控制台会抛 UnicodeEncodeError。
-
-    在打印任何内容前把 stdout/stderr 切到 UTF-8；GitHub Actions 日志本身
-    按 UTF-8 解码，这样既不会崩，中文也能正常显示。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
+import pytest
 
 
-_force_utf8_stdio()
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-REPO = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 SAMPLE_DIR = os.path.join(REPO, "testSample")
 
 import numpy as np
@@ -90,45 +74,28 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 # --------------------------------------------------------------------------
 # 测试脚手架
 # --------------------------------------------------------------------------
-class Checker:
-    def __init__(self):
-        self.results = []
-        self.skipped = []
-        self.section = ""
+class _Checker:
+    """断言式检查器：通过即静默，失败直接抛 AssertionError 交由 pytest 报告。
 
-    def title(self, text):
-        self.section = text
-        print("\n" + "=" * 74)
-        print(text)
-        print("=" * 74)
+    保留 C.check / C.skip / C.title 的调用形态，让各检查函数与历史验证
+    脚本一一对应，便于对照提交与回归项；但不再自行累积结果与打印汇总。
+    """
 
-    def check(self, name, ok, detail=""):
-        self.results.append((self.section, name, bool(ok), detail))
-        flag = "PASS" if ok else "FAIL"
-        print("  [%s] %-46s %s" % (flag, name, detail))
-        return bool(ok)
+    @staticmethod
+    def check(name, ok, detail=""):
+        if not ok:
+            raise AssertionError(f"{name} :: {detail}" if detail else name)
 
-    def skip(self, name, detail=""):
-        """样本/环境不具备时跳过，不计入失败（例如精简样本目录）。"""
-        self.skipped.append((self.section, name, detail))
-        print("  [SKIP] %-46s %s" % (name, detail))
+    @staticmethod
+    def skip(name, detail=""):
+        pytest.skip(f"{name}: {detail}" if detail else name)
 
-    def summary(self):
-        total = len(self.results)
-        failed = [r for r in self.results if not r[2]]
-        print("\n" + "=" * 74)
-        print("汇总：%d/%d 项通过，跳过 %d 项" % (total - len(failed), total, len(self.skipped)))
-        if failed:
-            for sec, name, _, detail in failed:
-                print("  FAIL  %s :: %s  %s" % (sec, name, detail))
-        if self.skipped:
-            for sec, name, detail in self.skipped:
-                print("  SKIP  %s :: %s  %s" % (sec, name, detail))
-        print("=" * 74)
-        return 1 if failed else 0
+    @staticmethod
+    def title(text):
+        """分节标题：pytest 以测试函数名分组，这里仅保留调用点便于阅读。"""
 
 
-C = Checker()
+C = _Checker()
 MODAL_CALLS = []
 
 
@@ -1268,44 +1235,3 @@ def check_end_to_end(app, limit):
     C.check("图标导出规格统一为 512×512", not non_uniform,
             "非 512² 的有 %d 个：%s" % (len(non_uniform), non_uniform[:3]))
 
-
-def main():
-    parser = argparse.ArgumentParser(description="WinApkInfo 修复验证")
-    parser.add_argument("--quick", action="store_true", help="跳过真实 APK 端到端")
-    parser.add_argument("--samples", type=int, default=0, help="端到端最多测几个 APK（0=全部）")
-    args = parser.parse_args()
-
-    silence_dialogs()
-    # 故意注入的异常会在应用日志里打 traceback，这里降噪以免干扰验证输出
-    logging.getLogger().setLevel(logging.CRITICAL)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
-    print("WinApkInfo 修复验证 · Python %s" % sys.version.split()[0])
-
-    check_env()
-    check_p0_1()
-    check_p0_2()
-    check_p0_3()
-    check_p1_4(app)
-    check_p1_5(app)
-    check_p1_6(app)
-    check_p1_7(app)
-    check_p1_8(app)
-    check_d3_supersede(app)
-    check_p2_9()
-    check_p2_10()
-    if not args.quick:
-        check_p2_11()
-    check_p2_12()
-    check_a1(app)
-    check_b1(app)
-    check_b2(not args.quick)
-    check_b3()
-    check_new_fixes()
-    if not args.quick:
-        check_end_to_end(app, args.samples or None)
-
-    return C.summary()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
