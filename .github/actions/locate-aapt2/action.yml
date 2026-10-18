@@ -1,0 +1,29 @@
+name: locate-aapt2
+description: 在 Windows runner 的 Android SDK 中定位 aapt2.exe，导出 AAPT2_PATH 环境变量并加入 PATH。
+
+runs:
+  using: composite
+  steps:
+    - name: Locate aapt2 from Android SDK
+      shell: pwsh
+      run: |
+        $localSdk = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Android\Sdk" } else { $null }
+        $roots = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, $localSdk, "C:\Android\android-sdk") |
+          Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+          Select-Object -Unique
+        $candidates = foreach ($root in $roots) {
+          $buildTools = Join-Path $root "build-tools"
+          if (Test-Path -LiteralPath $buildTools) {
+            Get-ChildItem -LiteralPath $buildTools -Directory |
+              Sort-Object -Property Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "aapt2.exe" }
+          }
+        }
+        $aapt2 = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $aapt2) {
+          throw "aapt2.exe was not found in the Windows runner's Android SDK."
+        }
+        Write-Host "Using aapt2: $aapt2"
+        # build.ps1 通过 -Aapt2Path $env:AAPT2_PATH 使用；测试与子进程通过 PATH 查找
+        "AAPT2_PATH=$aapt2" >> $env:GITHUB_ENV
+        "$(Split-Path -Parent $aapt2)" >> $env:GITHUB_PATH

@@ -19,8 +19,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: lint & test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Locate aapt2 from Android SDK
+        uses: ./.github/actions/locate-aapt2
+
+      - name: Run linter (ruff check)
+        run: python -m ruff check .
+
+      - name: Run tests (pytest)
+        run: python -m pytest tests -v -ra
+
   build:
     name: build (${{ matrix.mode }})
+    needs: test
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -43,30 +72,12 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
       - name: Locate aapt2 from Android SDK
-        shell: pwsh
-        run: |
-          $localSdk = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Android\Sdk" } else { $null }
-          $roots = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, $localSdk, "C:\Android\android-sdk") |
-            Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-            Select-Object -Unique
-          $candidates = foreach ($root in $roots) {
-            $buildTools = Join-Path $root "build-tools"
-            if (Test-Path -LiteralPath $buildTools) {
-              Get-ChildItem -LiteralPath $buildTools -Directory |
-                Sort-Object -Property Name -Descending |
-                ForEach-Object { Join-Path $_.FullName "aapt2.exe" }
-            }
-          }
-          $aapt2 = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-          if (-not $aapt2) {
-            throw "aapt2.exe was not found in the Windows runner's Android SDK."
-          }
-          Write-Host "Using aapt2: $aapt2"
-          "AAPT2_PATH=$aapt2" >> $env:GITHUB_ENV
+        uses: ./.github/actions/locate-aapt2
 
+      # lint 与测试已由 test job 完成，这里只打包（内部仍会跑产物 --self-test）
       - name: Build and package
         shell: pwsh
-        run: .\build.ps1 -Mode ${{ matrix.mode }} -Aapt2Path $env:AAPT2_PATH -Clean
+        run: .\build.ps1 -Mode ${{ matrix.mode }} -Aapt2Path $env:AAPT2_PATH -Clean -SkipTests
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
