@@ -37,7 +37,7 @@
 ## 运行环境
 
 - Windows 10/11（x64）
-- Python 3.10+
+- Python 3.14
 - `aapt2`（解析 APK 时必需）
 
 ## 从源码运行
