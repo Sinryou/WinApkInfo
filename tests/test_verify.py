@@ -2,6 +2,7 @@
 """标准测试适配入口，支持 pytest 与 python -m unittest 自动发现执行。"""
 import io
 import os
+import re
 import sys
 import glob
 import shutil
@@ -17,6 +18,7 @@ if ROOT_DIR not in sys.path:
 
 from PyQt6 import QtWidgets
 import core.aapt as aapt_mod
+import core.apk_parser as apk_parser_mod
 import core.signature as sig_mod
 import core.resources as res_mod
 import core.vector as vec_mod
@@ -151,6 +153,49 @@ class TestIconTypeSniffing(unittest.TestCase):
             self.assertTrue(data.startswith(b"\x89PNG"))
         finally:
             os.remove(apk_path)
+
+
+class TestMiniFixtureAPK(unittest.TestCase):
+    """迷你 APK 固件：CI 上也能跑的端到端链路（badging → 图标提取）。
+
+    testSample/ 不入库，CI 此前只验证 aapt2 可运行；固件由
+    scripts/make_mini_apk.py 生成并入库，覆盖自适应图标 + 矢量栅格化
+    与位图归一化两条路径。
+    """
+
+    FIXTURE = os.path.join(ROOT_DIR, "tests", "fixtures", "mini.apk")
+
+    def setUp(self):
+        if not os.path.isfile(self.FIXTURE):
+            self.skipTest("缺少 tests/fixtures/mini.apk（运行 scripts/make_mini_apk.py 生成）")
+        try:
+            aapt_mod.find_aapt2()
+        except Exception as e:
+            self.skipTest("aapt2 不可用：%s" % e)
+
+    def test_badging(self):
+        info = apk_parser_mod.parse_aapt2_output(
+            aapt_mod.run_aapt2_dump_badging(self.FIXTURE))
+        self.assertEqual(info["package_name"], "com.example.miniapk")
+        self.assertEqual(info["version_name"], "1.0")
+        self.assertTrue(info["icons"], "固件应包含 application-icon 条目")
+        self.assertTrue(any(p.lower().endswith(".xml") for p in info["icons"].values()))
+
+    def test_adaptive_and_bitmap_icon(self):
+        info = apk_parser_mod.parse_aapt2_output(
+            aapt_mod.run_aapt2_dump_badging(self.FIXTURE))
+        xml_icon = max(info["icons"].items(), key=lambda kv: int(kv[0]))[1]
+        image, data = IconWorker()._extract(self.FIXTURE, xml_icon)
+        self.assertFalse(image.isNull())
+        self.assertEqual((image.width(), image.height()), (512, 512))
+        self.assertTrue(data.startswith(b"\x89PNG"))
+
+        full_res = aapt_mod.run_aapt2_dump_resource(self.FIXTURE) or ""
+        pngs = re.findall(r"\(file\)\s*(res/\S+\.png)", full_res)
+        self.assertTrue(pngs, "固件应包含位图图标")
+        image2, data2 = IconWorker()._extract(self.FIXTURE, pngs[-1])
+        self.assertEqual((image2.width(), image2.height()), (512, 512))
+        self.assertTrue(data2.startswith(b"\x89PNG"))
 
 
 class TestGradientRendering(unittest.TestCase):

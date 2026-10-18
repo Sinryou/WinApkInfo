@@ -105,6 +105,12 @@ python main.py --version         # 打印版本
 python main.py --self-test       # 检查 aapt2 与随包资源
 ```
 
+`testSample/` 不入库。没有真实样本时（例如 CI），`build.ps1` 会用仓库内置的
+`tests/fixtures/mini.apk` 作为 `--self-test` 样本，保证打包产物的图标提取链路
+（badging → 自适应图标 → 矢量栅格化）也会被验证。该固件由
+`python scripts/make_mini_apk.py` 生成（只需 aapt2 + Pillow，不依赖 Android SDK
+或 `android.jar`），需要时重新生成并提交即可。
+
 ### 持续集成
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) 会在 Windows runner 上构建 `onedir` 与 `onefile` 两种产物并上传 artifact；推送 `v*` 标签时会自动创建 GitHub Release 并附带 zip 与校验文件。

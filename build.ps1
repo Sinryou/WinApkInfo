@@ -249,17 +249,24 @@ if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
 
 Write-Step "Running packaged self-test"
 $selfTestArgument = "--self-test"
+$sample = $null
 $sampleDir = Join-Path $ProjectRoot "testSample"
 if (Test-Path -LiteralPath $sampleDir -PathType Container) {
     $sample = Get-ChildItem -LiteralPath $sampleDir -Filter "*.apk" -File -ErrorAction SilentlyContinue |
         Sort-Object -Property Length |
         Select-Object -First 1
-    if ($sample) {
-        # 本地有样本时顺带验证打包后的 aapt2 + 图标提取链路；CI 没有样本，
-        # 只做资源/aapt2 基础自检。
-        $selfTestArgument = '--self-test "{0}"' -f ($sample.FullName -replace '"', '\"')
-        Write-Host "Sample APK: $($sample.FullName)"
+}
+if (-not $sample) {
+    # testSample/ 不入库：退化到仓库内置的迷你固件，保证 CI 上也能验证
+    # 打包产物的图标提取链路（自适应图标 + 矢量栅格化），而不是只查资源。
+    $fixture = Join-Path $ProjectRoot "tests\fixtures\mini.apk"
+    if (Test-Path -LiteralPath $fixture -PathType Leaf) {
+        $sample = Get-Item -LiteralPath $fixture
     }
+}
+if ($sample) {
+    $selfTestArgument = '--self-test "{0}"' -f ($sample.FullName -replace '"', '\"')
+    Write-Host "Sample APK: $($sample.FullName)"
 }
 $selfTest = Start-Process -FilePath $exePath -ArgumentList $selfTestArgument `
     -WorkingDirectory (Split-Path -Parent $exePath) -Wait -PassThru
