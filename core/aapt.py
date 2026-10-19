@@ -9,6 +9,7 @@ import tempfile
 import logging
 import shutil
 import functools
+from collections import OrderedDict
 from pathlib import Path
 
 # subprocess.CREATE_NO_WINDOW 仅存在于 Windows；macOS/Linux 上访问会在运行时报
@@ -123,6 +124,8 @@ class _Aapt2OutputCache:
 
     内存层同样有字节上限：capacity 只能限制条数，单条 resources dump
     可达几十 MB，必须再按总字节淘汰，避免长时间运行累积成数百 MB。
+    淘汰按 LRU：get 命中会刷新条目新鲜度，反复查看的 dump 不会被挤掉。
+
     """
 
     # 单条超过 8MB 的 dump 不落盘（Play 商店包实测单条 resources dump 36MB）
@@ -136,8 +139,7 @@ class _Aapt2OutputCache:
     def __init__(self, capacity=64, disk_dir=None, disk_limit=None,
                  disk_max_bytes=None, disk_max_entry=None, mem_max_bytes=None):
         self._capacity = capacity
-        self._cache = {}
-        self._order = []
+        self._cache = OrderedDict()  # 键 → 输出文本；move_to_end 实现 LRU 淘汰
         self._sizes = {}
         self._mem_bytes = 0
         self._mem_max_bytes = self.MEM_MAX_BYTES if mem_max_bytes is None else mem_max_bytes
@@ -157,6 +159,7 @@ class _Aapt2OutputCache:
     def get(self, key):
         with self._lock:
             if key in self._cache:
+                self._cache.move_to_end(key)  # 命中刷新新鲜度
                 return self._cache[key]
         text = self._disk_get(key)
         if text is not None:
@@ -173,14 +176,12 @@ class _Aapt2OutputCache:
         """清空内存层（磁盘层保留，测试与调优用）。"""
         with self._lock:
             self._cache.clear()
-            del self._order[:]
             self._sizes.clear()
             self._mem_bytes = 0
 
     def _evict_oldest(self):
-        """从内存层淘汰最旧一条（调用方需持有 _lock）。"""
-        old = self._order.pop(0)
-        self._cache.pop(old, None)
+        """从内存层淘汰最久未用一条（调用方需持有 _lock）。"""
+        old, _ = self._cache.popitem(last=False)
         self._mem_bytes -= self._sizes.pop(old, 0)
 
     def _remember(self, key, value):
@@ -193,16 +194,15 @@ class _Aapt2OutputCache:
             size = 0
         if key in self._cache:
             self._mem_bytes -= self._sizes.get(key, 0)
-        else:
-            self._order.append(key)
+            self._cache.move_to_end(key)
         self._cache[key] = value
         self._sizes[key] = size
         self._mem_bytes += size
         # 条数上限与字节上限同时生效；至少保留一条，避免单条超大 dump
         # 每次都因为超限被立刻淘汰、导致 aapt2 反复重跑。
-        while len(self._order) > self._capacity and self._order:
+        while len(self._cache) > self._capacity:
             self._evict_oldest()
-        while self._mem_bytes > self._mem_max_bytes and len(self._order) > 1:
+        while self._mem_bytes > self._mem_max_bytes and len(self._cache) > 1:
             self._evict_oldest()
 
     # ---------------- 磁盘层 ----------------
@@ -335,18 +335,30 @@ def _default_disk_cache_dir():
 _aapt2_cache = _Aapt2OutputCache(disk_dir=_default_disk_cache_dir())
 
 
+_aapt2_identity_cache = None
+
+
 def _aapt2_cache_identity():
     """返回 aapt2 工具的 (路径, mtime_ns, size)，找不到时返回空标识。
 
     缓存键必须包含工具版本信息：升级随包 aapt2 后，dump 的格式或行为
     可能变化，仅靠 APK 的 mtime/size 无法让旧输出失效。
+
+    结果在首次成功探测后缓存：一次图标提取会构建多次缓存键，每次都
+    重新 stat aapt2.exe 属于纯浪费。探测失败不缓存，与 find_aapt2 的
+    行为一致——装好 aapt2 后下次调用仍可重新探测。
     """
+    global _aapt2_identity_cache
+    if _aapt2_identity_cache is not None:
+        return _aapt2_identity_cache
     try:
         path = find_aapt2()
         st = os.stat(path)
-        return (path, st.st_mtime_ns, st.st_size)
     except Exception:
         return ("", 0, 0)
+    # 双线程首次并发探测最多重复 stat 一次，写入同一值，无需加锁
+    _aapt2_identity_cache = (path, st.st_mtime_ns, st.st_size)
+    return _aapt2_identity_cache
 
 
 def _aapt2_cache_key(apk_path: str, kind: str, arg=None):

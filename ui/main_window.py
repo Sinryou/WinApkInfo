@@ -350,12 +350,19 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             info = parse_aapt2_output(self._raw_output)
             self._parsed_info = info
-            self.fill_info(info)
+            # 重新解析的是同一份 badging：图标已属于当前 APK，不必重跑
+            # 整条提取链路（xmltree/resources dump + 栅格化）。
+            self.fill_info(info, refresh_icon=False)
         except Exception as e:
             logging.exception("重新解析失败: %s", e)
             QtWidgets.QMessageBox.critical(self, "错误", f"重新解析失败：\n{e}")
 
-    def fill_info(self, info: dict):
+    def fill_info(self, info: dict, refresh_icon: bool = True):
+        """把解析结果填进各控件并触发图标提取。
+
+        refresh_icon=False 时跳过图标提取与状态清理（重新解析同一份
+        badging 用）：此时界面上的图标仍属于当前 APK，重跑提取纯属浪费。
+        """
         # 顶部字段
         self.le_app_name.setText(info.get("app_name", ""))
         self.le_pkg.setText(info.get("package_name", ""))
@@ -449,6 +456,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.te_other["edit"].setPlainText("\n".join(other) if other else "(无)")
 
+        # 生成重命名预览
+        app_name = self.le_app_name.text().strip() or "App"
+        ver_text = info.get('version_name', '').strip() or "0.0"
+        self.rename_preview.setText(_sanitize_apk_name(f"{app_name}_{ver_text}"))
+
+        if not refresh_icon:
+            return
+
         # 提取图标：先无条件清空上一轮的图标/提示。新 APK 没有图标时，
         # 旧的 pixmap、导出字节和上次的失败提示都不能继续留在界面上。
         self.icon_label.clear()
@@ -472,11 +487,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 logging.exception("提取图标失败: %s", e)
         else:
             self.lbl_icon_hint.setText("未找到可读取的 APK 文件")
-
-        # 生成重命名预览
-        app_name = self.le_app_name.text().strip() or "App"
-        ver_text = info.get('version_name', '').strip() or "0.0"
-        self.rename_preview.setText(_sanitize_apk_name(f"{app_name}_{ver_text}"))
 
     def copy_summary(self):
         lines = []
