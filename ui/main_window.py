@@ -10,7 +10,9 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from version import __version__
 from core.aapt import kill_running_aapt2, get_disk_cache_info, clear_disk_cache
 from core.resources import local_resource_path, load_sdk_versions
-from core.apk_parser import _sanitize_apk_name, parse_aapt2_output, _CHINESE_LOCALE_PRIORITY
+from core.apk_parser import (
+    _sanitize_apk_name, _sanitize_filename, parse_aapt2_output, _CHINESE_LOCALE_PRIORITY
+)
 from ui.workers import IconWorker, ApkInfoWorker
 from ui.widgets import DropLineEdit
 
@@ -31,6 +33,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 避免解析失败后残留的占位文本被当成真实输出。
         self._raw_output = ""
         self._parse_ok_path = ""
+        self._parsed_info = {}
         # 基础解析线程（单常驻线程 + 最新请求覆盖）与向后兼容引用列表
         self._apk_worker = None
         self._apk_gen = 0
@@ -184,6 +187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """清空上一轮的输出、图标、提示与重命名预览状态，并作废在途图标提取。"""
         self._raw_output = ""
         self._parse_ok_path = ""
+        self._parsed_info = {}
         self._current_icon_bytes = None
         self.icon_label.clear()
         self.btn_export_icon.setVisible(False)
@@ -316,6 +320,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # 先记录原始输出：解析成功与否都不影响后续“重新解析”使用真实文本
             self._raw_output = output
             info = parse_aapt2_output(output)
+            self._parsed_info = info
             self.fill_info(info)
             self._parse_ok_path = self._apk_path
         except Exception as e:
@@ -344,6 +349,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             info = parse_aapt2_output(self._raw_output)
+            self._parsed_info = info
             self.fill_info(info)
         except Exception as e:
             logging.exception("重新解析失败: %s", e)
@@ -576,12 +582,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_icon_bytes = None
         self.btn_export_icon.setVisible(False)
 
+    def _default_export_icon_path(self) -> str:
+        """根据当前已解析的 APK 信息生成智能默认导出图标路径（含目录与文件名）。
+
+        命名策略：
+        1. 优先使用重命名预览框中的基础名称（若有微调，以微调后的为主），追加 `_icon.png`；
+        2. 其次使用 `{app_name}_{version_name}_icon.png` 或 `{app_name}_icon.png`；
+        3. 再退回 `{package_name}_icon.png`；
+        4. 兜底为 `app_icon.png`；
+        5. 保存目录优先定位到当前 APK 文件所在目录，方便用户就近查找。
+        """
+        stem = ""
+        preview = self.rename_preview.text().strip()
+        if preview:
+            stem = preview[:-4] if preview.lower().endswith(".apk") else preview
+            stem = stem.rstrip(" .")
+
+        if not stem:
+            app_name = self.le_app_name.text().strip()
+            info = getattr(self, "_parsed_info", {}) or {}
+            ver_text = info.get("version_name", "").strip()
+            if not ver_text:
+                ver_raw = self.le_ver.text().strip()
+                if ver_raw:
+                    ver_text = ver_raw.split("/")[0].strip()
+            if app_name and ver_text:
+                stem = f"{app_name}_{ver_text}"
+            elif app_name:
+                stem = app_name
+            elif self.le_pkg.text().strip():
+                stem = self.le_pkg.text().strip()
+
+        if stem:
+            default_filename = _sanitize_filename(f"{stem}_icon", ext=".png")
+        else:
+            default_filename = "app_icon.png"
+
+        if not default_filename:
+            default_filename = "app_icon.png"
+
+        apk_path = self._current_apk_path()
+        if apk_path and os.path.isfile(apk_path):
+            apk_dir = os.path.dirname(os.path.abspath(apk_path))
+            if os.path.isdir(apk_dir):
+                return os.path.join(apk_dir, default_filename)
+
+        return default_filename
+
     def export_icon(self):
         if not self._current_icon_bytes:
             QtWidgets.QMessageBox.warning(self, "提示", "当前没有可导出的图标。")
             return
+        default_target = self._default_export_icon_path()
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "保存图标", "app_icon.png", "PNG 图片 (*.png)"
+            self, "保存图标", default_target, "PNG 图片 (*.png)"
         )
         if path:
             try:

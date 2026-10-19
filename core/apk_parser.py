@@ -437,6 +437,30 @@ def parse_aapt2_output(text: str) -> dict:
     return info
 
 
+def _sanitize_filename(name: str, ext: str = "") -> str:
+    """把应用名/文件名整理成合法的 Windows 文件名（可选指定扩展名）。
+
+    - 非法字符（\\ / : * ? " < > | 与控制字符）替换为下划线；
+    - 去掉结尾的点和空格：Windows 会静默丢弃它们，生成的文件名与预期不符；
+    - 保留设备名（CON / NUL / COM1 …）加下划线前缀规避；
+    - 若指定 ext，先去除已有相同扩展名，最后统一附上指定扩展名；
+    - 全部被清理掉时返回空串。
+    """
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", (name or "").strip())
+    if ext:
+        ext_clean = ext if ext.startswith(".") else f".{ext}"
+        if stem.lower().endswith(ext_clean.lower()):
+            stem = stem[:-len(ext_clean)]
+    else:
+        ext_clean = ""
+    stem = stem.rstrip(" .")
+    if not stem:
+        return ""
+    if stem.upper() in _RESERVED_NAMES:
+        stem = "_" + stem
+    return stem + ext_clean
+
+
 def _sanitize_apk_name(name: str) -> str:
     """把应用名/用户输入整理成合法的 APK 文件名（含 .apk 扩展名）。
 
@@ -445,14 +469,6 @@ def _sanitize_apk_name(name: str) -> str:
     - 保留设备名（CON / NUL / COM1 …）加下划线前缀规避；
     - 全部被清理掉时返回空串，由调用方提示"没有生成新的文件名"。
     """
-    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", (name or "").strip())
-    if stem.lower().endswith(".apk"):
-        stem = stem[:-4]
-    stem = stem.rstrip(" .")
-    if not stem:
-        return ""
-    if stem.upper() in _RESERVED_NAMES:
-        stem = "_" + stem
-    return stem + ".apk"
+    return _sanitize_filename(name, ext=".apk")
 
 

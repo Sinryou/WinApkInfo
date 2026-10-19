@@ -39,6 +39,7 @@ import ui.workers as workers_mod
 from PIL import Image
 from tests import regression_checks
 from ui.workers import IconWorker
+from ui.main_window import MainWindow
 
 
 # 会话级 QApplication 引用：fixture 返回后仍需保活，避免测试中途被回收
@@ -180,6 +181,58 @@ class TestIconTypeSniffing(unittest.TestCase):
             self.assertTrue(data.startswith(b"\x89PNG"))
         finally:
             os.remove(apk_path)
+
+
+class TestSmartIconExportNaming(unittest.TestCase):
+    """测试导出图标智能命名与路径定位逻辑。"""
+
+    def test_sanitize_filename(self):
+        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon.png", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon.PNG", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename("微信_8.0.1", ext=".png"), "微信_8.0.1.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename("CON", ext=".png"), "_CON.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename('a/b:c*?"<>|', ext=".png"), "a_b_c______.png")
+        self.assertEqual(apk_parser_mod._sanitize_filename("   ", ext=".png"), "")
+        self.assertEqual(apk_parser_mod._sanitize_filename("test... ", ext=".png"), "test.png")
+
+    def test_default_export_icon_path(self):
+        _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+        win = MainWindow()
+        try:
+            # 1. 默认兜底
+            self.assertEqual(win._default_export_icon_path(), "app_icon.png")
+
+            # 2. 只有包名
+            win.le_pkg.setText("com.example.demo")
+            self.assertEqual(win._default_export_icon_path(), "com.example.demo_icon.png")
+
+            # 3. 只有应用名
+            win.le_app_name.setText("示例应用")
+            self.assertEqual(win._default_export_icon_path(), "示例应用_icon.png")
+
+            # 4. 应用名 + 版本
+            win.le_ver.setText("1.2.3 / 102")
+            self.assertEqual(win._default_export_icon_path(), "示例应用_1.2.3_icon.png")
+
+            # 5. 重命名预览微调优先
+            win.rename_preview.setText("MyCustomApp_v2.0.apk")
+            self.assertEqual(win._default_export_icon_path(), "MyCustomApp_v2.0_icon.png")
+
+            # 6. 带真实 APK 路径时，输出应位于 APK 所在目录
+            with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
+                tmp_apk = tmp.name
+            try:
+                win._apk_path = tmp_apk
+                export_path = win._default_export_icon_path()
+                expected_dir = os.path.dirname(os.path.abspath(tmp_apk))
+                self.assertEqual(os.path.dirname(export_path), expected_dir)
+                self.assertEqual(os.path.basename(export_path), "MyCustomApp_v2.0_icon.png")
+            finally:
+                if os.path.exists(tmp_apk):
+                    os.remove(tmp_apk)
+        finally:
+            win.close()
 
 
 _VECTOR_ICON_XML = (
