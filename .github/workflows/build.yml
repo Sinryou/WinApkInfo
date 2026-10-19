@@ -85,7 +85,6 @@ jobs:
           name: WinApkInfo-${{ matrix.mode }}
           path: |
             dist/*.zip
-            # dist/*.sha256
           if-no-files-found: error
 
   release:
@@ -107,6 +106,5 @@ jobs:
         with:
           files: |
             dist/*.zip
-            # dist/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
