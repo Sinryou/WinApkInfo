@@ -345,15 +345,15 @@ if (-not $NoZip) {
     }
     Compress-Archive -Path $stageDir -DestinationPath $archivePath -CompressionLevel Optimal
 
-    $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $checksumPath = "$archivePath.sha256"
-    "$hash  $archiveName" | Set-Content -LiteralPath $checksumPath -Encoding ASCII
+    # $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    # $checksumPath = "$archivePath.sha256"
+    # "$hash  $archiveName" | Set-Content -LiteralPath $checksumPath -Encoding ASCII
 
     Write-Step "Build complete"
     Write-Host "Executable : $exePath"
     Write-Host "Archive    : $archivePath"
-    Write-Host "Checksum   : $checksumPath"
-    Write-Host "SHA256     : $hash"
+    # Write-Host "Checksum   : $checksumPath"
+    # Write-Host "SHA256     : $hash"
 }
 else {
     Write-Step "Build complete"
