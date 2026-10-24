@@ -142,6 +142,27 @@ class TestCacheManagement(unittest.TestCase):
         self.assertIsNone(cache.get(("m1",)))
         self.assertEqual(cache.get(("m2",)), "x" * 60)
 
+    def test_oversized_entry_checked_before_encoding(self):
+        """超限的大 dump 不应先编码出完整 bytes 再丢弃。"""
+        tmp = tempfile.mkdtemp(prefix="winapkinfo-test-cache-")
+        cache = aapt_mod._Aapt2OutputCache(disk_dir=tmp, disk_max_entry=1024)
+
+        class HugeAscii(str):
+            def isascii(self):
+                return True
+
+            def __len__(self):
+                return 10 ** 9
+
+            def encode(self, *args, **kwargs):
+                raise AssertionError("超限值不应被 encode")
+
+        try:
+            cache._disk_put(("huge",), HugeAscii("x"))
+            self.assertEqual(os.listdir(tmp), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_cache_key_is_versioned(self):
         key = aapt_mod._aapt2_cache_key(__file__, "badging")
         self.assertEqual(len(key), 7)
@@ -171,6 +192,17 @@ class TestCacheManagement(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_aapt2_timeout_configurable(monkeypatch):
+    monkeypatch.setenv("WINAPKINFO_AAPT2_TIMEOUT", "7")
+    assert aapt_mod._aapt2_timeout() == 7
+    monkeypatch.setenv("WINAPKINFO_AAPT2_TIMEOUT", "0")
+    assert aapt_mod._aapt2_timeout() == 5
+    monkeypatch.setenv("WINAPKINFO_AAPT2_TIMEOUT", "99999")
+    assert aapt_mod._aapt2_timeout() == 3600
+    monkeypatch.setenv("WINAPKINFO_AAPT2_TIMEOUT", "bad")
+    assert aapt_mod._aapt2_timeout() == 60
+
+
 class TestResourceIndex(unittest.TestCase):
     """测试基于 _LazyEntryMap 的资源索引惰性切片。"""
 
@@ -195,6 +227,8 @@ class TestResourceIndex(unittest.TestCase):
         first = res_mod.get_resource_index(text)
         second = res_mod.get_resource_index(text)
         self.assertIs(first, second)
+        res_mod.clear_resource_index_cache()
+        self.assertIsNot(first, res_mod.get_resource_index(text))
         self.assertIsNone(res_mod.get_resource_index(""))
 
 
@@ -422,6 +456,25 @@ class TestIconTypeSniffing(unittest.TestCase):
         finally:
             os.remove(apk_path)
 
+    def test_qt_only_decode_still_produces_export_bytes(self):
+        """Pillow 解码失败、Qt 解码成功时，导出字节仍需生成。"""
+        buf = io.BytesIO()
+        Image.new("RGBA", (32, 32), (0, 128, 255, 255)).save(buf, format="PNG")
+
+        fd, apk_path = tempfile.mkstemp(suffix=".apk", prefix="winapkinfo-test-")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(apk_path, "w") as zf:
+                zf.writestr("res/icon.png", buf.getvalue())
+            with mock.patch.object(workers_mod, "decode_icon_image", return_value=(None, "")):
+                image, data = IconWorker()._extract(apk_path, "res/icon.png")
+            self.assertFalse(image.isNull())
+            self.assertTrue(data.startswith(b"\x89PNG"))
+            with Image.open(io.BytesIO(data)) as exported:
+                self.assertEqual(exported.size, (32, 32))
+        finally:
+            os.remove(apk_path)
+
 
 class TestSmartIconExportNaming(unittest.TestCase):
     """测试导出图标智能命名与路径定位逻辑。"""
@@ -435,6 +488,16 @@ class TestSmartIconExportNaming(unittest.TestCase):
         self.assertEqual(apk_parser_mod.sanitize_filename('a/b:c*?"<>|', ext=".png"), "a_b_c______.png")
         self.assertEqual(apk_parser_mod.sanitize_filename("   ", ext=".png"), "")
         self.assertEqual(apk_parser_mod.sanitize_filename("test... ", ext=".png"), "test.png")
+
+    def test_sanitize_filename_length_cap(self):
+        """超长应用名必须截断到 Windows 可创建的文件名长度。"""
+        long_name = "很长的应用名称" * 40
+        png = apk_parser_mod.sanitize_filename(long_name, ext=".png")
+        apk = apk_parser_mod.sanitize_apk_name(long_name)
+        self.assertLessEqual(len(png), apk_parser_mod._MAX_FILENAME_CHARS)
+        self.assertTrue(png.endswith(".png"))
+        self.assertLessEqual(len(apk), apk_parser_mod._MAX_FILENAME_CHARS)
+        self.assertTrue(apk.endswith(".apk"))
 
     def test_default_export_icon_path(self):
         _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
@@ -643,6 +706,27 @@ class TestBadgingLabelParsing(unittest.TestCase):
         self.assertEqual(info["launchable_activity"], "com.example.MainActivity")
         self.assertEqual(info["features"], ["android.hardware.faketouch"])
 
+    def test_zh_hans_preferred_over_generic(self):
+        """只有 zh-Hans 标签时也必须优先于通用英文标签。"""
+        text = (
+            "package: name='com.example.locale' versionCode='1' versionName='1.0'\n"
+            "application-label:'Default'\n"
+            "application-label-zh-Hans:'中文简体'\n"
+        )
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(info["app_name"], "中文简体")
+
+    def test_zh_variants_preferred_over_generic(self):
+        """裸 zh / zh-MO 等变体也应优先于 generic。"""
+        for locale, label in (("zh", "中文"), ("zh-MO", "澳門"), ("zh-Hant", "繁體")):
+            text = (
+                "package: name='a.b' versionCode='1' versionName='1.0'\n"
+                "application-label:'Default'\n"
+                f"application-label-{locale}:'{label}'\n"
+            )
+            info = apk_parser_mod.parse_aapt2_output(text)
+            self.assertEqual(info["app_name"], label, locale)
+
     def test_quoted_list_fields(self):
         """supports-screens / densities / locales 一串单引号值的提取。"""
         text = (
@@ -842,9 +926,12 @@ def test_adaptive_icon_failed_dump_is_attempted_once(monkeypatch):
                         lambda apk: dump_calls.append(apk) or None)
     monkeypatch.setattr(workers_mod, "find_mipmap_fallback", lambda *a: None)
 
-    image, data = workers_mod._adaptive_icon_result("x.apk", "res/icon.xml", lambda: None)
+    reasons = []
+    image, data = workers_mod._adaptive_icon_result(
+        "x.apk", "res/icon.xml", lambda: None, reason_out=reasons)
     assert image is None and data == b""
     assert len(dump_calls) == 1, dump_calls
+    assert reasons and "资源表 dump 失败" in reasons[0]
 
 
 def test_empty_resource_sentinel_prevents_retry():
