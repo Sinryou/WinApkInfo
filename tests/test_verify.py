@@ -431,6 +431,36 @@ class TestBadgingLabelParsing(unittest.TestCase):
         info = apk_parser_mod.parse_aapt2_output(text)
         self.assertEqual(info["app_name"], "McDonald's App")
 
+    def test_version_name_and_icon_path_unescaped(self):
+        """versionName 与图标路径也是自由字符串，同样必须支持转义引号。"""
+        text = (
+            "package: name='com.example.demo' versionCode='1' "
+            "versionName='8.0 \\'Oreo\\''\n"
+            "application-icon-480:'res/ic\\'on.png'\n"
+            "launchable-activity: name='com.example.MainActivity'\n"
+            "uses-feature: name='android.hardware.faketouch'\n"
+        )
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(info["version_name"], "8.0 'Oreo'")
+        self.assertEqual(info["icons"]["480"], "res/ic'on.png")
+        self.assertEqual(info["launchable_activity"], "com.example.MainActivity")
+        self.assertEqual(info["features"], ["android.hardware.faketouch"])
+
+    def test_quoted_list_fields(self):
+        """supports-screens / densities / locales 一串单引号值的提取。"""
+        text = (
+            "package: name='a.b' versionCode='1' versionName='1.0'\n"
+            "supports-screens: 'small' 'normal' 'xlarge'\n"
+            "supports-any-density: 'true'\n"
+            "densities: '160' '480'\n"
+            "locales: '--_--' 'zh-CN' 'en-US'\n"
+        )
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(info["supports_screens"], ["small", "normal", "xlarge"])
+        self.assertEqual(info["supports_any_density"], "true")
+        self.assertEqual(info["densities"], ["160", "480"])
+        self.assertEqual(info["locales"], ["--_--", "zh-CN", "en-US"])
+
     def test_permissions_extraction_and_sdk23(self):
         text = (
             "package: name='com.example.demo' versionCode='1' versionName='1.0'\n"

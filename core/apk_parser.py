@@ -19,8 +19,9 @@ _ICON_SIZE = 512
 _CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
 
 # badging 的字符串值包在单引号里，值内的 ' 与 \ 会被 aapt2 转义成 \' 与 \\。
-# [^']* 在转义引号处提前截断：含撇号的标签（如 It\'s）会被剪断，
-# 甚至把后续字段吞进匹配。用支持转义的引号模式取值，再统一还原。
+# [^']* 在转义引号处提前截断：含撇号的值（如 versionName='It\'s'）会被剪断，
+# 甚至把后续字段吞进匹配。badging 里所有单引号值统一用本模式取值，
+# 再经 _unescape_badging_value 还原。
 _BADGING_QUOTED = r"'((?:[^'\\]|\\.)*)'"
 
 
@@ -330,47 +331,45 @@ def parse_aapt2_output(text: str) -> dict:
     # package 行的属性顺序随 aapt2 版本变化（如 versionCodeMajor 可能插在
     # versionCode 与 versionName 之间），整行一次性匹配会让包名与版本号
     # 全部丢失；先截取 package 行，再逐个属性独立提取。
+    # 所有单引号值统一用支持转义的引号模式取值：versionName 等自由字符串
+    # 含撇号时 aapt2 写作 \'，裸 [^']+ 会在转义引号处提前截断。
     m_pkg = re.search(r"package:\s[^\n]*", text)
     if m_pkg:
         pkg_line = m_pkg.group(0)
-        m_name = re.search(r"\bname='([^']+)'", pkg_line)
+        m_name = re.search(r"\bname=" + _BADGING_QUOTED, pkg_line)
         if m_name:
-            info["package_name"] = m_name.group(1)
-        m_vcode = re.search(r"\bversionCode='([^']+)'", pkg_line)
+            info["package_name"] = _unescape_badging_value(m_name.group(1))
+        m_vcode = re.search(r"\bversionCode=" + _BADGING_QUOTED, pkg_line)
         if m_vcode:
-            info["version_code"] = m_vcode.group(1)
-        m_vname = re.search(r"\bversionName='([^']+)'", pkg_line)
+            info["version_code"] = _unescape_badging_value(m_vcode.group(1))
+        m_vname = re.search(r"\bversionName=" + _BADGING_QUOTED, pkg_line)
         if m_vname:
-            info["version_name"] = m_vname.group(1)
+            info["version_name"] = _unescape_badging_value(m_vname.group(1))
 
     # 平台/编译 SDK
-    m_plat = re.search(
-        r"platformBuildVersionName='([^']+)'", text
-    )
+    m_plat = re.search(r"platformBuildVersionName=" + _BADGING_QUOTED, text)
     if m_plat:
-        info["platform_build_version_name"] = m_plat.group(1)
+        info["platform_build_version_name"] = _unescape_badging_value(m_plat.group(1))
 
-    m_platc = re.search(
-        r"platformBuildVersionCode='([^']+)'", text
-    )
+    m_platc = re.search(r"platformBuildVersionCode=" + _BADGING_QUOTED, text)
     if m_platc:
-        info["platform_build_version_code"] = m_platc.group(1)
+        info["platform_build_version_code"] = _unescape_badging_value(m_platc.group(1))
 
-    m_compile = re.search(r"compileSdkVersion='([^']+)'", text)
+    m_compile = re.search(r"compileSdkVersion=" + _BADGING_QUOTED, text)
     if m_compile:
-        info["compile_sdk_version"] = m_compile.group(1)
+        info["compile_sdk_version"] = _unescape_badging_value(m_compile.group(1))
 
-    m_compile_code = re.search(r"compileSdkVersionCodename='([^']+)'", text)
+    m_compile_code = re.search(r"compileSdkVersionCodename=" + _BADGING_QUOTED, text)
     if m_compile_code:
-        info["compile_sdk_codename"] = m_compile_code.group(1)
+        info["compile_sdk_codename"] = _unescape_badging_value(m_compile_code.group(1))
 
     # Sdk 版本
-    m_min = re.search(r"minSdkVersion:'([^']+)'", text)
+    m_min = re.search(r"minSdkVersion:" + _BADGING_QUOTED, text)
     if m_min:
-        info["min_sdk"] = m_min.group(1)
-    m_target = re.search(r"targetSdkVersion:'([^']+)'", text)
+        info["min_sdk"] = _unescape_badging_value(m_min.group(1))
+    m_target = re.search(r"targetSdkVersion:" + _BADGING_QUOTED, text)
     if m_target:
-        info["target_sdk"] = m_target.group(1)
+        info["target_sdk"] = _unescape_badging_value(m_target.group(1))
 
     # --- 应用名（多语言） ---
     for loc, label in re.findall(r"application-label-([\w-]+):" + _BADGING_QUOTED, text):
@@ -397,11 +396,9 @@ def parse_aapt2_output(text: str) -> dict:
         )
 
     # --- 可启动 Activity ---
-    m_launch = re.search(
-        r"launchable-activity:\s+name='([^']*)'(?:\s+label='([^']*)')?", text
-    )
+    m_launch = re.search(r"launchable-activity:\s+name=" + _BADGING_QUOTED, text)
     if m_launch:
-        info["launchable_activity"] = m_launch.group(1)
+        info["launchable_activity"] = _unescape_badging_value(m_launch.group(1))
 
     # --- 权限 ---
     # 支持 uses-permission 与 uses-permission-sdk-23，保持顺序去重并支持转义单引号
@@ -413,37 +410,41 @@ def parse_aapt2_output(text: str) -> dict:
     info["permissions"] = perms
 
     # --- Feature ---
-    info["features"] = re.findall(r"uses-feature:\s+name='([^']+)'", text)
-    info["implied_features"] = re.findall(r"uses-implied-feature:\s+name='([^']+)'", text)
+    info["features"] = [
+        _unescape_badging_value(v)
+        for v in re.findall(r"uses-feature:\s+name=" + _BADGING_QUOTED, text)
+    ]
+    info["implied_features"] = [
+        _unescape_badging_value(v)
+        for v in re.findall(r"uses-implied-feature:\s+name=" + _BADGING_QUOTED, text)
+    ]
 
-    # --- 支持屏幕/密度/语言 ---
-    m_screens = re.search(r"supports-screens:\s+((?:'[^']+'\s*)+)", text)
-    if m_screens:
-        info["supports_screens"] = re.findall(r"'([^']+)'", m_screens.group(1))
+    # --- 支持屏幕/密度/语言（一行内的一串单引号值） ---
+    def _quoted_list(prefix: str) -> list:
+        m = re.search(prefix + r"\s+((?:" + _BADGING_QUOTED + r"\s*)+)", text)
+        if not m:
+            return []
+        return [_unescape_badging_value(v) for v in re.findall(_BADGING_QUOTED, m.group(1))]
 
-    m_anyden = re.search(r"supports-any-density:\s+'([^']+)'", text)
+    info["supports_screens"] = _quoted_list(r"supports-screens:")
+    info["densities"] = _quoted_list(r"densities:")
+    info["locales"] = _quoted_list(r"locales:")
+
+    m_anyden = re.search(r"supports-any-density:\s+" + _BADGING_QUOTED, text)
     if m_anyden:
-        info["supports_any_density"] = m_anyden.group(1)
-
-    m_dens = re.search(r"densities:\s+((?:'[^']+'\s*)+)", text)
-    if m_dens:
-        info["densities"] = re.findall(r"'([^']+)'", m_dens.group(1))
-
-    m_loc = re.search(r"locales:\s+((?:'[^']+'\s*)+)", text)
-    if m_loc:
-        info["locales"] = re.findall(r"'([^']+)'", m_loc.group(1))
+        info["supports_any_density"] = _unescape_badging_value(m_anyden.group(1))
 
     # --- 图标（按密度） ---
-    for dens, path_ in re.findall(r"application-icon-([0-9]+):'([^']+)'", text):
-        info["icons"][dens] = path_
+    for dens, path_ in re.findall(r"application-icon-([0-9]+):" + _BADGING_QUOTED, text):
+        info["icons"][dens] = _unescape_badging_value(path_)
 
     # 少数 APK 没有 application-icon-* 行，只在 application 节点上有 icon 属性，
     # 此前这种情况会完全不显示图标。用"密度"0 占位，fill_info 取 max() 挑选
     # 最佳密度时不会被它盖过真实密度。
     if not info["icons"]:
-        m_icon = re.search(r"^application:\s[^\n]*?icon='([^']*)'", text, re.M)
+        m_icon = re.search(r"^application:\s[^\n]*?icon=" + _BADGING_QUOTED, text, re.M)
         if m_icon and m_icon.group(1):
-            info["icons"]["0"] = m_icon.group(1)
+            info["icons"]["0"] = _unescape_badging_value(m_icon.group(1))
 
     # --- 支持架构 ---
     archs = []
