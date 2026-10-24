@@ -212,9 +212,14 @@ def _normalize_icon_png(raw: bytes, size: int = _ICON_SIZE):
     位图图标旧实现直接导出 APK 里的原始文件，导出尺寸随资源密度变化，
     与自适应/矢量链路固定的 _ICON_SIZE² 不一致：同一个"导出图标"按钮
     对不同 APK 给出不同规格的文件。
+
+    已经是目标尺寸的 PNG 原样返回：省掉一整圈解码 + LANCZOS + 重编码，
+    且导出字节与 APK 内原始文件逐位一致。
     """
     try:
         with Image.open(io.BytesIO(raw)) as im:
+            if im.size == (size, size) and (im.format or "").upper() == "PNG":
+                return raw
             img = im.convert("RGBA").resize((size, size), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
