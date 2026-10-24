@@ -7,16 +7,16 @@ import logging
 from PIL import Image
 
 from core.aapt import run_aapt2_dump_xmltree
-from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
+from core.colors import FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    _entry_span, extract_resource_entry, _density_of,
-    _pick_best_density, _sniff_file_kind, get_resource_info,
-    BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
+    entry_span, extract_resource_entry, density_of,
+    pick_best_density, sniff_file_kind, get_resource_info,
+    BITMAP_EXTS, MAX_DEREF_DEPTH, open_apk_zip
 )
 from core.vector import rasterize_vector_layer
 
-_ICON_SIZE = 512
-_CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
+ICON_SIZE = 512
+CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
 
 # badging 的字符串值包在单引号里，值内的 ' 与 \ 会被 aapt2 转义成 \' 与 \\。
 # [^']* 在转义引号处提前截断：含撇号的值（如 versionName='It\'s'）会被剪断，
@@ -116,13 +116,13 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
     另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）
     以及应用内资源别名——`() @0x7f......`（数字形式）与 `() @color/......`
     （aapt2 2.20+ 的命名形式，如 pixiv 6.201 的 adaptive 背景）都能跟随。
-    index 为 _ResourceIndex 时条目查询 O(1)。支持传入已有 zf 句柄以复用 I/O。
+    index 为 ResourceIndex 时条目查询 O(1)。支持传入已有 zf 句柄以复用 I/O。
     """
     rid = (res_id or "").lower()
     if rid.startswith("0x01"):
         # 框架资源（android 包）：资源表里没有，走内置颜色表
-        if rid in _FRAMEWORK_COLOR_MAP:
-            return ("color", _FRAMEWORK_COLOR_MAP[rid], None)
+        if rid in FRAMEWORK_COLOR_MAP:
+            return ("color", FRAMEWORK_COLOR_MAP[rid], None)
         if rid.startswith("0x0106"):  # 框架 color 类型
             return ("color", "#00000000", None)  # 未知框架颜色按透明处理
         return (None, None, None)
@@ -130,7 +130,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
     kind, value = info["type"], info["value"]
     if kind in ("color", "image"):
         return (kind, value, None)
-    if depth >= _MAX_DEREF_DEPTH:
+    if depth >= MAX_DEREF_DEPTH:
         return ("vector", value, None) if kind == "vector" else (None, None, None)
     if kind == "ref" and value:
         # 应用内别名：继续跟随（目标可能是颜色/位图/矢量，也可能是框架颜色）
@@ -141,7 +141,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
             return ("image", value, None)
         if ext == ".xml":
             return _resolve_xml_wrapper(apk_path, full_res, value, depth, index, zf=zf)
-        sniffed = _sniff_file_kind(apk_path, value, zf=zf)
+        sniffed = sniff_file_kind(apk_path, value, zf=zf)
         if sniffed == "image":
             return ("image", value, None)
         if sniffed == "xml":
@@ -161,7 +161,7 @@ def _collect_bitmap_variants(entry_text: str) -> dict:
     for line in (entry_text or "").splitlines():
         m = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
         if m and m.group(2).lower().endswith(BITMAP_EXTS):
-            variants[_density_of(m.group(1))] = m.group(2)
+            variants[density_of(m.group(1))] = m.group(2)
     return variants
 
 
@@ -170,13 +170,13 @@ def find_mipmap_fallback(full_res: str, icon_xml_path: str, index=None):
     自适应图标（.xml）无法整体栅格化时的回退：
     找到包含该 icon xml 的资源条目（通常是 mipmap/ic_launcher），
     返回其最高密度的位图变体路径（即 8.0 之前使用的传统回退图标）。
-    传入 index（_ResourceIndex）时 O(1) 查询。
+    传入 index（ResourceIndex）时 O(1) 查询。
     """
     if index is not None:
         entry = index.by_file.get(icon_xml_path)
         if entry is None:
             return None
-        return _pick_best_density(_collect_bitmap_variants(entry))
+        return pick_best_density(_collect_bitmap_variants(entry))
 
     lines = (full_res or "").splitlines()
     target = None
@@ -190,8 +190,8 @@ def find_mipmap_fallback(full_res: str, icon_xml_path: str, index=None):
     start = target
     while start > 0 and not lines[start - 1].strip().startswith("resource 0x"):
         start -= 1
-    a, b = _entry_span(lines, start)
-    return _pick_best_density(_collect_bitmap_variants("\n".join(lines[a:b])))
+    a, b = entry_span(lines, start)
+    return pick_best_density(_collect_bitmap_variants("\n".join(lines[a:b])))
 
 
 
@@ -212,17 +212,17 @@ def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None, 
             return img
         raise ValueError(f"矢量图标栅格化失败: {res_path_or_color['value']}")
     # 位图文件
-    with _open_apk_zip(apk_path, zf) as apk:
+    with open_apk_zip(apk_path, zf) as apk:
         with apk.open(res_path_or_color["value"]) as f:
             img = Image.open(f).convert("RGBA")
     return img.resize((size, size), Image.LANCZOS)
 
 
-def _normalize_icon_png(raw: bytes, size: int = _ICON_SIZE):
+def normalize_icon_png(raw: bytes, size: int = ICON_SIZE):
     """把任意可解码的位图字节统一成 size×size 的 PNG；解不了返回 None。
 
     位图图标旧实现直接导出 APK 里的原始文件，导出尺寸随资源密度变化，
-    与自适应/矢量链路固定的 _ICON_SIZE² 不一致：同一个"导出图标"按钮
+    与自适应/矢量链路固定的 ICON_SIZE² 不一致：同一个"导出图标"按钮
     对不同 APK 给出不同规格的文件。
 
     已经是目标尺寸的 PNG 原样返回：省掉一整圈解码 + LANCZOS + 重编码，
@@ -266,14 +266,14 @@ def _place_by_gravity(size: int, w: int, h: int, gravity: int):
     return x, y
 
 
-def extract_icon_bytes(apk_path, foreground, background, size=_ICON_SIZE, fg_scale=None, full_res=None, index=None, zf=None):
+def extract_icon_bytes(apk_path, foreground, background, size=ICON_SIZE, fg_scale=None, full_res=None, index=None, zf=None):
     """
     自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流。
 
     fg_scale: (width%, height%, gravity)，来自 <scale> 包装 drawable；
               None 表示前景按整层尺寸渲染。
     """
-    with _open_apk_zip(apk_path, zf) as shared_zf:
+    with open_apk_zip(apk_path, zf) as shared_zf:
         # 加载前景
         foreground_img = load_resource(apk_path, foreground, size, full_res, index, zf=shared_zf)
         # 加载背景
@@ -384,7 +384,7 @@ def parse_aapt2_output(text: str) -> dict:
     app_node_label = _unescape_badging_value(m_label_app.group(1)) if m_label_app else ""
 
     # 选择优先中文
-    for pref in _CHINESE_LOCALE_PRIORITY:
+    for pref in CHINESE_LOCALE_PRIORITY:
         if info["app_name_labels"].get(pref):
             info["app_name"] = info["app_name_labels"][pref]
             break
@@ -471,7 +471,7 @@ def pick_best_icon(icons: dict) -> str:
     return max(icons.items(), key=lambda item: int(item[0]))[1]
 
 
-def _sanitize_filename(name: str, ext: str = "") -> str:
+def sanitize_filename(name: str, ext: str = "") -> str:
     """把应用名/文件名整理成合法的 Windows 文件名（可选指定扩展名）。
 
     - 非法字符（\\ / : * ? " < > | 与控制字符）替换为下划线；
@@ -495,7 +495,7 @@ def _sanitize_filename(name: str, ext: str = "") -> str:
     return stem + ext_clean
 
 
-def _sanitize_apk_name(name: str) -> str:
+def sanitize_apk_name(name: str) -> str:
     """把应用名/用户输入整理成合法的 APK 文件名（含 .apk 扩展名）。
 
     - 非法字符（\\ / : * ? " < > | 与控制字符）替换为下划线；
@@ -503,6 +503,6 @@ def _sanitize_apk_name(name: str) -> str:
     - 保留设备名（CON / NUL / COM1 …）加下划线前缀规避；
     - 全部被清理掉时返回空串，由调用方提示"没有生成新的文件名"。
     """
-    return _sanitize_filename(name, ext=".apk")
+    return sanitize_filename(name, ext=".apk")
 
 

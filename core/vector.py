@@ -11,9 +11,9 @@ except ImportError:
     np = None
 
 from core.aapt import run_aapt2_dump_xmltree, run_aapt2_dump_resource
-from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
+from core.colors import FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    extract_resource_entry, get_resource_info, _MAX_DEREF_DEPTH
+    extract_resource_entry, get_resource_info, MAX_DEREF_DEPTH
 )
 from PyQt6 import QtCore, QtGui
 
@@ -819,8 +819,8 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
     if is_hex:
         ref = ref.lower()
         if ref.startswith("0x01"):
-            if ref in _FRAMEWORK_COLOR_MAP:
-                return ("color", parse_android_color(_FRAMEWORK_COLOR_MAP[ref]))
+            if ref in FRAMEWORK_COLOR_MAP:
+                return ("color", parse_android_color(FRAMEWORK_COLOR_MAP[ref]))
             return None
     if not full_res:
         full_res = run_aapt2_dump_resource(apk_path)
@@ -831,11 +831,11 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
         except ValueError:
             return None
     if info["type"] == "ref" and info["value"]:
-        if depth >= _MAX_DEREF_DEPTH:
+        if depth >= MAX_DEREF_DEPTH:
             return None
         target = info["value"]
         if target.lower().startswith("0x01"):
-            c = _FRAMEWORK_COLOR_MAP.get(target.lower())
+            c = FRAMEWORK_COLOR_MAP.get(target.lower())
             if c:
                 try:
                     return ("color", parse_android_color(c))
@@ -862,7 +862,7 @@ def _resolve_gradient_color(apk_path, full_res, value, index=None, depth=0):
     渐变颜色可能是资源引用，_parse_gradient 本身只认识 #hex；
     这里复用 _resolve_vector_fill 的引用链解析，并限制递归深度。
     """
-    if depth >= _MAX_DEREF_DEPTH:
+    if depth >= MAX_DEREF_DEPTH:
         return None
     try:
         resolved = _resolve_vector_fill(apk_path, full_res, value, index, depth + 1)

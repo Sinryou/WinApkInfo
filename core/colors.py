@@ -33,7 +33,7 @@ def parse_android_color(color_str: str):
 # system_* 是 Material You 动态色，设备上可被 OverlayManager 按壁纸替换；
 # 这里使用 AOSP 默认调色板（Pixel 默认主题）。静态解析拿不到用户主题，
 # 取默认值仍能渲染出接近真实图标的颜色，比按"未知"当透明更可用。
-_FRAMEWORK_COLOR_MAP = {
+FRAMEWORK_COLOR_MAP = {
     "0x01060000": "#ffaaaaaa",  # darker_gray
     "0x0106000b": "#ffffffff",  # white
     "0x0106000c": "#ff000000",  # black

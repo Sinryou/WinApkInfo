@@ -973,7 +973,7 @@ def check_b1(app):
         if not xml:
             continue
         full = aapt_mod.run_aapt2_dump_resource(apk)
-        idx = resources_mod._ResourceIndex(full)
+        idx = resources_mod.ResourceIndex(full)
         out = aapt_mod.run_aapt2_dump_xmltree(apk, xml)
         fg = apk_parser_mod.find_adaptive_layer_addr(out, "foreground")
         bg = apk_parser_mod.find_adaptive_layer_addr(out, "background")
@@ -1145,16 +1145,16 @@ def check_new_fixes():
             ext[0] == (-3.0, 0.0) and ext[-1] == (13.0, 0.0), "%r" % (ext,))
 
     # --- 文件名净化 ---
-    sanitized = apk_parser_mod._sanitize_apk_name('a/b:c*?"<>|')
+    sanitized = apk_parser_mod.sanitize_apk_name('a/b:c*?"<>|')
     C.check("文件名净化：非法字符被替换",
             not any(ch in sanitized for ch in '\\/:*?"<>|') and sanitized.endswith(".apk"),
             sanitized)
     C.check("文件名净化：结尾点/空格与保留设备名",
-            apk_parser_mod._sanitize_apk_name("name... ") == "name.apk" and
-            apk_parser_mod._sanitize_apk_name("CON") == "_CON.apk" and
-            apk_parser_mod._sanitize_apk_name("  ") == "" and
-            apk_parser_mod._sanitize_apk_name("微信_8.0.1") == "微信_8.0.1.apk",
-            "%r %r" % (apk_parser_mod._sanitize_apk_name("name... "), apk_parser_mod._sanitize_apk_name("CON")))
+            apk_parser_mod.sanitize_apk_name("name... ") == "name.apk" and
+            apk_parser_mod.sanitize_apk_name("CON") == "_CON.apk" and
+            apk_parser_mod.sanitize_apk_name("  ") == "" and
+            apk_parser_mod.sanitize_apk_name("微信_8.0.1") == "微信_8.0.1.apk",
+            "%r %r" % (apk_parser_mod.sanitize_apk_name("name... "), apk_parser_mod.sanitize_apk_name("CON")))
 
     # --- dump 失败必须可区分 ---
     C.check("dump 失败返回 None（不再把错误文本当输出）",
@@ -1171,11 +1171,11 @@ def check_new_fixes():
     # --- 统一导出规格 ---
     src = io.BytesIO()
     Image.new("RGB", (37, 91), (10, 20, 30)).save(src, format="PNG")
-    out = apk_parser_mod._normalize_icon_png(src.getvalue())
+    out = apk_parser_mod.normalize_icon_png(src.getvalue())
     out_size = Image.open(io.BytesIO(out)).size if out else None
     C.check("位图图标归一化为 512×512", out_size == (512, 512), "%s" % (out_size,))
     C.check("不可解码的字节返回 None（由调用方回退原始字节）",
-            apk_parser_mod._normalize_icon_png(b"not an image") is None)
+            apk_parser_mod.normalize_icon_png(b"not an image") is None)
 
     # --- 子线程只碰 QImage ---
     C.check("图标链路改用 QImage（子线程不再创建 QPixmap）",
@@ -1203,7 +1203,7 @@ def check_new_fixes():
             "%r / %r / %r" % (info_pkg["package_name"], info_pkg["version_code"],
                               info_pkg["version_name"]))
 
-    # --- find_mipmap_fallback 无 index 路径（曾因未导入 _entry_span 抛 NameError）---
+    # --- find_mipmap_fallback 无 index 路径（曾因未导入 entry_span 抛 NameError）---
     fake_res = ("resource 0x7f0e0001 res/mipmap/ic_launcher\n"
                 "    (anydpi-v26) (file) res/mipmap-anydpi-v26/ic_launcher.xml type=XML\n"
                 "    (xxxhdpi) (file) res/mipmap-xxxhdpi-v4/ic_launcher.png type=PNG\n")
@@ -1251,7 +1251,7 @@ def check_end_to_end(app, limit):
                     win.le_app_name.text()[:14], len(data), size or "-", el))
         win.close()
     C.check("全部样本均成功提取图标", ok == len(apks), "%d/%d" % (ok, len(apks)))
-    # 位图/矢量/自适应三条链路统一导出 _ICON_SIZE²，否则"导出图标"给出的
+    # 位图/矢量/自适应三条链路统一导出 ICON_SIZE²，否则"导出图标"给出的
     # 文件规格会随图标类型变化
     C.check("图标导出规格统一为 512×512", not non_uniform,
             "非 512² 的有 %d 个：%s" % (len(non_uniform), non_uniform[:3]))

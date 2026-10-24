@@ -8,11 +8,11 @@ from PIL import Image
 from PyQt6 import QtCore, QtGui
 
 from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2_dump_xmltree
-from core.resources import _ResourceIndex, _open_apk_zip, _sniff_file_kind, BITMAP_EXTS
+from core.resources import ResourceIndex, open_apk_zip, sniff_file_kind, BITMAP_EXTS
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
-    _ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
-    extract_icon_bytes, find_mipmap_fallback, _normalize_icon_png
+    ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
+    extract_icon_bytes, find_mipmap_fallback, normalize_icon_png
 )
 
 class _Cancelled(Exception):
@@ -143,7 +143,7 @@ def _icon_kind(apk_path: str, icon_path: str, zf=None):
     if lower.endswith(".xml"):
         return "xml"
     try:
-        return _sniff_file_kind(apk_path, icon_path, zf=zf)
+        return sniff_file_kind(apk_path, icon_path, zf=zf)
     except Exception as e:
         logging.debug("图标类型嗅探失败 %s: %s", icon_path, e)
         return None
@@ -176,8 +176,8 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
         # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
         # 十几条引用就是数秒），并瞬时产生大量行字符串。
         full_res = run_aapt2_dump_resource(apk_path)
-        index = _ResourceIndex(full_res) if full_res else None
-        img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE, full_res, index)
+        index = ResourceIndex(full_res) if full_res else None
+        img = rasterize_vector_layer(apk_path, icon_path, ICON_SIZE, full_res, index)
         if img is None:
             return b""
         buf = io.BytesIO()
@@ -193,7 +193,7 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
         full_res = run_aapt2_dump_resource(apk_path)
         check()
         # 一次性索引全量输出，后续所有资源条目查询 O(1)
-        index = _ResourceIndex(full_res)
+        index = ResourceIndex(full_res)
         fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
         bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
         check()
@@ -219,12 +219,12 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
     if full_res is None:
         full_res = run_aapt2_dump_resource(apk_path)
         check()
-        index = _ResourceIndex(full_res)
+        index = ResourceIndex(full_res)
     fallback = find_mipmap_fallback(full_res, icon_path, index)
     if fallback:
-        with _open_apk_zip(apk_path, zf) as shared_zf:
+        with open_apk_zip(apk_path, zf) as shared_zf:
             img = Image.open(shared_zf.open(fallback)).convert("RGBA")
-        img = img.resize((_ICON_SIZE, _ICON_SIZE), Image.LANCZOS)
+        img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
@@ -242,15 +242,15 @@ def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
     check = check_cancel or _never_cancelled
     img = QtGui.QImage()
     data = b""
-    with _open_apk_zip(apk_path, zf) as shared_zf:
+    with open_apk_zip(apk_path, zf) as shared_zf:
         kind = _icon_kind(apk_path, icon_path, shared_zf)
         if kind == "image":
             raw = shared_zf.open(icon_path).read()
-            data = _normalize_icon_png(raw) or raw
+            data = normalize_icon_png(raw) or raw
             if not _load_image(img, data):
                 # 后缀可能是伪装/错误的：按魔数再确认一次是否为 XML。
                 # 例如 AndResGuard 有时会把二进制 XML 改名成 .png。
-                if _sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
+                if sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
                     kind = "xml"
                 else:
                     raise ValueError(f"图标文件无法解码为图片: {icon_path}")

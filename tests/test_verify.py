@@ -216,7 +216,7 @@ class TestNamedResourceAlias(unittest.TestCase):
         self.assertEqual(info, {"type": "ref", "value": "0x0106003b"})
 
     def test_extract_entry_by_name_with_index(self):
-        index = res_mod._ResourceIndex(_NAMED_ALIAS_FULL_RES)
+        index = res_mod.ResourceIndex(_NAMED_ALIAS_FULL_RES)
         self.assertIn("#ff0096fa", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "color/brand", index))
         # @ 前缀可带可不带；数字地址不受影响
         self.assertIn("res/Tx.xml", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "@drawable/fg", index))
@@ -233,12 +233,12 @@ class TestNamedResourceAlias(unittest.TestCase):
                 "    () @color/Brand\n"
                 "resource 0x7f060002 color/Brand\n"
                 "    () #ff112233\n")
-        index = res_mod._ResourceIndex(text)
+        index = res_mod.ResourceIndex(text)
         kind, value, scale = apk_parser_mod.resolve_icon_layer("f.apk", text, "0x7f060001", index=index)
         self.assertEqual((kind, value, scale), ("color", "#ff112233", None))
 
     def test_resolve_icon_layer_follows_named_alias(self):
-        index = res_mod._ResourceIndex(_NAMED_ALIAS_FULL_RES)
+        index = res_mod.ResourceIndex(_NAMED_ALIAS_FULL_RES)
         kind, value, scale = apk_parser_mod.resolve_icon_layer(
             "f.apk", _NAMED_ALIAS_FULL_RES, "0x7f0600f1", index=index)
         self.assertEqual((kind, value, scale), ("color", "#ff0096fa", None))
@@ -371,14 +371,14 @@ class TestSmartIconExportNaming(unittest.TestCase):
     """测试导出图标智能命名与路径定位逻辑。"""
 
     def test_sanitize_filename(self):
-        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon", ext=".png"), "app_icon.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon.png", ext=".png"), "app_icon.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename("app_icon.PNG", ext=".png"), "app_icon.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename("微信_8.0.1", ext=".png"), "微信_8.0.1.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename("CON", ext=".png"), "_CON.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename('a/b:c*?"<>|', ext=".png"), "a_b_c______.png")
-        self.assertEqual(apk_parser_mod._sanitize_filename("   ", ext=".png"), "")
-        self.assertEqual(apk_parser_mod._sanitize_filename("test... ", ext=".png"), "test.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("app_icon", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("app_icon.png", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("app_icon.PNG", ext=".png"), "app_icon.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("微信_8.0.1", ext=".png"), "微信_8.0.1.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("CON", ext=".png"), "_CON.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename('a/b:c*?"<>|', ext=".png"), "a_b_c______.png")
+        self.assertEqual(apk_parser_mod.sanitize_filename("   ", ext=".png"), "")
+        self.assertEqual(apk_parser_mod.sanitize_filename("test... ", ext=".png"), "test.png")
 
     def test_default_export_icon_path(self):
         _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])

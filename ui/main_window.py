@@ -12,8 +12,8 @@ from version import __version__
 from core.aapt import kill_running_aapt2, get_disk_cache_info, clear_disk_cache
 from core.resources import local_resource_path, load_sdk_versions
 from core.apk_parser import (
-    _sanitize_apk_name, _sanitize_filename, parse_aapt2_output, pick_best_icon,
-    _CHINESE_LOCALE_PRIORITY
+    sanitize_apk_name, sanitize_filename, parse_aapt2_output, pick_best_icon,
+    CHINESE_LOCALE_PRIORITY
 )
 from ui.workers import IconWorker, ApkInfoWorker
 from ui.widgets import DropLineEdit
@@ -439,7 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
             other.append("")
             other.append("[部分多语言应用名]")
             # 优先展示常见语言
-            preferred = list(_CHINESE_LOCALE_PRIORITY) + ["en-GB", "en-US", "ja", "ko"]
+            preferred = list(CHINESE_LOCALE_PRIORITY) + ["en-GB", "en-US", "ja", "ko"]
             shown = set()
             for k in preferred:
                 if k in labels and labels[k]:
@@ -465,7 +465,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 生成重命名预览
         app_name = self.le_app_name.text().strip() or "App"
         ver_text = info.get('version_name', '').strip() or "0.0"
-        self.rename_preview.setText(_sanitize_apk_name(f"{app_name}_{ver_text}"))
+        self.rename_preview.setText(sanitize_apk_name(f"{app_name}_{ver_text}"))
 
         if not refresh_icon:
             return
@@ -522,7 +522,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def do_rename(self):
         old_path = self._current_apk_path()
         # 预览框现在可编辑：重新净化，非法字符/保留设备名不能带进 os.replace
-        new_name = _sanitize_apk_name(self.rename_preview.text())
+        new_name = sanitize_apk_name(self.rename_preview.text())
         if not old_path or not os.path.isfile(old_path):
             QtWidgets.QMessageBox.warning(self, "提示", "未选择有效的 APK 文件。")
             return
@@ -629,7 +629,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 stem = self.le_pkg.text().strip()
 
         if stem:
-            default_filename = _sanitize_filename(f"{stem}_icon", ext=".png")
+            default_filename = sanitize_filename(f"{stem}_icon", ext=".png")
         else:
             default_filename = "app_icon.png"
 

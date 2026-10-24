@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 @contextlib.contextmanager
-def _open_apk_zip(apk_path: str, zf=None):
+def open_apk_zip(apk_path: str, zf=None):
     """上下文管理器：若已提供有效 zf 句柄则复用，否则临时打开并在退出时关闭。"""
     if zf is not None:
         yield zf
@@ -84,7 +84,7 @@ def load_sdk_versions():
     return sdk_map
 
 
-def _entry_span(lines, start):
+def entry_span(lines, start):
     """返回资源条目 [start, end) 行区间：到下一个 `resource 0x` 或 `type ... id=` 分节行前。"""
     end = start + 1
     while end < len(lines):
@@ -124,7 +124,7 @@ class _LazyEntryMap(dict):
             yield (k, self[k])
 
 
-class _ResourceIndex:
+class ResourceIndex:
     """一次性解析 `aapt2 dump resources` 全量输出，提供 O(1) 的条目查询。
 
     采用惰性区间索引映射，避免对大型 APK（30MB+ 文本）全量调用 splitlines()
@@ -197,7 +197,7 @@ def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
     res_id 支持两种形态（可带 @ 前缀）：
         - 数字地址：0x7f0600f1（大小写不敏感）；
         - 命名引用：color/feature_x（按条目头行的 type/name 查询）。
-    找不到返回空字符串。传入 index（_ResourceIndex）时 O(1) 查询。
+    找不到返回空字符串。传入 index（ResourceIndex）时 O(1) 查询。
     """
     key = _normalize_resource_key(res_id)
     is_hex = key[:2] == "0x"
@@ -224,17 +224,17 @@ def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
     if start is None:
         return ""
 
-    a, b = _entry_span(lines, start)
+    a, b = entry_span(lines, start)
     return "\n".join(lines[a:b])
 
 
-def _density_of(qualifier: str) -> str:
+def density_of(qualifier: str) -> str:
     """从配置限定符中提取密度（如 "xxhdpi"、"anydpi-v26"、"hdpi-v25"）。"""
     m = re.search(r"(ldpi|mdpi|tvdpi|hdpi|xhdpi|xxhdpi|xxxhdpi|nodpi|anydpi)", qualifier or "")
     return m.group(1) if m else ""
 
 
-def _pick_best_density(variants: dict):
+def pick_best_density(variants: dict):
     """variants: {density: path}，优先返回最高标准密度，其次 nodpi/默认，最后取末条。"""
     for dpi in reversed(_DPI_ORDER):
         if dpi in variants:
@@ -251,7 +251,7 @@ _sniff_cache = {}
 _sniff_cache_lock = threading.Lock()
 
 
-def _sniff_file_kind(apk_path: str, inner_path: str, zf=None):
+def sniff_file_kind(apk_path: str, inner_path: str, zf=None):
     """
     用魔数识别 APK 内文件类型（AndResGuard 等混淆后文件没有扩展名）。
     返回 "image" / "xml" / None。结果按 (apk 路径, mtime, 文件路径) 缓存，
@@ -266,7 +266,7 @@ def _sniff_file_kind(apk_path: str, inner_path: str, zf=None):
         if key in _sniff_cache:
             return _sniff_cache[key]
     try:
-        with _open_apk_zip(apk_path, zf) as local_zf:
+        with open_apk_zip(apk_path, zf) as local_zf:
             head = local_zf.open(inner_path).read(16)
     except Exception:
         return None
@@ -297,7 +297,7 @@ def _sniff_file_kind(apk_path: str, inner_path: str, zf=None):
 BITMAP_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
 
 # 混淆包中字符串引用/包装 XML 的最大解引用深度，防止循环引用
-_MAX_DEREF_DEPTH = 3
+MAX_DEREF_DEPTH = 3
 
 
 def get_resource_info(entry_text: str) -> dict:
@@ -343,7 +343,7 @@ def get_resource_info(entry_text: str) -> dict:
         if m:
             qual, path, typ = m.group(1).strip(), m.group(2), m.group(3)
             if typ == "PNG" or path.lower().endswith(BITMAP_EXTS):
-                bitmaps[_density_of(qual)] = path
+                bitmaps[density_of(qual)] = path
             else:
                 xml_files.append(path)
             continue
@@ -366,7 +366,7 @@ def get_resource_info(entry_text: str) -> dict:
                 ref = m.group(1)
 
     if bitmaps:
-        return {"type": "image", "value": _pick_best_density(bitmaps)}
+        return {"type": "image", "value": pick_best_density(bitmaps)}
     if color:
         return {"type": "color", "value": color}
     if xml_files:
