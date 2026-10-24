@@ -13,6 +13,7 @@
 """
 import glob
 import io
+import math
 import os
 import re
 import shutil
@@ -299,6 +300,33 @@ class TestVectorRasterization(unittest.TestCase):
             self.assertGreaterEqual(p_in_pil[3], 240)
             p_out_pil = img_pil.getpixel((75, 75))
             self.assertEqual(p_out_pil[3], 0)
+
+
+class TestPathSamplingLimits(unittest.TestCase):
+    """畸形 pathData 不能把绘图线程拖进无界采样。"""
+
+    def test_non_finite_numbers_are_dropped(self):
+        tokens = vec_mod._tokenize_path_data("M0,0 L1e999,2")
+        values = [v for _, v in tokens]
+        self.assertFalse(any(math.isinf(v) or math.isnan(v) for v in values))
+        # 丢弃 inf 后该 L 命令参数不足，会被解析器跳过，但整条路径仍可处理
+        subs = vec_mod._flatten_subpaths(vec_mod._parse_path_commands(tokens), 1.0)
+        self.assertEqual(subs, [[(0.0, 0.0)]])
+
+    def test_extreme_curves_are_capped(self):
+        pts = vec_mod._bezier_points((0.0, 0.0), (1e9, 0.0), (1e9, 1e9), (0.0, 1e9), 0.5)
+        self.assertLessEqual(len(pts), vec_mod._MAX_CURVE_SEGMENTS)
+        quad = vec_mod._quad_points((0.0, 0.0), (1e9, 0.0), (1e9, 1e9), 0.5)
+        self.assertLessEqual(len(quad), vec_mod._MAX_CURVE_SEGMENTS)
+        arc = vec_mod._arc_points(0.0, 0.0, 1e9, 1e9, 0.0, 1, 1, 2e9, 0.0, 0.5)
+        self.assertLessEqual(len(arc), vec_mod._MAX_CURVE_SEGMENTS)
+
+    def test_total_path_points_are_capped(self):
+        # 20 条大跨度三次曲线；每条最多 _MAX_CURVE_SEGMENTS 点，总点数仍必须受限
+        path_data = "M0,0 " + " ".join(["C1e6,0 1e6,1e6 0,1e6"] * 20)
+        subs = vec_mod._flatten_subpaths(
+            vec_mod._parse_path_commands(vec_mod._tokenize_path_data(path_data)), 0.5)
+        self.assertLessEqual(sum(len(s) for s in subs), vec_mod._MAX_PATH_POINTS + 2)
 
 
 class TestVectorElementParsing(unittest.TestCase):

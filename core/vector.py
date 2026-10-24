@@ -25,6 +25,22 @@ _VECTOR_CAPS = {"butt": 0, "round": 1, "square": 2, "0": 0, "1": 1, "2": 2}
 # 旧版 aapt2 属性值前缀的类型标注，如 =(type 0x1)0x7f060000 / =(type 0x3)"text"
 _TYPE_PREFIX_RE = re.compile(r"^\(type\s+0x[0-9a-fA-F]+\)\s*")
 
+# 单条曲线/圆弧的最大采样段数。正常 108dp 图标远达不到该值；这里只用于
+# 兜住畸形 pathData 的极端坐标，避免一次绘制申请数百万个点导致卡死/OOM。
+_MAX_CURVE_SEGMENTS = 4096
+# 单个 <path> 的折线总点数上限（Qt 侧只对圆弧累加，Pillow 侧包含曲线）。
+_MAX_PATH_POINTS = 60_000
+
+
+def _sample_count(extent, step):
+    """按跨度/步长计算采样段数，并把极端值收敛到上限。"""
+    if not math.isfinite(step) or step <= 0:
+        step = 1.0
+    if not math.isfinite(extent) or extent >= _MAX_CURVE_SEGMENTS * step:
+        return _MAX_CURVE_SEGMENTS
+    return max(2, int(math.ceil(extent / step)))
+
+
 
 def _parse_vector_elements(xml_out):
     """把 aapt2 dump xmltree 输出解析为 [{indent, tag, attrs}] 元素列表。"""
@@ -60,9 +76,12 @@ def _attr_float(attrs, name, default=None):
     m = re.match(r"^([-+0-9.eE]+)", v)
     if m:
         try:
-            return float(m.group(1))
+            value = float(m.group(1))
         except ValueError:
             return default
+        # 1e999 这类值会被 float() 解析成 inf；继续参与矩阵/渐变计算会
+        # 产生 inf/NaN 坐标，最终拖死采样或让 QPainter 收到非法值。
+        return value if math.isfinite(value) else default
     return default
 
 
@@ -121,11 +140,18 @@ def _tokenize_path_data(d):
                     while j < n and d[j].isdigit():
                         j += 1
             try:
-                tokens.append((None, float(d[i:j])))
+                value = float(d[i:j])
             except ValueError:
                 # 畸形数字（如 "1.2.3"）：跳过该记号，而不是让整条 pathData
                 # 解析失败、把整个图标判为提取失败。
                 logging.debug("pathData 中的非法数字已跳过: %r", d[i:j])
+            else:
+                if math.isfinite(value):
+                    tokens.append((None, value))
+                else:
+                    # 1e999 会变成 inf；继续参与采样会触发 OverflowError 或
+                    # 无上限的坐标跨度，直接丢弃该记号。
+                    logging.debug("pathData 中的非有限数值已跳过: %r", d[i:j])
             i = j
             continue
         i += 1
@@ -300,9 +326,12 @@ def _iter_path_ops(cmds):
 
 
 def _bezier_points(p0, p1, p2, p3, step):
+    coords = (p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1])
+    if not all(math.isfinite(v) for v in coords):
+        return [p3]
     ext = max(abs(p1[0] - p0[0]), abs(p2[0] - p0[0]), abs(p3[0] - p0[0]),
               abs(p1[1] - p0[1]), abs(p2[1] - p0[1]), abs(p3[1] - p0[1]))
-    n = max(2, int(math.ceil(ext / step)))
+    n = _sample_count(ext, step)
     pts = []
     for k in range(1, n + 1):
         t = k / n
@@ -314,8 +343,11 @@ def _bezier_points(p0, p1, p2, p3, step):
 
 
 def _quad_points(p0, p1, p2, step):
+    coords = (p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
+    if not all(math.isfinite(v) for v in coords):
+        return [p2]
     ext = max(abs(p1[0] - p0[0]), abs(p2[0] - p0[0]), abs(p1[1] - p0[1]), abs(p2[1] - p0[1]))
-    n = max(2, int(math.ceil(ext / step)))
+    n = _sample_count(ext, step)
     pts = []
     for k in range(1, n + 1):
         t = k / n
@@ -327,7 +359,14 @@ def _quad_points(p0, p1, p2, step):
 
 
 def _arc_points(x0, y0, rx, ry, phi_deg, large, sweep, x1, y1, step):
-    """SVG 椭圆弧 → 折线点列（标准中心参数化）。"""
+    """SVG 椭圆弧 → 折线点列（标准中心参数化）。
+
+    rx/ry 或端点来自畸形 APK 时可能是 inf/NaN，或大到让采样段数爆炸；
+    这里统一退化为端点/限制段数，避免图标线程在 _arc_points 内卡死。
+    """
+    coords = (x0, y0, rx, ry, phi_deg, x1, y1)
+    if not all(math.isfinite(v) for v in coords):
+        return [(x1, y1)]
     rx, ry = abs(rx), abs(ry)
     if rx < 1e-9 or ry < 1e-9:
         return [(x1, y1)]
@@ -359,7 +398,7 @@ def _arc_points(x0, y0, rx, ry, phi_deg, large, sweep, x1, y1, step):
         dtheta -= 2 * math.pi
     if sweep and dtheta < 0:
         dtheta += 2 * math.pi
-    n = max(2, int(math.ceil(abs(dtheta) * max(rx, ry) / step)))
+    n = _sample_count(abs(dtheta) * max(rx, ry), step)
     pts = []
     for k in range(1, n + 1):
         t = theta1 + dtheta * k / n
@@ -374,25 +413,52 @@ def _flatten_subpaths(cmds, step):
 
     SVG 语义（相对坐标、S/T 镜像）已由 _iter_path_ops 规整成绝对坐标
     原语；这里只负责按 step 把曲线/圆弧采样成折线并维护子路径分组。
+
+    单个 path 的点数受 _MAX_PATH_POINTS 限制：畸形 pathData 可以把一条
+    C 命令写成百万级坐标跨度，若不设上限，仅采样就会耗尽内存并卡住图标
+    线程（实测 1e6 级控制点会产生 148 万个点）。
     """
     subpaths = []
     sub = None
     pen = (0.0, 0.0)       # 当前笔位
     sub_start = (0.0, 0.0)  # 当前子路径起点
+    total_points = 0
+    truncated = False
+
+    def _append(points):
+        """把采样点追加到当前子路径，超过总点数上限时截断。"""
+        nonlocal total_points, truncated
+        if truncated or not points:
+            return
+        room = _MAX_PATH_POINTS - total_points
+        if room <= 0:
+            truncated = True
+            return
+        if len(points) > room:
+            points = points[:room]
+            truncated = True
+        sub.extend(points)
+        total_points += len(points)
+
     for op in _iter_path_ops(cmds):
+        if truncated:
+            break
         tag = op[0]
         if tag == "M":
             if sub is not None:
                 # 填充语义下未闭合的子路径隐式连回起点
-                sub.append(sub_start)
+                _append([sub_start])
                 subpaths.append(sub)
             x, y = op[1], op[2]
             sub_start = (x, y)
             pen = (x, y)
             sub = [(x, y)]
+            total_points += 1
+            if total_points >= _MAX_PATH_POINTS:
+                truncated = True
         elif tag == "Z":
             if sub is not None:
-                sub.append(sub_start)
+                _append([sub_start])
                 subpaths.append(sub)
                 sub = None
             pen = sub_start
@@ -400,28 +466,34 @@ def _flatten_subpaths(cmds, step):
             x, y = op[1], op[2]
             if sub is None:
                 sub = [pen]
-            sub.append((x, y))
+                total_points += 1
+            _append([(x, y)])
             pen = (x, y)
         elif tag == "C":
             x1, y1, x2, y2, x, y = op[1:]
             if sub is None:
                 sub = [pen]
-            sub.extend(_bezier_points(pen, (x1, y1), (x2, y2), (x, y), step))
+                total_points += 1
+            _append(_bezier_points(pen, (x1, y1), (x2, y2), (x, y), step))
             pen = (x, y)
         elif tag == "Q":
             x1, y1, x, y = op[1:]
             if sub is None:
                 sub = [pen]
-            sub.extend(_quad_points(pen, (x1, y1), (x, y), step))
+                total_points += 1
+            _append(_quad_points(pen, (x1, y1), (x, y), step))
             pen = (x, y)
         elif tag == "A":
             x0, y0, rx, ry, rot, large, sweep, x, y = op[1:]
             if sub is None:
                 sub = [pen]
-            sub.extend(_arc_points(x0, y0, rx, ry, rot, large != 0, sweep != 0, x, y, step))
+                total_points += 1
+            _append(_arc_points(x0, y0, rx, ry, rot, large != 0, sweep != 0, x, y, step))
             pen = (x, y)
     if sub is not None:
         subpaths.append(sub)
+    if truncated:
+        logging.warning("pathData 采样点数超过上限 %d，已截断", _MAX_PATH_POINTS)
     return subpaths
 
 
@@ -1008,7 +1080,11 @@ def _cmds_to_qpainterpath(cmds, m, fill_rule="nonzero", step=1.0) -> QtGui.QPain
         QtCore.Qt.FillRule.OddEvenFill if fill_rule == "evenodd" else QtCore.Qt.FillRule.WindingFill
     )
 
+    arc_points = 0
+    truncated = False
     for op in _iter_path_ops(cmds):
+        if truncated:
+            break
         tag = op[0]
         if tag == "M":
             tx, ty = _mat_apply(m, op[1], op[2])
@@ -1031,11 +1107,17 @@ def _cmds_to_qpainterpath(cmds, m, fill_rule="nonzero", step=1.0) -> QtGui.QPain
             x0, y0, rx, ry, rot, large, sweep, x, y = op[1:]
             arc_pts = _arc_points(x0, y0, rx, ry, rot, large != 0, sweep != 0, x, y, step)
             for pt in arc_pts:
+                if arc_points >= _MAX_PATH_POINTS:
+                    truncated = True
+                    break
                 tp = _mat_apply(m, pt[0], pt[1])
                 qpath.lineTo(tp[0], tp[1])
+                arc_points += 1
         elif tag == "Z":
             qpath.closeSubpath()
 
+    if truncated:
+        logging.warning("pathData 圆弧采样点数超过上限 %d，已截断", _MAX_PATH_POINTS)
     return qpath
 
 
