@@ -16,7 +16,12 @@ from core.resources import (
 from core.vector import rasterize_vector_layer
 
 ICON_SIZE = 512
-CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
+# 中文标签优先级：简中/新加坡、港澳台/繁体；当只有 zh-Hans、zh-Hant、
+# zh-MO 或裸 zh 时也必须优先于通用英文 application-label。
+CHINESE_LOCALE_PRIORITY = (
+    "zh-CN", "zh-Hans", "zh-SG",
+    "zh-HK", "zh-MO", "zh-TW", "zh-Hant",
+)
 
 # badging 的字符串值包在单引号里，值内的 ' 与 \ 会被 aapt2 转义成 \' 与 \\。
 # [^']* 在转义引号处提前截断：含撇号的值（如 versionName='It\'s'）会被剪断，
@@ -35,6 +40,11 @@ _RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+# 单个文件名分量的保守上限。Windows 组件上限是 255，但重命名/导出默认
+# 落在 APK 所在目录，长目录下仍可能触发 MAX_PATH；120 字符足够容纳常见
+# "应用名_版本号"，也避免恶意超长 label 生成无法创建的文件名。
+_MAX_FILENAME_CHARS = 120
 
 def find_adaptive_layer_addr(xml_output: str, layer: str):
     """
@@ -403,17 +413,26 @@ def parse_aapt2_output(text: str) -> dict:
     m_label_app = re.search(r"application:\s+label=" + _BADGING_QUOTED, text)
     app_node_label = _unescape_badging_value(m_label_app.group(1)) if m_label_app else ""
 
-    # 选择优先中文
+    # 选择优先中文：locale 统一按 "-" 连接、大小写不敏感匹配。
+    # aapt2 通常输出 zh-CN / zh-Hans；部分工具或手写测试可能用下划线。
+    labels_lower = {
+        loc.replace("_", "-").lower(): label
+        for loc, label in info["app_name_labels"].items()
+    }
     for pref in CHINESE_LOCALE_PRIORITY:
-        if info["app_name_labels"].get(pref):
-            info["app_name"] = info["app_name_labels"][pref]
+        if labels_lower.get(pref.lower()):
+            info["app_name"] = labels_lower[pref.lower()]
             break
     if not info["app_name"]:
-        info["app_name"] = (
-            generic_label
-            or info["app_name_labels"].get("zh", "")
-            or app_node_label
+        # 任意中文变体（zh、zh-Hans-CN、zh-MO…）都优先于通用英文标签。
+        # 旧实现把 generic 放在 zh 前面，只有 application-label-zh 的包
+        # 会显示英文名；zh-Hans/zh-Hant 则完全被忽略。
+        zh_label = next(
+            (label for loc, label in labels_lower.items()
+             if (loc == "zh" or loc.startswith("zh-")) and label),
+            "",
         )
+        info["app_name"] = zh_label or generic_label or app_node_label
 
     # --- 可启动 Activity ---
     m_launch = re.search(r"launchable-activity:\s+name=" + _BADGING_QUOTED, text)
@@ -510,8 +529,18 @@ def sanitize_filename(name: str, ext: str = "") -> str:
     stem = stem.rstrip(" .")
     if not stem:
         return ""
+    # 超长 label 不能让重命名/导出生成 Windows 无法创建的文件名。
+    # 预留扩展名长度，按字符截断；截断后再去掉尾部点/空格。
+    max_stem = max(1, _MAX_FILENAME_CHARS - len(ext_clean))
+    if len(stem) > max_stem:
+        stem = stem[:max_stem].rstrip(" .")
+        if not stem:
+            return ""
     if stem.upper() in _RESERVED_NAMES:
         stem = "_" + stem
+        stem = stem[:max_stem].rstrip(" .")
+        if not stem:
+            return ""
     return stem + ext_clean
 
 
