@@ -37,6 +37,7 @@ import core.apk_parser as apk_parser_mod
 import core.signature as sig_mod
 import core.resources as res_mod
 import core.vector as vec_mod
+import ui.main_window as main_window_mod
 import ui.workers as workers_mod
 from PIL import Image
 from tests import regression_checks
@@ -507,6 +508,64 @@ def test_parse_failure_clears_previous_info(app):
         assert win._current_icon_bytes is None
         assert win._apk_path == ""
     finally:
+        win.close()
+
+
+def test_replace_with_retry_handles_sharing_violation(tmp_path, monkeypatch):
+    """Windows 上文件刚被释放时的短暂占用应通过重试覆盖。"""
+    src = tmp_path / "old.apk"
+    dst = tmp_path / "new.apk"
+    src.write_bytes(b"apk")
+    real_replace = main_window_mod.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(a, b):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            err = PermissionError(13, "file in use")
+            err.winerror = 32
+            raise err
+        return real_replace(a, b)
+
+    monkeypatch.setattr(main_window_mod.os, "replace", flaky_replace)
+    main_window_mod._replace_with_retry(str(src), str(dst), attempts=3, delay=0)
+    assert dst.read_bytes() == b"apk"
+    assert calls["n"] == 3
+
+
+def test_rename_cancels_busy_icon_worker(app, tmp_path):
+    """图标提取在途时重命名应先取消/等待，避免 ZipFile 占用导致失败。"""
+    win = MainWindow()
+    src = tmp_path / "old.apk"
+    src.write_bytes(b"apk")
+    win._apk_path = str(src)
+    win._parse_ok_path = str(src)
+    win._parsed_info = {"icons": {}}
+    win.rename_preview.setText("new.apk")
+
+    class FakeIconWorker:
+        def __init__(self):
+            self.busy = True
+            self.cancelled = False
+
+        def is_busy(self):
+            return self.busy
+
+        def cancel(self):
+            self.cancelled = True
+            self.busy = False
+
+    fake = FakeIconWorker()
+    win._icon_worker = fake
+    try:
+        win.do_rename()
+        assert fake.cancelled
+        assert (tmp_path / "new.apk").exists()
+        assert not src.exists()
+        assert win._apk_path == str(tmp_path / "new.apk")
+        assert win._parse_ok_path == str(tmp_path / "new.apk")
+    finally:
+        win._icon_worker = None
         win.close()
 
 

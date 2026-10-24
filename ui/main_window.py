@@ -20,6 +20,25 @@ from ui.widgets import DropLineEdit
 
 # 关闭窗口时等待后台线程收尾的时间（毫秒）
 _CLOSE_WAIT_MS = 2000
+# 重命名前等待图标线程释放 APK 文件句柄的时间（毫秒）
+_ICON_CANCEL_WAIT_MS = 2000
+
+
+def _replace_with_retry(old_path: str, new_path: str, attempts: int = 20, delay: float = 0.05):
+    """os.replace；遇到 Windows 文件占用（WinError 32）时短暂重试。
+
+    图标提取可能仍持有 APK 的 ZipFile；取消请求与子进程终止都需要一点
+    时间，重试窗口用于覆盖这段时间，避免用户刚解析完就重命名直接失败。
+    其它 PermissionError（真正的权限拒绝）立即抛出，不做无意义等待。
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(old_path, new_path)
+            return
+        except PermissionError as e:
+            if attempt >= attempts - 1 or getattr(e, "winerror", None) != 32:
+                raise
+            time.sleep(delay)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
@@ -291,6 +310,34 @@ class MainWindow(QtWidgets.QMainWindow):
         """请求常驻图标线程结束（关闭窗口/退出时调用）。"""
         if self._icon_worker is not None:
             self._icon_worker.stop()
+
+    def _cancel_icon_worker_and_wait(self, timeout_ms: int = _ICON_CANCEL_WAIT_MS) -> bool:
+        """取消在途图标提取，并等待其释放 APK 的 ZipFile 句柄。
+
+        重命名前调用：Windows 上图标提取持有的 ZipFile 会让 os.replace
+        报 WinError 32。取消会同时终止该线程的 resources/xmltree 子进程，
+        因此通常很快返回；返回 False 表示等待超时，调用方仍可尝试重试替换。
+        """
+        worker = self._icon_worker
+        if worker is None or not worker.is_busy():
+            return True
+        worker.cancel()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while worker.is_busy() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not worker.is_busy()
+
+    def _restart_icon_extraction(self):
+        """按当前 APK 重新发起图标提取（取消/重命名后恢复图标）。"""
+        icons = (self._parsed_info or {}).get("icons") or {}
+        icon_path = pick_best_icon(icons)
+        apk_path = self._current_apk_path()
+        if not icon_path or not apk_path or not os.path.isfile(apk_path):
+            return
+        try:
+            self._start_icon_worker(apk_path, icon_path)
+        except Exception as e:
+            logging.exception("重新启动图标提取失败: %s", e)
 
     def closeEvent(self, event):
         """关闭窗口前取消后台线程，并强制结束卡住的 aapt2 子进程。
@@ -564,15 +611,27 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if ret != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
+        # 图标提取仍持有 APK 的 ZipFile 时，Windows 的 os.replace 会报
+        # WinError 32。先取消在途提取并等待句柄释放；超时也继续走下面的
+        # 重试窗口，避免用户已经确认覆盖却直接失败。
+        icon_was_busy = bool(self._icon_worker is not None and self._icon_worker.is_busy())
+        if icon_was_busy and not self._cancel_icon_worker_and_wait():
+            logging.warning("图标提取未在 %d ms 内停止，重命名将重试文件替换",
+                            _ICON_CANCEL_WAIT_MS)
         try:
-            # os.rename 在 Windows 上目标已存在时失败；os.replace 原子替换
-            os.replace(old_path, new_path)
-            QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
+            # os.rename 在 Windows 上目标已存在时失败；os.replace 原子替换。
+            # 句柄刚释放时仍可能短暂占用，交给重试窗口兜底。
+            _replace_with_retry(old_path, new_path)
             self._apk_path = new_path
             self._parse_ok_path = new_path
             self.apk_path_edit.setText(new_path)
             self.rename_preview.setText(new_name)
+            QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
+            if icon_was_busy:
+                self._restart_icon_extraction()
         except Exception as e:
+            if icon_was_busy:
+                self._restart_icon_extraction()
             QtWidgets.QMessageBox.critical(self, "错误", f"重命名失败: {e}")
 
     def on_icon_loaded(self, image: QtGui.QImage, data: bytes, gen: int):

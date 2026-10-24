@@ -44,6 +44,7 @@ class _IconWorkerCore(QtCore.QObject):
         self._gen = 0             # 最新请求代数
         self._current_gen = 0     # 正在处理的代数
         self._stopping = False
+        self._working = False     # 是否正在执行提取（含待办刚被取走的阶段）
         self._trigger.connect(self._do_work, QtCore.Qt.ConnectionType.QueuedConnection)
 
     def request(self, apk_path: str, icon_path: str) -> int:
@@ -76,6 +77,11 @@ class _IconWorkerCore(QtCore.QObject):
         with self._lock:
             return self._stopping or gen != self._gen
 
+    def is_busy(self) -> bool:
+        """是否有提取任务在途（含刚被取走、尚未开始的待办）。"""
+        with self._lock:
+            return self._working or self._pending is not None
+
     def check_cancel(self):
         """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
         with self._lock:
@@ -92,23 +98,30 @@ class _IconWorkerCore(QtCore.QObject):
             apk_path, icon_path, gen = self._pending
             self._pending = None
             self._current_gen = gen
-
-        if self.is_stale(gen) or self._owner.isInterruptionRequested():
-            return
+            # 与取待办在同一把锁内置位：重命名前调用 is_busy() 时不会
+            # 漏掉“待办已被取走、马上开始提取”的窗口。
+            self._working = True
 
         try:
-            self.check_cancel()
-            image, data = self._owner._extract(apk_path, icon_path)
-        except _Cancelled:
-            return  # 已有更新请求或已中断：丢弃本轮结果
-        except Exception as e:
-            logging.exception("子线程提取图标失败: %s", e)
-            if not self.is_stale(gen):
-                self.failed.emit(str(e), gen)
-            return
+            if self.is_stale(gen) or self._owner.isInterruptionRequested():
+                return
 
-        if not self.is_stale(gen):
-            self.iconReady.emit(image, data, gen)
+            try:
+                self.check_cancel()
+                image, data = self._owner._extract(apk_path, icon_path)
+            except _Cancelled:
+                return  # 已有更新请求或已中断：丢弃本轮结果
+            except Exception as e:
+                logging.exception("子线程提取图标失败: %s", e)
+                if not self.is_stale(gen):
+                    self.failed.emit(str(e), gen)
+                return
+
+            if not self.is_stale(gen):
+                self.iconReady.emit(image, data, gen)
+        finally:
+            with self._lock:
+                self._working = False
 
 
 def _never_cancelled():
@@ -342,6 +355,10 @@ class IconWorker(QtCore.QThread):
 
     def _is_stale(self, gen: int) -> bool:
         return self._core.is_stale(gen)
+
+    def is_busy(self) -> bool:
+        """是否有图标提取在途（重命名前等待文件句柄释放时使用）。"""
+        return self._core.is_busy()
 
     def _check_cancel(self):
         """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
