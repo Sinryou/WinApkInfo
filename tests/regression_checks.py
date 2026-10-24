@@ -513,7 +513,7 @@ def check_p1_5(app):
         win.close()
         el = time.time() - t0
         C.check("解析进行中关窗不再阻塞 10s", el < 3.0, "close() 耗时=%.2fs" % el)
-        leftovers = win._apk_workers + ([win._icon_worker] if win._icon_worker else [])
+        leftovers = [w for w in (win._apk_worker, win._icon_worker) if w is not None]
         C.check("关闭后线程能收尾", win.shutdown_background(15000),
                 "剩余运行中线程=%d" % sum(1 for t in leftovers if t.isRunning()))
 

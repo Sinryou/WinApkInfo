@@ -34,10 +34,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_output = ""
         self._parse_ok_path = ""
         self._parsed_info = {}
-        # 基础解析线程（单常驻线程 + 最新请求覆盖）与向后兼容引用列表
+        # 基础解析线程：单常驻线程 + 最新请求覆盖
         self._apk_worker = None
         self._apk_gen = 0
-        self._apk_workers = []
         # 图标提取是常驻线程（单线程 + 最新请求覆盖），首次使用时创建
         self._icon_worker = None
         self._icon_gen = 0  # 最近一次图标请求的代数，用于丢弃延迟投递的旧结果
@@ -249,7 +248,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apk_worker = ApkInfoWorker()
             self._apk_worker.resultReady.connect(self.on_apk_info_ready)
             self._apk_worker.failed.connect(self.on_apk_info_failed)
-            self._apk_workers = [self._apk_worker]
             self._apk_worker.start()
         self._apk_gen = self._apk_worker.request(apk_path)
 
@@ -286,7 +284,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._stop_icon_worker()
         self._stop_apk_worker()
-        threads = list(self._apk_workers)
+        threads = [self._apk_worker] if self._apk_worker is not None else []
         for t in threads:
             if t.isRunning():
                 t.requestInterruption()
@@ -313,7 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_apk_worker()
         kill_running_aapt2()
         all_done = True
-        for t in self._apk_workers + ([self._icon_worker] if self._icon_worker else []):
+        for t in (w for w in (self._apk_worker, self._icon_worker) if w is not None):
             if t.isRunning() and not t.wait(timeout_ms):
                 logging.warning("后台线程仍在运行，等待超时: %s", t)
                 all_done = False
