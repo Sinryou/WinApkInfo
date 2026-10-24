@@ -396,9 +396,12 @@ def check_p1_4(app):
     C.title("P1-4 slot 内异常不再终止进程")
     C.check("install_excepthook 存在且可安装", callable(getattr(main_window_mod, "install_excepthook", None)))
     old_hook = sys.excepthook
+    old_thread_hook = threading.excepthook
     main_window_mod.install_excepthook()
     C.check("安装后 sys.excepthook 被替换", sys.excepthook is not old_hook)
+    C.check("安装后 threading.excepthook 被替换", threading.excepthook is not old_thread_hook)
     sys.excepthook = old_hook
+    threading.excepthook = old_thread_hook
 
     apks = sample_apks(1)
     if not apks:
@@ -920,9 +923,20 @@ def check_a1(app):
         C.check("子线程触发时不跨线程弹窗", shown == [], "当场弹窗=%r" % shown)
         consume_events(app, 0.4)
         C.check("异常经队列投递后在 GUI 线程弹出一次", shown == [True], "弹窗=%r" % shown)
+
+        shown.clear()
+        # 纯 threading.Thread 的未捕获异常走 threading.excepthook（不经过
+        # sys.excepthook），同样必须只投递、不跨线程弹窗
+        t2 = threading.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError("plain-thread-boom")))
+        t2.start()
+        t2.join()
+        C.check("纯线程异常不直接弹窗", shown == [], "当场弹窗=%r" % shown)
+        consume_events(app, 0.4)
+        C.check("纯线程异常经 threading.excepthook 投递弹窗", shown == [True], "弹窗=%r" % shown)
     finally:
         QtWidgets.QMessageBox.critical = staticmethod(original)
         sys.excepthook = sys.__excepthook__
+        threading.excepthook = threading.__excepthook__
 
 
 def check_b1(app):

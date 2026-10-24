@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import logging
+import threading
 from pathlib import Path
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -730,10 +731,13 @@ def install_excepthook():
     进程；打包配置是 console=False，用户既看不到 traceback 也看不到提示。
     这里把异常写进日志并弹窗，作为各 slot 自身 try/except 之外的兜底。
 
-    sys.excepthook 运行在**抛出异常的那个线程**里，而 QMessageBox 只能在
-    GUI 线程使用：实测在子线程直接弹窗会以 0xC0000005（访问违例）崩溃，
-    只写日志的钩子则能让进程正常存活。因此非 GUI 线程只记日志，GUI 线程
-    才直接弹窗；有 QApplication 时子线程的异常经队列投递回主线程再提示。
+    sys.excepthook 只覆盖主线程与 QThread slot（PyQt 会转调它）；纯
+    threading.Thread 的未捕获异常走 threading.excepthook，必须另行接管，
+    否则这类异常只打到 stderr，打包后同样"静默消失"。两个钩子都运行在
+    **抛出异常的那个线程**里，而 QMessageBox 只能在 GUI 线程使用：实测
+    在子线程直接弹窗会以 0xC0000005（访问违例）崩溃，只写日志的钩子则
+    能让进程正常存活。因此非 GUI 线程只记日志，GUI 线程才直接弹窗；有
+    QApplication 时子线程的异常经队列投递回主线程再提示。
     """
     global _error_dialog
     if _error_dialog is None and QtWidgets.QApplication.instance() is not None:
@@ -751,5 +755,13 @@ def install_excepthook():
             # 队列连接：真正的弹窗发生在 GUI 线程，这里只投递
             _error_dialog.requested.emit(text)
 
+    def _thread_hook(args: threading.ExceptHookArgs):
+        # Python 3.14 起线程内的 SystemExit 也会进入 threading.excepthook：
+        # sys.exit() 是线程主动退出的正常途径，不上报
+        if args.exc_type is SystemExit:
+            return
+        _hook(args.exc_type, args.exc_value, args.exc_traceback)
+
     sys.excepthook = _hook
+    threading.excepthook = _thread_hook
 
