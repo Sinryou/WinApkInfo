@@ -1082,89 +1082,92 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
     qimg = QtGui.QImage(W, H, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
     qimg.fill(QtCore.Qt.GlobalColor.transparent)
     painter = QtGui.QPainter(qimg)
-    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-    painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+    try:
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
 
-    stack = []  # (indent, 累计矩阵, 累计 alpha)
-    for el in elems:
-        tag = el["tag"]
-        indent = el["indent"]
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        if tag == "vector":
-            stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
-            continue
-        if tag == "group":
-            if not stack:
+        stack = []  # (indent, 累计矩阵, 累计 alpha)
+        for el in elems:
+            tag = el["tag"]
+            indent = el["indent"]
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            if tag == "vector":
+                stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
                 continue
-            a = el["attrs"]
-            m = _group_matrix(
-                _attr_float(a, "translateX", 0.0), _attr_float(a, "translateY", 0.0),
-                _attr_float(a, "pivotX", 0.0), _attr_float(a, "pivotY", 0.0),
-                _attr_float(a, "rotation", 0.0),
-                _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
-            )
-            pm, pa = stack[-1][1], stack[-1][2]
-            stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
-            continue
-        if tag == "path":
-            if not stack:
+            if tag == "group":
+                if not stack:
+                    continue
+                a = el["attrs"]
+                m = _group_matrix(
+                    _attr_float(a, "translateX", 0.0), _attr_float(a, "translateY", 0.0),
+                    _attr_float(a, "pivotX", 0.0), _attr_float(a, "pivotY", 0.0),
+                    _attr_float(a, "rotation", 0.0),
+                    _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
+                )
+                pm, pa = stack[-1][1], stack[-1][2]
+                stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
                 continue
-            pm, pa = stack[-1][1], stack[-1][2]
-            a = el["attrs"]
-            path_data = a.get("pathData")
-            if not path_data:
-                continue
-            cmds = _parse_path_commands(_tokenize_path_data(path_data))
-            if not cmds:
-                continue
-            m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
-            fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
-            qpath = _cmds_to_qpainterpath(cmds, m, fill_rule, step)
-            if qpath.isEmpty():
-                continue
+            if tag == "path":
+                if not stack:
+                    continue
+                pm, pa = stack[-1][1], stack[-1][2]
+                a = el["attrs"]
+                path_data = a.get("pathData")
+                if not path_data:
+                    continue
+                cmds = _parse_path_commands(_tokenize_path_data(path_data))
+                if not cmds:
+                    continue
+                m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
+                fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
+                qpath = _cmds_to_qpainterpath(cmds, m, fill_rule, step)
+                if qpath.isEmpty():
+                    continue
 
-            if "fillColor" in a:
-                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
-                if fill is not None:
-                    falpha = pa * _attr_float(a, "fillAlpha", 1.0)
-                    brush = _create_qbrush(fill, m, falpha, W, H)
-                    if brush is not None:
-                        painter.fillPath(qpath, brush)
-
-            if "strokeColor" in a:
-                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
-                if sc is not None:
-                    sw = _attr_float(a, "strokeWidth", 0.0)
-                    sa = pa * _attr_float(a, "strokeAlpha", 1.0)
-                    if sw > 0 and sa > 0:
-                        wpx = max(1.0, sw * _mat_scale(m))
-                        cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
-                        if cap_enum in ("1", "round"):
-                            cap = QtCore.Qt.PenCapStyle.RoundCap
-                        elif cap_enum in ("2", "square"):
-                            cap = QtCore.Qt.PenCapStyle.SquareCap
-                        else:
-                            cap = QtCore.Qt.PenCapStyle.FlatCap
-
-                        join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
-                        if join_enum in ("0", "miter"):
-                            join = QtCore.Qt.PenJoinStyle.MiterJoin
-                        elif join_enum in ("2", "bevel"):
-                            join = QtCore.Qt.PenJoinStyle.BevelJoin
-                        else:
-                            join = QtCore.Qt.PenJoinStyle.RoundJoin
-
-                        pen = QtGui.QPen()
-                        pen.setWidthF(wpx)
-                        pen.setCapStyle(cap)
-                        pen.setJoinStyle(join)
-                        brush = _create_qbrush(sc, m, sa, W, H)
+                if "fillColor" in a:
+                    fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
+                    if fill is not None:
+                        falpha = pa * _attr_float(a, "fillAlpha", 1.0)
+                        brush = _create_qbrush(fill, m, falpha, W, H)
                         if brush is not None:
-                            pen.setBrush(brush)
-                            painter.strokePath(qpath, pen)
+                            painter.fillPath(qpath, brush)
 
-    painter.end()
+                if "strokeColor" in a:
+                    sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
+                    if sc is not None:
+                        sw = _attr_float(a, "strokeWidth", 0.0)
+                        sa = pa * _attr_float(a, "strokeAlpha", 1.0)
+                        if sw > 0 and sa > 0:
+                            wpx = max(1.0, sw * _mat_scale(m))
+                            cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
+                            if cap_enum in ("1", "round"):
+                                cap = QtCore.Qt.PenCapStyle.RoundCap
+                            elif cap_enum in ("2", "square"):
+                                cap = QtCore.Qt.PenCapStyle.SquareCap
+                            else:
+                                cap = QtCore.Qt.PenCapStyle.FlatCap
+
+                            join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
+                            if join_enum in ("0", "miter"):
+                                join = QtCore.Qt.PenJoinStyle.MiterJoin
+                            elif join_enum in ("2", "bevel"):
+                                join = QtCore.Qt.PenJoinStyle.BevelJoin
+                            else:
+                                join = QtCore.Qt.PenJoinStyle.RoundJoin
+
+                            pen = QtGui.QPen()
+                            pen.setWidthF(wpx)
+                            pen.setCapStyle(cap)
+                            pen.setJoinStyle(join)
+                            brush = _create_qbrush(sc, m, sa, W, H)
+                            if brush is not None:
+                                pen.setBrush(brush)
+                                painter.strokePath(qpath, pen)
+    finally:
+        # 中途抛异常时（外层捕获后回退 Pillow 渲染）也必须结束 painter，
+        # 否则 Qt 会留下"QPainter 未 end"的警告与未定义状态。
+        painter.end()
     return _qimage_to_pil(qimg)
 
 
