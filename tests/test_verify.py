@@ -234,6 +234,38 @@ class TestVectorRasterization(unittest.TestCase):
         qpath = vec_mod._cmds_to_qpainterpath(cmds, m, "nonzero")
         self.assertFalse(qpath.isEmpty())
 
+    def test_vector_clip_path(self):
+        """测试 <clip-path> 矢量裁剪路径支持（Qt 与 Pillow 后端）。"""
+        xml_clip = (
+            "E: vector (line=1)\n"
+            "  A: android:viewportWidth(0x01010402)=100.0\n"
+            "  A: android:viewportHeight(0x01010403)=100.0\n"
+            "  E: group (line=4)\n"
+            "    E: clip-path (line=5)\n"
+            "      A: android:pathData(0x010100d0)=\"M 0,0 L 50,0 L 50,50 L 0,50 Z\"\n"
+            "    E: path (line=7)\n"
+            "      A: android:pathData(0x010100d0)=\"M 0,0 L 100,0 L 100,100 L 0,100 Z\"\n"
+            "      A: android:fillColor(0x010100d1)=\"#ffff0000\"\n"
+        )
+        with mock.patch("core.vector.run_aapt2_dump_xmltree", return_value=xml_clip):
+            # 1. Qt 光栅化后端
+            img_qt = vec_mod._rasterize_vector_layer_qt("x.apk", "res/icon.xml", 100)
+            self.assertIsNotNone(img_qt)
+            p_in_qt = img_qt.getpixel((25, 25))
+            self.assertEqual(p_in_qt[0], 255)
+            self.assertGreaterEqual(p_in_qt[3], 240)
+            p_out_qt = img_qt.getpixel((75, 75))
+            self.assertEqual(p_out_qt[3], 0)
+
+            # 2. Pillow 光栅化回退后端
+            img_pil = vec_mod._rasterize_vector_layer_pil("x.apk", "res/icon.xml", 100)
+            self.assertIsNotNone(img_pil)
+            p_in_pil = img_pil.getpixel((25, 25))
+            self.assertEqual(p_in_pil[0], 255)
+            self.assertGreaterEqual(p_in_pil[3], 240)
+            p_out_pil = img_pil.getpixel((75, 75))
+            self.assertEqual(p_out_pil[3], 0)
+
 
 class TestVectorElementParsing(unittest.TestCase):
     """aapt2 dump xmltree 属性值解析的格式兼容。"""

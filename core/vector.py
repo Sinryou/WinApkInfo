@@ -918,7 +918,7 @@ def _stroke_mask(size, subpaths, wpx, cap):
     return mask
 
 
-def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
+def _draw_stroke(layer, subpaths, color, alpha, wpx, cap, clip_masks=None):
     """描边一条路径，端点按 strokeLineCap 处理。
 
     拐角统一用 Pillow 的 round join 近似：ImageDraw 不提供 miter/bevel，
@@ -927,6 +927,8 @@ def _draw_stroke(layer, subpaths, color, alpha, wpx, cap):
     if alpha <= 0 or color[3] <= 0:
         return
     mask = _stroke_mask(layer.size, subpaths, wpx, cap)
+    for cmask in (clip_masks or []):
+        mask = ImageChops.multiply(mask, cmask)
     if alpha < 0.999:
         mask = mask.point(lambda v: int(round(v * alpha)))
     if color[3] < 255:
@@ -1075,7 +1077,7 @@ def _iter_path_draw_ops(elems, vw, vh, W, H):
     sx = W / vw
     sy = H / vh
     step = max(0.5, max(vw, vh) / 160.0)
-    stack = []  # (indent, group 空间累计矩阵, 累计 alpha)
+    stack = []  # (indent, group 空间累计矩阵, 累计 alpha, 累计 clip_paths)
     for el in elems:
         tag = el["tag"]
         indent = el["indent"]
@@ -1083,7 +1085,7 @@ def _iter_path_draw_ops(elems, vw, vh, W, H):
             stack.pop()
         if tag == "vector":
             stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
-                          _attr_float(el["attrs"], "alpha", 1.0)))
+                          _attr_float(el["attrs"], "alpha", 1.0), []))
             continue
         if tag == "group":
             if not stack:
@@ -1095,8 +1097,28 @@ def _iter_path_draw_ops(elems, vw, vh, W, H):
                 _attr_float(a, "rotation", 0.0),
                 _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
             )
-            pm, pa = stack[-1][1], stack[-1][2]
-            stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
+            pm, pa, pclips = stack[-1][1], stack[-1][2], stack[-1][3]
+            stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0), list(pclips)))
+            continue
+        if tag == "clip-path":
+            if not stack:
+                continue
+            a = el["attrs"]
+            path_data = a.get("pathData")
+            if not path_data:
+                continue
+            cmds = _parse_path_commands(_tokenize_path_data(path_data))
+            if not cmds:
+                continue
+            pm = stack[-1][1]
+            clip_matrix = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
+            fill_type = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
+            stack[-1][3].append({
+                "cmds": cmds,
+                "matrix": clip_matrix,
+                "fill_type": fill_type,
+                "step": step,
+            })
             continue
         if tag == "path":
             if not stack:
@@ -1108,7 +1130,7 @@ def _iter_path_draw_ops(elems, vw, vh, W, H):
             cmds = _parse_path_commands(_tokenize_path_data(path_data))
             if not cmds:
                 continue
-            pm, pa = stack[-1][1], stack[-1][2]
+            pm, pa, pclips = stack[-1][1], stack[-1][2], stack[-1][3]
             yield {
                 "cmds": cmds,
                 "matrix": _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm),
@@ -1116,6 +1138,7 @@ def _iter_path_draw_ops(elems, vw, vh, W, H):
                 "fill_type": "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero",
                 "step": step,
                 "attrs": a,
+                "clip_paths": list(pclips),
             }
 
 
@@ -1140,45 +1163,58 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
             if qpath.isEmpty():
                 continue
 
-            if "fillColor" in a:
-                fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
-                if fill is not None:
-                    falpha = op["alpha"] * _attr_float(a, "fillAlpha", 1.0)
-                    brush = _create_qbrush(fill, op["matrix"], falpha, W, H)
-                    if brush is not None:
-                        painter.fillPath(qpath, brush)
+            has_clip = bool(op.get("clip_paths"))
+            if has_clip:
+                painter.save()
+            try:
+                if has_clip:
+                    for cp in op["clip_paths"]:
+                        qclip = _cmds_to_qpainterpath(cp["cmds"], cp["matrix"], cp["fill_type"], cp["step"])
+                        if not qclip.isEmpty():
+                            painter.setClipPath(qclip, QtCore.Qt.ClipOperation.IntersectClip)
 
-            if "strokeColor" in a:
-                sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
-                if sc is not None:
-                    sw = _attr_float(a, "strokeWidth", 0.0)
-                    sa = op["alpha"] * _attr_float(a, "strokeAlpha", 1.0)
-                    if sw > 0 and sa > 0:
-                        wpx = max(1.0, sw * _mat_scale(op["matrix"]))
-                        cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
-                        if cap_enum in ("1", "round"):
-                            cap = QtCore.Qt.PenCapStyle.RoundCap
-                        elif cap_enum in ("2", "square"):
-                            cap = QtCore.Qt.PenCapStyle.SquareCap
-                        else:
-                            cap = QtCore.Qt.PenCapStyle.FlatCap
-
-                        join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
-                        if join_enum in ("0", "miter"):
-                            join = QtCore.Qt.PenJoinStyle.MiterJoin
-                        elif join_enum in ("2", "bevel"):
-                            join = QtCore.Qt.PenJoinStyle.BevelJoin
-                        else:
-                            join = QtCore.Qt.PenJoinStyle.RoundJoin
-
-                        pen = QtGui.QPen()
-                        pen.setWidthF(wpx)
-                        pen.setCapStyle(cap)
-                        pen.setJoinStyle(join)
-                        brush = _create_qbrush(sc, op["matrix"], sa, W, H)
+                if "fillColor" in a:
+                    fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
+                    if fill is not None:
+                        falpha = op["alpha"] * _attr_float(a, "fillAlpha", 1.0)
+                        brush = _create_qbrush(fill, op["matrix"], falpha, W, H)
                         if brush is not None:
-                            pen.setBrush(brush)
-                            painter.strokePath(qpath, pen)
+                            painter.fillPath(qpath, brush)
+
+                if "strokeColor" in a:
+                    sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
+                    if sc is not None:
+                        sw = _attr_float(a, "strokeWidth", 0.0)
+                        sa = op["alpha"] * _attr_float(a, "strokeAlpha", 1.0)
+                        if sw > 0 and sa > 0:
+                            wpx = max(1.0, sw * _mat_scale(op["matrix"]))
+                            cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
+                            if cap_enum in ("1", "round"):
+                                cap = QtCore.Qt.PenCapStyle.RoundCap
+                            elif cap_enum in ("2", "square"):
+                                cap = QtCore.Qt.PenCapStyle.SquareCap
+                            else:
+                                cap = QtCore.Qt.PenCapStyle.FlatCap
+
+                            join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
+                            if join_enum in ("0", "miter"):
+                                join = QtCore.Qt.PenJoinStyle.MiterJoin
+                            elif join_enum in ("2", "bevel"):
+                                join = QtCore.Qt.PenJoinStyle.BevelJoin
+                            else:
+                                join = QtCore.Qt.PenJoinStyle.RoundJoin
+
+                            pen = QtGui.QPen()
+                            pen.setWidthF(wpx)
+                            pen.setCapStyle(cap)
+                            pen.setJoinStyle(join)
+                            brush = _create_qbrush(sc, op["matrix"], sa, W, H)
+                            if brush is not None:
+                                pen.setBrush(brush)
+                                painter.strokePath(qpath, pen)
+            finally:
+                if has_clip:
+                    painter.restore()
     finally:
         # 中途抛异常时（外层捕获后回退 Pillow 渲染）也必须结束 painter，
         # 否则 Qt 会留下"QPainter 未 end"的警告与未定义状态。
@@ -1205,18 +1241,27 @@ def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=N
                  for pts in _flatten_subpaths(op["cmds"], op["step"])]
         if not tsubs:
             continue
+
+        clip_masks = []
+        for cp in op.get("clip_paths", []):
+            c_subs = [[_mat_apply(cp["matrix"], x, y) for (x, y) in pts]
+                      for pts in _flatten_subpaths(cp["cmds"], cp["step"])]
+            if c_subs:
+                clip_masks.append(_build_fill_mask(W, H, c_subs, cp["fill_type"]))
+
         if "fillColor" in a:
             fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
             if fill is not None:
                 falpha = op["alpha"] * _attr_float(a, "fillAlpha", 1.0)
+                mask = _build_fill_mask(W, H, tsubs, op["fill_type"])
+                for cmask in clip_masks:
+                    mask = ImageChops.multiply(mask, cmask)
                 if fill[0] == "color":
                     ca = int(round(fill[1][3] * falpha))
                     if ca > 0:
-                        mask = _build_fill_mask(W, H, tsubs, op["fill_type"])
                         tint = Image.new("RGBA", (W, H), (fill[1][0], fill[1][1], fill[1][2], ca))
                         layer.alpha_composite(Image.composite(tint, transparent, mask))
                 else:  # gradient 填充
-                    mask = _build_fill_mask(W, H, tsubs, op["fill_type"])
                     gimg = _scale_alpha(_render_gradient(W, H, fill[1], m), falpha)
                     gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
                     layer.alpha_composite(gimg)
@@ -1231,9 +1276,11 @@ def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=N
                     wpx = max(1, int(round(sw * _mat_scale(m))))
                     cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
                     if sc[0] == "color":
-                        _draw_stroke(layer, tsubs, sc[1], sa, wpx, cap)
+                        _draw_stroke(layer, tsubs, sc[1], sa, wpx, cap, clip_masks)
                     elif sc[0] == "gradient":
                         mask = _stroke_mask(layer.size, tsubs, wpx, cap)
+                        for cmask in clip_masks:
+                            mask = ImageChops.multiply(mask, cmask)
                         if sa < 0.999:
                             mask = mask.point(lambda v: int(round(v * sa)))
                         gimg = _render_gradient(W, H, sc[1], m)
