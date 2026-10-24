@@ -268,18 +268,25 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None, reason_
 
     full_res = None
     index = None
-    if fg_addr and bg_addr:
+    # Android 允许 <adaptive-icon> 只声明 foreground（background 可选，
+    # 缺省按透明渲染）。缺 background 不能整条链路放弃去撞几乎不存在的
+    # 位图回退——minSdk≥26 的应用通常没有传统 mipmap 图标。
+    if fg_addr:
         full_res = run_aapt2_dump_resource(apk_path)
         if full_res is None:
             resource_failed = True
             full_res = ""  # 已尝试且失败：禁止回退阶段重复 dump
         check()
         # 只有层值还需要继续解引用（别名/字符串文件/矢量）时才构建全量
-        # 索引；直接的 color/image 层用两次线性查询即可，索引反而更慢。
-        if _adaptive_layers_need_index(full_res, fg_addr, bg_addr):
+        # 索引；直接的 color/image 层用线性查询即可，索引反而更慢。
+        addrs = [fg_addr] + ([bg_addr] if bg_addr else [])
+        if _adaptive_layers_need_index(full_res, *addrs):
             index = get_resource_index(full_res)
         fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
-        bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
+        if bg_addr:
+            bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
+        else:
+            bg_kind, bg_val = "color", "#00000000"  # 缺省透明背景
         check()
         if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
             try:

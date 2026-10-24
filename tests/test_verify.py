@@ -964,6 +964,39 @@ def test_adaptive_alias_layer_builds_index(monkeypatch):
     assert data == b"png"
 
 
+def test_adaptive_icon_without_background_composes_transparent(monkeypatch):
+    """只有 foreground 的自适应图标要按透明背景合成，不能整条链路放弃。
+
+    background 在 <adaptive-icon> 里是可选层（缺省按透明渲染）；旧实现
+    要求 fg/bg 齐全才合成，缺 background 的图标会落到几乎不存在的位图
+    回退（minSdk≥26 的应用通常没有传统 mipmap 图标）。
+    """
+    xml_only_fg = (
+        "E: adaptive-icon (line=1)\n"
+        "  E: foreground (line=2)\n"
+        "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=@0x7f010002\n"
+    )
+    full_res = (
+        "resource 0x7f010002 color/fg\n"
+        "    () #ff6750a4\n"
+    )
+    captured = {}
+
+    def fake_compose(apk_path, foreground, background, fg_scale=None, full_res=None, index=None, zf=None):
+        captured["foreground"] = foreground
+        captured["background"] = background
+        return Image.new("RGBA", (16, 16), (255, 0, 0, 255)), b"png"
+
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: xml_only_fg)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource", lambda apk: full_res)
+    monkeypatch.setattr(workers_mod, "compose_adaptive_icon", fake_compose)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert data == b"png"
+    assert captured["foreground"] == {"type": "color", "value": "#ff6750a4"}
+    assert captured["background"] == {"type": "color", "value": "#00000000"}
+
+
 def test_adaptive_icon_failed_dump_is_attempted_once(monkeypatch):
     """自适应图标的资源 dump 失败后，回退阶段不应再重试一次。"""
     dump_calls = []
