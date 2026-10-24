@@ -22,6 +22,9 @@ from PyQt6 import QtCore, QtGui
 # （旧表只有名字和 0x 写法两种键，命中不了十进制值）。
 _VECTOR_CAPS = {"butt": 0, "round": 1, "square": 2, "0": 0, "1": 1, "2": 2}
 
+# 旧版 aapt2 属性值前缀的类型标注，如 =(type 0x1)0x7f060000 / =(type 0x3)"text"
+_TYPE_PREFIX_RE = re.compile(r"^\(type\s+0x[0-9a-fA-F]+\)\s*")
+
 
 def _parse_vector_elements(xml_out):
     """把 aapt2 dump xmltree 输出解析为 [{indent, tag, attrs}] 元素列表。"""
@@ -34,6 +37,11 @@ def _parse_vector_elements(xml_out):
         m = re.match(r"^(\s*)A:\s+[^=]*?(\w+)\(0x[0-9a-fA-F]+\)=(.*)$", line)
         if m and elems:
             name, raw = m.group(2), m.group(3).strip()
+            # 旧版 aapt2 对资源引用等非字面量值带 (type 0x01) 前缀
+            # （如 =(type 0x1)0x7f060000，新版直接输出 =@0x7f060000）。
+            # 不剥掉的话取值分支会命中不了引号、space 截断也只留下
+            # "(type"，引用色会整层丢失（fill/stroke 渲染成透明）。
+            raw = _TYPE_PREFIX_RE.sub("", raw)
             if raw.startswith('"'):
                 value = raw[1:raw.find('"', 1)]
             elif raw.startswith("'"):

@@ -235,6 +235,53 @@ class TestVectorRasterization(unittest.TestCase):
         self.assertFalse(qpath.isEmpty())
 
 
+class TestVectorElementParsing(unittest.TestCase):
+    """aapt2 dump xmltree 属性值解析的格式兼容。"""
+
+    def test_old_type_prefix_reference(self):
+        """旧版 aapt2 的资源引用带 (type 0x1) 前缀：不剥掉的话取值截断成
+        空串，fill/stroke 颜色整层丢失（渲染成透明）。"""
+        xml = (
+            "E: vector (line=1)\n"
+            "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108\n"
+            "  E: path (line=2)\n"
+            "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=(type 0x1)0x7f060000\n"
+            "    A: http://schemas.android.com/apk/res/android:pathData(0x01010405)=\"M0,0h108v108H0z\"\n"
+        )
+        elems = vec_mod._parse_vector_elements(xml)
+        path = next(el for el in elems if el["tag"] == "path")
+        self.assertEqual(path["attrs"]["fillColor"], "0x7f060000")
+        self.assertEqual(path["attrs"]["pathData"], "M0,0h108v108H0z")
+
+    def test_old_format_reference_resolves_to_color(self):
+        """剥掉 (type 0x1) 前缀后，旧格式引用要能走通 _resolve_vector_fill 取色。"""
+        full_res = "resource 0x7f060000 color/brand\n    () #ff0096fa\n"
+        xml = (
+            "E: path (line=1)\n"
+            "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=(type 0x1)0x7f060000\n"
+        )
+        fill_color = vec_mod._parse_vector_elements(xml)[0]["attrs"]["fillColor"]
+        self.assertEqual(
+            vec_mod._resolve_vector_fill("f.apk", full_res, fill_color),
+            ("color", (0x00, 0x96, 0xfa, 0xff)))
+
+    def test_new_reference_and_inline_values_unchanged(self):
+        """新版 aapt2（@0x... 引用、内联色、维度值）的解析行为不变。"""
+        xml = (
+            "E: vector (line=1)\n"
+            "  E: path (line=2)\n"
+            "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=#ff6750a4\n"
+            "  E: path (line=3)\n"
+            "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=@0x7f060000\n"
+            "  E: path (line=4)\n"
+            "    A: http://schemas.android.com/apk/res/android:strokeWidth(0x01010424)=2.500000dp\n"
+        )
+        paths = [el for el in vec_mod._parse_vector_elements(xml) if el["tag"] == "path"]
+        self.assertEqual(paths[0]["attrs"]["fillColor"], "#ff6750a4")
+        self.assertEqual(paths[1]["attrs"]["fillColor"], "@0x7f060000")
+        self.assertEqual(paths[2]["attrs"]["strokeWidth"], "2.500000dp")
+
+
 class TestIconTypeSniffing(unittest.TestCase):
     """混淆 APK 的资源路径可能没有扩展名，提取链必须按魔数兜底。"""
 
