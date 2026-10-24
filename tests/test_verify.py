@@ -997,6 +997,24 @@ def test_adaptive_icon_without_background_composes_transparent(monkeypatch):
     assert captured["background"] == {"type": "color", "value": "#00000000"}
 
 
+def test_adaptive_layer_addr_old_type_prefix_variants():
+    """旧版 aapt2 的 (type 0x…) 前缀无论位数都要能提取出层地址。
+
+    旧实现把前缀写死为 (type 0x01)（两位），而实测旧版输出是
+    (type 0x1)（一位，与 vector.py 的 _TYPE_PREFIX_RE 一致），层地址
+    会被漏提、图标落到位图回退。
+    """
+    xml = (
+        "E: adaptive-icon (line=1)\n"
+        "  E: foreground (line=2)\n"
+        "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=(type 0x1)0x7f0800bb\n"
+        "  E: background (line=3)\n"
+        "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=(type 0x01)0x7f060045\n"
+    )
+    assert apk_parser_mod.find_adaptive_layer_addr(xml, "foreground") == "0x7f0800bb"
+    assert apk_parser_mod.find_adaptive_layer_addr(xml, "background") == "0x7f060045"
+
+
 def test_adaptive_icon_failed_dump_is_attempted_once(monkeypatch):
     """自适应图标的资源 dump 失败后，回退阶段不应再重试一次。"""
     dump_calls = []

@@ -53,12 +53,13 @@ def find_adaptive_layer_addr(xml_output: str, layer: str):
 
     兼容两种 aapt 输出格式：
         新版: A: ...:drawable(0x01010199)=@0x7f060000
-        旧版: A: ...:drawable(0x01010199)=(type 0x01)0x7f060000
+        旧版: A: ...:drawable(0x01010199)=(type 0x1)0x7f060000
+              （type 值的位数随 aapt2 版本，1–2 位十六进制都兼容）
     找不到返回 None。
     """
     lines = (xml_output or "").splitlines()
     ref_re = re.compile(
-        r"A: [^=\n]*?(\w+)\(0x[0-9a-fA-F]+\)\s*=\s*(?:\(type\s+0x01\)\s*)?@?(0x[0-9a-fA-F]+)"
+        r"A: [^=\n]*?(\w+)\(0x[0-9a-fA-F]+\)\s*=\s*(?:\(type\s+0x[0-9a-fA-F]+\)\s*)?@?(0x[0-9a-fA-F]+)"
     )
     for i, line in enumerate(lines):
         m = re.match(r"^(\s*)E:\s+" + re.escape(layer) + r"\s*\(", line)
@@ -91,7 +92,7 @@ def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int
         # 纯矢量 drawable：交由 rasterize_vector_layer 栅格化
         return ("vector", xml_path, None)
     m = re.search(
-        r"A: [^=\n]*?drawable\(0x[0-9a-fA-F]+\)\s*=\s*(?:\(type\s+0x01\)\s*)?@?(0x[0-9a-fA-F]+)",
+        r"A: [^=\n]*?drawable\(0x[0-9a-fA-F]+\)\s*=\s*(?:\(type\s+0x[0-9a-fA-F]+\)\s*)?@?(0x[0-9a-fA-F]+)",
         xml_out,
     )
     if not m:
@@ -99,7 +100,7 @@ def _resolve_xml_wrapper(apk_path: str, full_res: str, xml_path: str, depth: int
     scale = None
     sw = re.search(r"scaleWidth[^=\n]*=\s*\"([0-9]+(?:\.[0-9]+)?)%\"", xml_out)
     sh = re.search(r"scaleHeight[^=\n]*=\s*\"([0-9]+(?:\.[0-9]+)?)%\"", xml_out)
-    sg = re.search(r"scaleGravity\([^)]*\)\s*=\s*(?:\(type\s+0x10\)\s*)?(0x[0-9a-fA-F]+)", xml_out)
+    sg = re.search(r"scaleGravity\([^)]*\)\s*=\s*(?:\(type\s+0x[0-9a-fA-F]+\)\s*)?(0x[0-9a-fA-F]+)", xml_out)
     if sw or sh:
         scale = (
             float(sw.group(1)) if sw else 100.0,
