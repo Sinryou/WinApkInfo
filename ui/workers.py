@@ -191,6 +191,11 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
         # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
         # 十几条引用就是数秒），并瞬时产生大量行字符串。
         full_res = run_aapt2_dump_resource(apk_path)
+        if full_res is None:
+            # 本次图标提取已经尝试过资源表 dump 且失败。空串是"已尝试、
+            # 无数据"的哨兵：渲染层看到它不会再把每个颜色引用都重跑一次
+            # aapt2（一次 60s 超时会被放大成 N×60s）。
+            full_res = ""
         index = ResourceIndex(full_res) if full_res else None
         img = rasterize_vector_layer(apk_path, icon_path, ICON_SIZE, full_res, index)
         if img is None:
@@ -204,9 +209,11 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     index = None
     if fg_addr and bg_addr:
         full_res = run_aapt2_dump_resource(apk_path)
+        if full_res is None:
+            full_res = ""  # 已尝试且失败：禁止回退阶段重复 dump
         check()
         # 一次性索引全量输出，后续所有资源条目查询 O(1)
-        index = ResourceIndex(full_res)
+        index = ResourceIndex(full_res) if full_res else None
         fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
         bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
         check()
@@ -231,8 +238,10 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     check()
     if full_res is None:
         full_res = run_aapt2_dump_resource(apk_path)
+        if full_res is None:
+            full_res = ""
         check()
-        index = ResourceIndex(full_res)
+        index = ResourceIndex(full_res) if full_res else None
     fallback = find_mipmap_fallback(full_res, icon_path, index)
     if fallback:
         with open_apk_zip(apk_path, zf) as shared_zf:

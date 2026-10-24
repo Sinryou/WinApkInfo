@@ -874,6 +874,10 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
 
     颜色资源本身也可能是一条别名（`() @0x0106...`，Material You 动态色
     在 APK 里就是这种形态），因此这里要跟随引用链；深度受限防止循环。
+
+    full_res 为 None 表示尚未尝试 dump，函数会按需读取一次；为空串则表示
+    调用方已经尝试过且失败（例如 workers 里的失败哨兵），此时直接放弃，
+    避免同一次图标提取为每个颜色引用重复启动 aapt2。
     """
     v = (color_value or "").strip()
     if v.startswith("#"):
@@ -894,8 +898,11 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
             if ref in FRAMEWORK_COLOR_MAP:
                 return ("color", parse_android_color(FRAMEWORK_COLOR_MAP[ref]))
             return None
-    if not full_res:
+    if full_res is None:
         full_res = run_aapt2_dump_resource(apk_path)
+    if not full_res:
+        # 空串/空表：dump 已尝试但不可用，不要再为下一个引用重试
+        return None
     info = get_resource_info(extract_resource_entry(full_res, ref, index))
     if info["type"] == "color":
         try:

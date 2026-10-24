@@ -627,6 +627,69 @@ def test_vector_icon_reuses_resource_index(monkeypatch):
     assert data.startswith(b"\x89PNG")
 
 
+_VECTOR_WITH_REFS_XML = (
+    "E: vector (line=1)\n"
+    "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108\n"
+    "  A: http://schemas.android.com/apk/res/android:viewportHeight(0x01010403)=108\n"
+    "  E: path (line=2)\n"
+    "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=@0x7f010001\n"
+    "    A: http://schemas.android.com/apk/res/android:pathData(0x01010405)=\"M0,0 L10,0 L10,10 Z\"\n"
+)
+
+_ADAPTIVE_ICON_XML = (
+    "E: adaptive-icon (line=1)\n"
+    "  E: background (line=2)\n"
+    "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=@0x7f010001\n"
+    "  E: foreground (line=3)\n"
+    "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=@0x7f010002\n"
+)
+
+
+def test_root_vector_failed_dump_is_attempted_once(monkeypatch):
+    """资源 dump 失败时，根 vector 不能为每个颜色引用重跑 aapt2。
+
+    失败一次后必须把空串哨兵传给渲染层；否则 N 个颜色引用会把一次
+    60s 超时放大成 N×60s。
+    """
+    dump_calls = []
+    captured = {}
+
+    def fake_rasterize(apk_path, xml_path, size, full_res=None, index=None):
+        captured["full_res"] = full_res
+        return Image.new("RGBA", (size, size), (255, 0, 0, 255))
+
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _VECTOR_WITH_REFS_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource",
+                        lambda apk: dump_calls.append(apk) or None)
+    monkeypatch.setattr(workers_mod, "rasterize_vector_layer", fake_rasterize)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert len(dump_calls) == 1, dump_calls
+    assert captured["full_res"] == "", "必须传空串哨兵，禁止逐引用重试"
+    assert data.startswith(b"\x89PNG")
+
+
+def test_adaptive_icon_failed_dump_is_attempted_once(monkeypatch):
+    """自适应图标的资源 dump 失败后，回退阶段不应再重试一次。"""
+    dump_calls = []
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _ADAPTIVE_ICON_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource",
+                        lambda apk: dump_calls.append(apk) or None)
+    monkeypatch.setattr(workers_mod, "find_mipmap_fallback", lambda *a: None)
+
+    image, data = workers_mod._adaptive_icon_result("x.apk", "res/icon.xml", lambda: None)
+    assert image is None and data == b""
+    assert len(dump_calls) == 1, dump_calls
+
+
+def test_empty_resource_sentinel_prevents_retry():
+    """_resolve_vector_fill 收到空串哨兵时不能再触发 dump。"""
+    with mock.patch.object(vec_mod, "run_aapt2_dump_resource") as dump:
+        self_result = vec_mod._resolve_vector_fill("x.apk", "", "@0x7f010001")
+    assert self_result is None
+    dump.assert_not_called()
+
+
 class TestMiniFixtureAPK(unittest.TestCase):
     """迷你 APK 固件：CI 上也能跑的端到端链路（badging → 图标提取）。
 
