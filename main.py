@@ -21,12 +21,12 @@ import tempfile
 
 from PyQt6 import QtWidgets
 
-from core.aapt import _decode_output, _run_aapt2, find_aapt2, run_aapt2_dump_badging
+from core.aapt import aapt2_version, find_aapt2, run_aapt2_dump_badging
 from core.apk_parser import parse_aapt2_output
 from core.paths import default_log_dir
 from core.resources import load_sdk_versions, local_resource_path
 from ui.main_window import MainWindow, install_excepthook
-from ui.workers import IconWorker
+from ui.workers import extract_icon
 from version import __version__
 
 
@@ -43,12 +43,11 @@ def _self_test(apk_path: str = None) -> int:
     aapt2_path = None
     try:
         aapt2_path = find_aapt2()
-        rc, out, err = _run_aapt2([aapt2_path, "version"], timeout=30)
-        if rc != 0:
-            detail = (_decode_output(err or out)).strip() or f"退出码 {rc}"
-            problems.append(f"aapt2 无法运行：{detail}")
-    except Exception as e:
+        aapt2_version()
+    except FileNotFoundError as e:
         problems.append(f"找不到可用的 aapt2：{e}")
+    except Exception as e:
+        problems.append(str(e))
 
     for rel in ("resources/android_sdk_versions.json", "resources/logo.ico", "resources/info.png"):
         path = local_resource_path(rel)
@@ -69,7 +68,7 @@ def _self_test(apk_path: str = None) -> int:
                 problems.append(f"样本 APK 没有可用图标：{apk_path}")
             else:
                 icon_path = max(icons.items(), key=lambda item: int(item[0]))[1]
-                image, data = IconWorker()._extract(apk_path, icon_path)
+                image, data = extract_icon(apk_path, icon_path)
                 if image.isNull() or not data:
                     problems.append(f"样本 APK 图标提取结果为空：{icon_path}")
                 else:

@@ -388,6 +388,20 @@ def find_aapt2() -> str:
     raise FileNotFoundError("未找到 aapt2，请将 aapt2 放到脚本同级目录或加入系统 PATH。")
 
 
+def aapt2_version(timeout: int = 30) -> str:
+    """运行 `aapt2 version` 并返回解码后的输出文本。
+
+    供构建链路（--self-test）验证 aapt2 可执行，避免其直接依赖
+    _run_aapt2/_decode_output 私有符号；找不到或非零退出时抛异常
+    （FileNotFoundError / Aapt2Error，message 已含解码后的原因）。
+    """
+    rc, out, err = _run_aapt2([find_aapt2(), "version"], timeout=timeout)
+    if rc != 0:
+        detail = (_decode_output(err or out)).strip() or f"退出码 {rc}"
+        raise Aapt2Error(f"aapt2 无法运行：{detail}")
+    return _decode_output(out)
+
+
 def run_aapt2_dump_badging(apk_path: str) -> str:
     """
     运行 `aapt2 dump badging "<apk>"` 并返回 stdout 文本。

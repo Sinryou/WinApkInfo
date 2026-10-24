@@ -111,6 +111,164 @@ class _IconWorkerCore(QtCore.QObject):
             self.iconReady.emit(image, data, gen)
 
 
+def _never_cancelled():
+    """缺省取消检查回调：永不取消（--self-test 等无线程场景）。"""
+    return False
+
+
+def _load_image(img: QtGui.QImage, data: bytes) -> bool:
+    """把字节载入 QImage；Qt 解不了时用 PIL 转成标准 PNG 再试一次。
+
+    这里必须用 QImage 而不是 QPixmap：本函数在工作线程里执行，而
+    QPixmap 属于 GUI 线程对象（在部分平台/后续 Qt 版本上于子线程使用
+    属未定义行为）。转 QPixmap 的动作放在 GUI 线程的 on_icon_loaded 里。
+    """
+    if img.loadFromData(data):
+        return True
+    try:
+        im = Image.open(io.BytesIO(data)).convert("RGBA")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return bool(img.loadFromData(buf.getvalue()))
+    except Exception:
+        return False
+
+
+def _icon_kind(apk_path: str, icon_path: str, zf=None):
+    """按后缀/魔数判断图标是位图还是 XML。
+
+    混淆包（AndResGuard 等）的资源路径可能完全没有扩展名，此时不能只靠
+    endswith 分派，否则明明能读取的图标会被判成"不支持的类型"。
+    """
+    lower = icon_path.lower()
+    if lower.endswith(_IMAGE_EXTENSIONS):
+        return "image"
+    if lower.endswith(".xml"):
+        return "xml"
+    try:
+        return _sniff_file_kind(apk_path, icon_path, zf=zf)
+    except Exception as e:
+        logging.debug("图标类型嗅探失败 %s: %s", icon_path, e)
+        return None
+
+
+def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes:
+    """XML 图标提取（自适应图标或普通 VectorDrawable），返回导出用 PNG 字节。
+
+    1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
+       mipmap/ic_launcher 直接指向一个普通矢量 drawable，它的
+       viewport 里已经画好了完整图标，没有 foreground/background 层；
+    2) 根元素是 <adaptive-icon> 时，从 xmltree 解析 foreground/background
+       资源地址，完整解析每一层（支持混淆字符串引用、无扩展名文件、
+       <scale> 包装），两层都能渲染（位图/颜色/矢量）时合成完整图标；
+    3) 结构不是标准 adaptive-icon、或任一层渲染失败时，回退到
+       icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
+
+    `dump resources` 只在确实需要时执行。check 为取消检查回调，请求
+    过期时抛 _Cancelled。
+    """
+    check()
+    xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
+
+    root_m = re.search(r"E:\s*(\S+)\s*\(", xml_out or "")
+    if root_m and root_m.group(1) == "vector":
+        check()
+        # 矢量图标的 fillColor/strokeColor 常引用应用内资源（@0x7f...）。
+        # 这里先建一次资源索引并透传给渲染层：否则每次引用都会走
+        # extract_resource_entry 的无索引路径，对整个 dump（真实包约
+        # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
+        # 十几条引用就是数秒），并瞬时产生大量行字符串。
+        full_res = run_aapt2_dump_resource(apk_path)
+        index = _ResourceIndex(full_res) if full_res else None
+        img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE, full_res, index)
+        if img is None:
+            return b""
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
+    bg_addr = find_adaptive_layer_addr(xml_out, "background")
+
+    full_res = None
+    index = None
+    if fg_addr and bg_addr:
+        full_res = run_aapt2_dump_resource(apk_path)
+        check()
+        # 一次性索引全量输出，后续所有资源条目查询 O(1)
+        index = _ResourceIndex(full_res)
+        fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
+        bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
+        check()
+        if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
+            try:
+                return extract_icon_bytes(
+                    apk_path,
+                    {"type": fg_kind, "value": fg_val},
+                    {"type": bg_kind, "value": bg_val},
+                    fg_scale=fg_scale,
+                    full_res=full_res,
+                    index=index,
+                    zf=zf,
+                )
+            except _Cancelled:
+                raise
+            except Exception as e:
+                # 层解析成功不代表能渲染：回退到下面的位图回退
+                logging.warning("合成自适应图标失败，改用位图回退: %s", e)
+
+    # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
+    check()
+    if full_res is None:
+        full_res = run_aapt2_dump_resource(apk_path)
+        check()
+        index = _ResourceIndex(full_res)
+    fallback = find_mipmap_fallback(full_res, icon_path, index)
+    if fallback:
+        with _open_apk_zip(apk_path, zf) as shared_zf:
+            img = Image.open(shared_zf.open(fallback)).convert("RGBA")
+        img = img.resize((_ICON_SIZE, _ICON_SIZE), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    return b""
+
+
+def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
+    """执行一次完整图标提取，返回 (QImage, 导出用 PNG 字节)。
+
+    独立于 IconWorker 线程的纯执行逻辑：--self-test 等不涉及 Qt 线程的
+    场景直接调用本函数即可，无需为同步跑一次提取而构造未启动的 QThread。
+    check_cancel 是可选取消检查回调（过期时抛 _Cancelled）；线程内调用
+    时由 IconWorker 传入自己的检查点。
+    """
+    check = check_cancel or _never_cancelled
+    img = QtGui.QImage()
+    data = b""
+    with _open_apk_zip(apk_path, zf) as shared_zf:
+        kind = _icon_kind(apk_path, icon_path, shared_zf)
+        if kind == "image":
+            raw = shared_zf.open(icon_path).read()
+            data = _normalize_icon_png(raw) or raw
+            if not _load_image(img, data):
+                # 后缀可能是伪装/错误的：按魔数再确认一次是否为 XML。
+                # 例如 AndResGuard 有时会把二进制 XML 改名成 .png。
+                if _sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
+                    kind = "xml"
+                else:
+                    raise ValueError(f"图标文件无法解码为图片: {icon_path}")
+
+        if kind == "xml":
+            data = _adaptive_icon_bytes(apk_path, icon_path, check, zf=shared_zf)
+            if not data:
+                raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
+            if not _load_image(img, data):
+                raise ValueError("合成后的图标无法解码为图片")
+        elif kind != "image":
+            raise ValueError(f"无法识别图标类型（非图片也非 XML）: {icon_path}")
+    return img, data
+
+
 class IconWorker(QtCore.QThread):
     """常驻的图标提取工作线程（Worker-Object 门面与生命周期管理）。
 
@@ -153,148 +311,16 @@ class IconWorker(QtCore.QThread):
         """当前请求已过期（有新请求/窗口关闭）时抛出 _Cancelled。"""
         self._core.check_cancel()
 
-    @staticmethod
-    def _load_image(img: QtGui.QImage, data: bytes) -> bool:
-        """把字节载入 QImage；Qt 解不了时用 PIL 转成标准 PNG 再试一次。
-
-        这里必须用 QImage 而不是 QPixmap：本方法在工作线程里执行，而
-        QPixmap 属于 GUI 线程对象（在部分平台/后续 Qt 版本上于子线程使用
-        属未定义行为）。转 QPixmap 的动作放在 GUI 线程的 on_icon_loaded 里。
-        """
-        if img.loadFromData(data):
-            return True
-        try:
-            im = Image.open(io.BytesIO(data)).convert("RGBA")
-            buf = io.BytesIO()
-            im.save(buf, format="PNG")
-            return bool(img.loadFromData(buf.getvalue()))
-        except Exception:
-            return False
+    # 子线程只碰 QImage（回归守护：_load_image 必须在，_load_pixmap 不许回来）
+    _load_image = staticmethod(_load_image)
 
     def _extract_adaptive_icon(self, apk_path: str, icon_path: str, zf=None) -> bytes:
-        """
-        XML 图标提取（自适应图标或普通 VectorDrawable）：
-        1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
-           mipmap/ic_launcher 直接指向一个普通矢量 drawable，它的
-           viewport 里已经画好了完整图标，没有 foreground/background 层；
-        2) 根元素是 <adaptive-icon> 时，从 xmltree 解析 foreground/background
-           资源地址，完整解析每一层（支持混淆字符串引用、无扩展名文件、
-           <scale> 包装），两层都能渲染（位图/颜色/矢量）时合成完整图标；
-        3) 结构不是标准 adaptive-icon、或任一层渲染失败时，回退到
-           icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
-
-        `dump resources` 只在确实需要时执行。
-        """
-        self._check_cancel()
-        xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
-
-        root_m = re.search(r"E:\s*(\S+)\s*\(", xml_out or "")
-        if root_m and root_m.group(1) == "vector":
-            self._check_cancel()
-            # 矢量图标的 fillColor/strokeColor 常引用应用内资源（@0x7f...）。
-            # 这里先建一次资源索引并透传给渲染层：否则每次引用都会走
-            # extract_resource_entry 的无索引路径，对整个 dump（真实包约
-            # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
-            # 十几条引用就是数秒），并瞬时产生大量行字符串。
-            full_res = run_aapt2_dump_resource(apk_path)
-            index = _ResourceIndex(full_res) if full_res else None
-            img = rasterize_vector_layer(apk_path, icon_path, _ICON_SIZE, full_res, index)
-            if img is None:
-                return b""
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-
-        fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
-        bg_addr = find_adaptive_layer_addr(xml_out, "background")
-
-        full_res = None
-        index = None
-        if fg_addr and bg_addr:
-            full_res = run_aapt2_dump_resource(apk_path)
-            self._check_cancel()
-            # 一次性索引全量输出，后续所有资源条目查询 O(1)
-            index = _ResourceIndex(full_res)
-            fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
-            bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
-            self._check_cancel()
-            if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
-                try:
-                    return extract_icon_bytes(
-                        apk_path,
-                        {"type": fg_kind, "value": fg_val},
-                        {"type": bg_kind, "value": bg_val},
-                        fg_scale=fg_scale,
-                        full_res=full_res,
-                        index=index,
-                        zf=zf,
-                    )
-                except _Cancelled:
-                    raise
-                except Exception as e:
-                    # 层解析成功不代表能渲染：回退到下面的位图回退
-                    logging.warning("合成自适应图标失败，改用位图回退: %s", e)
-
-        # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
-        self._check_cancel()
-        if full_res is None:
-            full_res = run_aapt2_dump_resource(apk_path)
-            self._check_cancel()
-            index = _ResourceIndex(full_res)
-        fallback = find_mipmap_fallback(full_res, icon_path, index)
-        if fallback:
-            with _open_apk_zip(apk_path, zf) as shared_zf:
-                img = Image.open(shared_zf.open(fallback)).convert("RGBA")
-            img = img.resize((_ICON_SIZE, _ICON_SIZE), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-        return b""
+        """向后兼容入口：实现见模块级 _adaptive_icon_bytes。"""
+        return _adaptive_icon_bytes(apk_path, icon_path, self._check_cancel, zf)
 
     def _extract(self, apk_path: str, icon_path: str, zf=None):
-        """执行一次提取，返回 (QImage, 导出用 PNG 字节)。"""
-        img = QtGui.QImage()
-        data = b""
-        with _open_apk_zip(apk_path, zf) as shared_zf:
-            kind = self._icon_kind(apk_path, icon_path, shared_zf)
-            if kind == "image":
-                raw = shared_zf.open(icon_path).read()
-                data = _normalize_icon_png(raw) or raw
-                if not self._load_image(img, data):
-                    # 后缀可能是伪装/错误的：按魔数再确认一次是否为 XML。
-                    # 例如 AndResGuard 有时会把二进制 XML 改名成 .png。
-                    if _sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
-                        kind = "xml"
-                    else:
-                        raise ValueError(f"图标文件无法解码为图片: {icon_path}")
-
-            if kind == "xml":
-                data = self._extract_adaptive_icon(apk_path, icon_path, zf=shared_zf)
-                if not data:
-                    raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
-                if not self._load_image(img, data):
-                    raise ValueError("合成后的图标无法解码为图片")
-            elif kind != "image":
-                raise ValueError(f"无法识别图标类型（非图片也非 XML）: {icon_path}")
-        return img, data
-
-    @staticmethod
-    def _icon_kind(apk_path: str, icon_path: str, zf=None):
-        """按后缀/魔数判断图标是位图还是 XML。
-
-        混淆包（AndResGuard 等）的资源路径可能完全没有扩展名，此时不能只靠
-        endswith 分派，否则明明能读取的图标会被判成“不支持的类型”。
-        """
-        lower = icon_path.lower()
-        if lower.endswith(_IMAGE_EXTENSIONS):
-            return "image"
-        if lower.endswith(".xml"):
-            return "xml"
-        try:
-            return _sniff_file_kind(apk_path, icon_path, zf=zf)
-        except Exception as e:
-            logging.debug("图标类型嗅探失败 %s: %s", icon_path, e)
-            return None
+        """向后兼容入口：实现见模块级 extract_icon。"""
+        return extract_icon(apk_path, icon_path, check_cancel=self._check_cancel, zf=zf)
 
 
 class _ApkInfoWorkerCore(QtCore.QObject):
