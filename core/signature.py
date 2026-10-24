@@ -207,17 +207,23 @@ def extract_apk_signatures(apk_path: str) -> dict:
 
                                 if pair_id in (0x7109871a, 0xf05368c0):
                                     pos = 0
-                                    signers_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
+                                    signers_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]
+                                    pos += 4
                                     while pos < 4 + signers_len:
-                                        signer_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
+                                        signer_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]
+                                        pos += 4
                                         signer_end = pos + signer_len
                                         pos += 4  # signed_data_len
-                                        digests_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4 + digests_len
-                                        certs_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
+                                        digests_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]
+                                        pos += 4 + digests_len
+                                        certs_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]
+                                        pos += 4
                                         certs_end = pos + certs_len
                                         while pos < certs_end:
-                                            cert_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]; pos += 4
-                                            cert_der = pair_val[pos:pos + cert_len]; pos += cert_len
+                                            cert_len = struct.unpack("<I", pair_val[pos:pos + 4])[0]
+                                            pos += 4
+                                            cert_der = pair_val[pos:pos + cert_len]
+                                            pos += cert_len
                                             scheme_tag = "v2" if pair_id == 0x7109871a else "v3"
                                             certs_raw.append((scheme_tag, cert_der))
                                         pos = signer_end

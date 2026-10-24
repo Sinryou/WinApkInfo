@@ -94,12 +94,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 基本信息（表单）
         form = QtWidgets.QFormLayout()
-        self.le_app_name = QtWidgets.QLineEdit(); self.le_app_name.setReadOnly(True)
-        self.le_pkg = QtWidgets.QLineEdit(); self.le_pkg.setReadOnly(True)
-        self.le_ver = QtWidgets.QLineEdit(); self.le_ver.setReadOnly(True)
-        self.le_sdk = QtWidgets.QLineEdit(); self.le_sdk.setReadOnly(True)
-        self.le_launch = QtWidgets.QLineEdit(); self.le_launch.setReadOnly(True)
-        self.le_arch = QtWidgets.QLineEdit(); self.le_arch.setReadOnly(True)  # 新增架构显示
+        self.le_app_name = QtWidgets.QLineEdit()
+        self.le_app_name.setReadOnly(True)
+        self.le_pkg = QtWidgets.QLineEdit()
+        self.le_pkg.setReadOnly(True)
+        self.le_ver = QtWidgets.QLineEdit()
+        self.le_ver.setReadOnly(True)
+        self.le_sdk = QtWidgets.QLineEdit()
+        self.le_sdk.setReadOnly(True)
+        self.le_launch = QtWidgets.QLineEdit()
+        self.le_launch.setReadOnly(True)
+        self.le_arch = QtWidgets.QLineEdit()  # 新增架构显示
+        self.le_arch.setReadOnly(True)
 
         form.addRow("APP 名称（优先中文）：", self.le_app_name)
         form.addRow("APK 包名：", self.le_pkg)

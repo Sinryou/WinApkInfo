@@ -159,8 +159,10 @@ def reference_fill_mask(W, H, subpaths, fill_rule="nonzero"):
     edges = vector_mod._collect_edges(subpaths)
     if not edges:
         return arr
-    x1 = np.array([e[0] for e in edges]); y1 = np.array([e[1] for e in edges])
-    x2 = np.array([e[2] for e in edges]); y2 = np.array([e[3] for e in edges])
+    x1 = np.array([e[0] for e in edges])
+    y1 = np.array([e[1] for e in edges])
+    x2 = np.array([e[2] for e in edges])
+    y2 = np.array([e[3] for e in edges])
     y_lo = max(0, int(math.floor(min(y1.min(), y2.min()))))
     y_hi = min(H, int(math.ceil(max(y1.max(), y2.max()))))
     if y_lo >= y_hi:
@@ -599,7 +601,8 @@ def check_p1_7(app):
     win2.apk_path_edit.setText(target)
     C.check("_apk_path 为空时回退输入框", os.path.normcase(win2._current_apk_path()) ==
             os.path.normcase(target))
-    win.close(); win2.close()
+    win.close()
+    win2.close()
 
 
 def check_p1_8(app):
@@ -931,7 +934,10 @@ def check_b1(app):
     import core.vector as core_vector
     saved_parser = core_apk_parser.run_aapt2_dump_xmltree
     saved_vector = core_vector.run_aapt2_dump_xmltree
-    fake_dump = lambda apk, p, _t=fake_bitmap: _t
+
+    def fake_dump(apk, p, _t=fake_bitmap):
+        return _t
+
     core_apk_parser.run_aapt2_dump_xmltree = fake_dump
     core_vector.run_aapt2_dump_xmltree = fake_dump
     try:
@@ -979,7 +985,8 @@ def check_b1(app):
         saved_parser_raster = core_apk_parser.rasterize_vector_layer
         saved_vector_raster = core_vector.rasterize_vector_layer
         if force_fail:
-            fail_fn = lambda *a, **k: None
+            def fail_fn(*a, **k):
+                return None
             ui_workers.rasterize_vector_layer = fail_fn
             core_apk_parser.rasterize_vector_layer = fail_fn
             core_vector.rasterize_vector_layer = fail_fn
