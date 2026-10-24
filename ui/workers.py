@@ -150,6 +150,20 @@ def _load_image(img: QtGui.QImage, data: bytes) -> bool:
         return False
 
 
+def _qimage_png_bytes(img: QtGui.QImage) -> bytes:
+    """把 QImage 编码成 PNG 字节（Pillow 解码失败、Qt 单独解码成功时使用）。"""
+    if img.isNull():
+        return b""
+    buf = QtCore.QBuffer()
+    buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+    try:
+        if not img.save(buf, "PNG"):
+            return b""
+        return bytes(buf.data())
+    finally:
+        buf.close()
+
+
 def _qimage_from_pil(im: Image.Image) -> QtGui.QImage:
     """PIL RGBA Image → QImage：像素直接搬运，不经 PNG 编码/解码。
 
@@ -199,7 +213,7 @@ def _adaptive_layers_need_index(full_res: str, *addrs) -> bool:
     return False
 
 
-def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
+def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None, reason_out=None):
     """XML 图标提取（自适应图标或普通 VectorDrawable），返回 (PIL Image, 导出用 PNG 字节)。
 
     1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
@@ -214,7 +228,12 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     `dump resources` 只在确实需要时执行。check 为取消检查回调，请求
     过期时抛 _Cancelled。Image 供显示直接转 QImage；导出字节随图像
     一次成型，不再"编码成 PNG 交调用方解码回来"。
+    reason_out 为可选的列表：失败时追加可展示的具体原因（例如资源表
+    dump 超时），让上层不再只能提示笼统的"无法渲染"。
     """
+    reason = "自适应图标的前景/背景均无法渲染，且未找到位图回退图标"
+    resource_failed = False
+    compose_error = ""
     check()
     xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
 
@@ -232,10 +251,15 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
                 # 本次图标提取已经尝试过资源表 dump 且失败。空串是"已尝试、
                 # 无数据"的哨兵：渲染层看到它不会再把每个颜色引用都重跑一次
                 # aapt2（一次 60s 超时会被放大成 N×60s）。
+                resource_failed = True
                 full_res = ""
             index = get_resource_index(full_res)
         img = rasterize_vector_layer(apk_path, icon_path, ICON_SIZE, full_res, index)
         if img is None:
+            reason = ("aapt2 资源表 dump 失败（超时或执行错误），矢量图标无法解析；详见日志"
+                      if resource_failed else "矢量图标栅格化失败")
+            if reason_out is not None:
+                reason_out.append(reason)
             return None, b""
         return img, to_png_bytes(img)
 
@@ -247,6 +271,7 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     if fg_addr and bg_addr:
         full_res = run_aapt2_dump_resource(apk_path)
         if full_res is None:
+            resource_failed = True
             full_res = ""  # 已尝试且失败：禁止回退阶段重复 dump
         check()
         # 只有层值还需要继续解引用（别名/字符串文件/矢量）时才构建全量
@@ -271,6 +296,7 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
                 raise
             except Exception as e:
                 # 层解析成功不代表能渲染：回退到下面的位图回退
+                compose_error = str(e)
                 logging.warning("合成自适应图标失败，改用位图回退: %s", e)
 
     # 回退：找 icon xml 所属 mipmap 条目的最高密度位图
@@ -278,6 +304,7 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     if full_res is None:
         full_res = run_aapt2_dump_resource(apk_path)
         if full_res is None:
+            resource_failed = True
             full_res = ""
         check()
         index = get_resource_index(full_res)
@@ -288,6 +315,12 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
                 img = Image.open(f).convert("RGBA")
         img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
         return img, to_png_bytes(img)
+    if resource_failed:
+        reason = "aapt2 资源表 dump 失败（超时或执行错误），无法解析图标；详见日志"
+    elif compose_error:
+        reason = f"自适应图标合成失败且未找到位图回退：{compose_error}"
+    if reason_out is not None:
+        reason_out.append(reason)
     return None, b""
 
 
@@ -319,11 +352,18 @@ def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
                     kind = "xml"
                 else:
                     raise ValueError(f"图标文件无法解码为图片: {icon_path}")
+            else:
+                # Pillow 解不了但 Qt 能解：用 Qt 已解出的图像补导出字节，
+                # 避免“图标能显示、导出按钮可见，但导出时没有数据”。
+                data = _qimage_png_bytes(img)
 
         if kind == "xml":
-            im, data = _adaptive_icon_result(apk_path, icon_path, check, zf=shared_zf)
+            reasons = []
+            im, data = _adaptive_icon_result(
+                apk_path, icon_path, check, zf=shared_zf, reason_out=reasons)
             if not data:
-                raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
+                raise ValueError(reasons[0] if reasons else
+                                 "自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
             img = _qimage_from_pil(im) if im is not None else QtGui.QImage()
             if img.isNull():
                 raise ValueError("合成后的图标无法解码为图片")

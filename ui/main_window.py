@@ -644,8 +644,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_icon_hint.clear()
         self.lbl_icon_hint.setToolTip("")
         if not pix.isNull():
-            self._current_icon_bytes = data
-            self.btn_export_icon.setVisible(True)
+            self._current_icon_bytes = data or None
+            self.btn_export_icon.setVisible(bool(data))
         else:
             self._current_icon_bytes = None
             self.btn_export_icon.setVisible(False)
