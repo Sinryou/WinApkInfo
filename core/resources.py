@@ -263,6 +263,22 @@ def _normalize_resource_key(res_id: str) -> str:
     return key
 
 
+# 无索引条目查询的区间扫描正则，与 ResourceIndex._iter_entries 的头行/
+# 边界规则同源：条目以 `resource 0x… <name>` 行开始，到下一 `resource 0x`
+# 行或 `type <type> id=..` 分节行之前结束。
+ENTRY_HEAD_RE = re.compile(r"(?m)^[ \t]*resource[ \t]+(\S+)(?:[ \t]+(\S+))?")
+ENTRY_BOUNDARY_RE = re.compile(r"(?m)^[ \t]*(?:resource[ \t]+0x|type\s+\w+\s+id=)")
+
+
+def entry_text_span(text: str, head_m) -> str:
+    """给定条目头行 match（ENTRY_HEAD_RE），返回头行起至下一边界前的原文。
+
+    与 ResourceIndex 的区间切片语义一致（含尾部换行，到边界行首为止）。
+    """
+    em = ENTRY_BOUNDARY_RE.search(text, head_m.end())
+    return text[head_m.start(): em.start() if em else len(text)]
+
+
 def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
     """
     从 `aapt2 dump resources` 全量输出中精确截取某个资源条目。
@@ -274,6 +290,12 @@ def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
         - 数字地址：0x7f0600f1（大小写不敏感）；
         - 命名引用：color/feature_x（按条目头行的 type/name 查询）。
     找不到返回空字符串。传入 index（ResourceIndex）时 O(1) 查询。
+
+    无索引路径把查询键直接编进正则做单键定位：re.search 命中目标头行
+    即止，边界截取复用 entry_text_span（与 ResourceIndex 同源）。不像
+    旧实现那样每次查询都把几十 MB 的 dump 全量 splitlines 物化成几十万
+    行字符串——自适应图标直接 color/image 层这条最热路径不建索引，
+    一次提取要在这份 dump 上连续查询多次。
     """
     key = _normalize_resource_key(res_id)
     is_hex = key[:2] == "0x"
@@ -283,25 +305,19 @@ def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
             return index.by_id.get(key, "")
         return index.by_name.get(key, "")
 
-    lines = (full_output or "").splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if not s.startswith("resource "):
-            continue
-        parts = s.split()
-        if is_hex:
-            if len(parts) >= 2 and parts[1] == key:
-                start = i
-                break
-        elif len(parts) >= 3 and parts[2] == key:
-            start = i
-            break
-    if start is None:
+    text = full_output or ""
+    if not text or not key:
         return ""
-
-    a, b = entry_span(lines, start)
-    return "\n".join(lines[a:b])
+    # 键值逐字符等值：前瞻要求键后紧跟空白/行尾，排除同前缀的更长 token
+    # （如 0x7f01 不能命中 0x7f012）。命名键含 '.'、':'、'/' 等，统一 escape。
+    if is_hex:
+        head_re = re.compile(r"(?m)^[ \t]*resource[ \t]+" + re.escape(key) + r"(?=[ \t\r]|$)")
+    else:
+        head_re = re.compile(r"(?m)^[ \t]*resource[ \t]+\S+[ \t]+" + re.escape(key) + r"(?=[ \t\r]|$)")
+    hm = head_re.search(text)
+    if hm is None:
+        return ""
+    return entry_text_span(text, hm)
 
 
 def density_of(qualifier: str) -> str:

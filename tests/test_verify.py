@@ -332,6 +332,39 @@ class TestResourceIndex(unittest.TestCase):
         self.assertIsNot(first, res_mod.get_resource_index(text))
         self.assertIsNone(res_mod.get_resource_index(""))
 
+    def test_extract_entry_no_index_matches_index(self):
+        """无索引区间扫描必须与索引切片返回一致的结果。
+
+        无索引路径是自适应图标直接 color/image 层的最热查询路径。
+        覆盖：首条目、中间条目、末尾条目（其后无边界行）、type 分节行
+        边界、十六进制大小写归一、命名引用与查不到的键。
+        """
+        text = (
+            "type drawable id=0x1\n"
+            "resource 0x7f080001 drawable/first\n"
+            "    (hdpi) (file) res/drawable-hdpi/first.png type=PNG\n"
+            "    (xhdpi) (file) res/drawable-xhdpi/first.png type=PNG\n"
+            "resource 0x7f0600f1 color/brand\n"
+            "    () #ff0096fa\n"
+            "resource 0x7f080002 drawable/last\n"
+            "    (anydpi) (file) res/drawable/last.xml type=XML\n"
+        )
+        index = res_mod.ResourceIndex(text)
+        for res_id in ("0x7f080001", "0x7F080001", "@color/brand", "drawable/first",
+                       "drawable/last", "0x7f080002", "0xffffffff", "color/missing"):
+            self.assertEqual(
+                res_mod.extract_resource_entry(text, res_id),
+                res_mod.extract_resource_entry(text, res_id, index),
+                f"res_id={res_id}",
+            )
+        # 末尾条目（其后没有边界行）不能吞掉前面条目；type 分节行要截断
+        last_entry = res_mod.extract_resource_entry(text, "0x7f080002")
+        self.assertIn("res/drawable/last.xml", last_entry)
+        self.assertNotIn("first.png", last_entry)
+        # 空输出与空键安全
+        self.assertEqual(res_mod.extract_resource_entry("", "0x7f080001"), "")
+        self.assertEqual(res_mod.extract_resource_entry(text, ""), "")
+
 
 _NAMED_ALIAS_FULL_RES = (
     "resource 0x7f080162 drawable/fg\n"

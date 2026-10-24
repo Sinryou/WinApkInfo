@@ -9,8 +9,9 @@ from PIL import Image
 from core.aapt import run_aapt2_dump_xmltree
 from core.colors import FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
-    entry_span, extract_resource_entry, density_of,
+    entry_text_span, extract_resource_entry, density_of,
     pick_best_density, sniff_file_kind, get_resource_info,
+    ENTRY_BOUNDARY_RE, ENTRY_HEAD_RE,
     BITMAP_EXTS, MAX_DEREF_DEPTH, open_apk_zip
 )
 from core.vector import rasterize_vector_layer
@@ -189,20 +190,26 @@ def find_mipmap_fallback(full_res: str, icon_xml_path: str, index=None):
             return None
         return pick_best_density(_collect_bitmap_variants(entry))
 
-    lines = (full_res or "").splitlines()
-    target = None
-    for i, line in enumerate(lines):
-        if f"(file) {icon_xml_path}" in line:
-            target = i
-            break
-    if target is None:
+    text = full_res or ""
+    target = text.find(f"(file) {icon_xml_path}")
+    if target == -1:
         return None
 
-    start = target
-    while start > 0 and not lines[start - 1].strip().startswith("resource 0x"):
-        start -= 1
-    a, b = entry_span(lines, start)
-    return pick_best_density(_collect_bitmap_variants("\n".join(lines[a:b])))
+    # 向前定位最近的 resource 0x 头行：区间扫描，命中即用，不把几十 MB
+    # 的 dump 全量 splitlines 物化成行列表（旧实现的回退路径走这里）。
+    head_m = None
+    for hm in ENTRY_HEAD_RE.finditer(text):
+        if hm.start() >= target:
+            break
+        if hm.group(1).startswith("0x"):
+            head_m = hm
+    if head_m is not None:
+        entry_text = entry_text_span(text, head_m)
+    else:
+        # 目标之前没有 resource 头行：条目从文本头开始
+        em = ENTRY_BOUNDARY_RE.search(text)
+        entry_text = text[: em.start() if em else len(text)]
+    return pick_best_density(_collect_bitmap_variants(entry_text))
 
 
 
