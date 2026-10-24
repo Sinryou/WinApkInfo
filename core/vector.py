@@ -1149,6 +1149,21 @@ def _load_vector_elements(apk_path, xml_path):
     return elems, vw, vh
 
 
+def vector_uses_resources(xml_out) -> bool:
+    """xmltree 中的 path 是否引用了应用资源。
+
+    根元素是 <vector> 时，只有 fillColor/strokeColor 指向资源才需要执行
+    `aapt2 dump resources` 并建索引；纯字面量颜色（#AARRGGBB）的矢量图标
+    可以完全跳过这一步，省掉大资源表上的一次全量 dump。
+    """
+    for el in _parse_vector_elements(xml_out):
+        for name in ("fillColor", "strokeColor"):
+            value = (el["attrs"].get(name) or "").strip()
+            if value.startswith("@") or value.lower().startswith("0x"):
+                return True
+    return False
+
+
 def _iter_path_draw_ops(elems, vw, vh, W, H):
     """共享的矢量元素树遍历：为每个可绘制的 <path> 产出渲染参数。
 

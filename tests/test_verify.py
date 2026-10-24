@@ -183,6 +183,20 @@ class TestResourceIndex(unittest.TestCase):
         self.assertEqual(m.get("0x7f010001"), "resource 0x7f010001\nvalue1\n")
         self.assertIsNone(m.get("0x99999999"))
 
+    def test_by_file_is_built_lazily(self):
+        """多数图标只按资源地址查询，不应预先扫描全表的文件行。"""
+        index = res_mod.ResourceIndex(_NAMED_ALIAS_FULL_RES)
+        self.assertIsNone(index._by_file)
+        entry = index.by_file.get("res/Tx.xml")
+        self.assertIn("res/Tx.xml", entry)
+
+    def test_index_cache_reuses_same_dump_text(self):
+        text = "resource 0x7f010001 color/x\n    () #ff0000\n"
+        first = res_mod.get_resource_index(text)
+        second = res_mod.get_resource_index(text)
+        self.assertIs(first, second)
+        self.assertIsNone(res_mod.get_resource_index(""))
+
 
 _NAMED_ALIAS_FULL_RES = (
     "resource 0x7f080162 drawable/fg\n"
@@ -332,6 +346,19 @@ class TestPathSamplingLimits(unittest.TestCase):
 
 class TestVectorElementParsing(unittest.TestCase):
     """aapt2 dump xmltree 属性值解析的格式兼容。"""
+
+    def test_vector_uses_resources(self):
+        literal = (
+            "E: vector (line=1)\n"
+            "  E: path (line=2)\n"
+            "    A: android:fillColor(0x01010404)=#ff0000ff\n"
+            "    A: android:pathData(0x01010405)=\"M0,0 L1,1\"\n"
+        )
+        at_ref = literal.replace("#ff0000ff", "@0x7f010001")
+        old_ref = literal.replace("#ff0000ff", "0x7f010001")
+        self.assertFalse(vec_mod.vector_uses_resources(literal))
+        self.assertTrue(vec_mod.vector_uses_resources(at_ref))
+        self.assertTrue(vec_mod.vector_uses_resources(old_ref))
 
     def test_old_type_prefix_reference(self):
         """旧版 aapt2 的资源引用带 (type 0x1) 前缀：不剥掉的话取值截断成
@@ -655,6 +682,9 @@ class TestBadgingLabelParsing(unittest.TestCase):
 _VECTOR_ICON_XML = (
     "E: vector (line=1)\n"
     "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108.0\n"
+    "  E: path (line=2)\n"
+    "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=@0x7f010001\n"
+    "    A: http://schemas.android.com/apk/res/android:pathData(0x01010405)=\"M0,0 L10,0 L10,10 Z\"\n"
 )
 _VECTOR_FULL_RES = (
     "resource 0x7f010001 res/color/c0\n"
@@ -703,6 +733,15 @@ _ADAPTIVE_ICON_XML = (
     "    A: http://schemas.android.com/apk/res/android:drawable(0x01010199)=@0x7f010002\n"
 )
 
+_VECTOR_LITERAL_XML = (
+    "E: vector (line=1)\n"
+    "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108\n"
+    "  A: http://schemas.android.com/apk/res/android:viewportHeight(0x01010403)=108\n"
+    "  E: path (line=2)\n"
+    "    A: http://schemas.android.com/apk/res/android:fillColor(0x01010404)=#ff6750a4\n"
+    "    A: http://schemas.android.com/apk/res/android:pathData(0x01010405)=\"M0,0 L10,0 L10,10 Z\"\n"
+)
+
 
 def test_root_vector_failed_dump_is_attempted_once(monkeypatch):
     """资源 dump 失败时，根 vector 不能为每个颜色引用重跑 aapt2。
@@ -726,6 +765,73 @@ def test_root_vector_failed_dump_is_attempted_once(monkeypatch):
     assert len(dump_calls) == 1, dump_calls
     assert captured["full_res"] == "", "必须传空串哨兵，禁止逐引用重试"
     assert data.startswith(b"\x89PNG")
+
+
+def test_root_vector_without_refs_skips_resource_dump(monkeypatch):
+    """纯字面量颜色的矢量图标不应触发 resources dump。"""
+    captured = {}
+
+    def fake_rasterize(apk_path, xml_path, size, full_res=None, index=None):
+        captured["full_res"] = full_res
+        captured["index"] = index
+        return Image.new("RGBA", (size, size), (255, 0, 0, 255))
+
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _VECTOR_LITERAL_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource",
+                        lambda apk: pytest.fail("字面量颜色不应 dump resources"))
+    monkeypatch.setattr(workers_mod, "rasterize_vector_layer", fake_rasterize)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert captured["full_res"] is None and captured["index"] is None
+    assert data.startswith(b"\x89PNG")
+
+
+def test_adaptive_direct_colors_skip_resource_index(monkeypatch):
+    """fg/bg 直接是颜色时只做线性查询，不构建全量索引。"""
+    full_res = (
+        "resource 0x7f010001 color/bg\n"
+        "    () #ff000000\n"
+        "resource 0x7f010002 color/fg\n"
+        "    () #ffffffff\n"
+    )
+    captured = {}
+
+    def fake_compose(apk_path, foreground, background, fg_scale=None, full_res=None, index=None, zf=None):
+        captured["index"] = index
+        return Image.new("RGBA", (16, 16), (255, 0, 0, 255)), b"png"
+
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _ADAPTIVE_ICON_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource", lambda apk: full_res)
+    monkeypatch.setattr(workers_mod, "compose_adaptive_icon", fake_compose)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert captured["index"] is None
+    assert data == b"png"
+
+
+def test_adaptive_alias_layer_builds_index(monkeypatch):
+    """层值是别名时后续可能继续解引用，应构建索引。"""
+    full_res = (
+        "resource 0x7f010001 color/bg\n"
+        "    () @color/brand\n"
+        "resource 0x7f010002 color/fg\n"
+        "    () #ffffffff\n"
+        "resource 0x7f010003 color/brand\n"
+        "    () #ff000000\n"
+    )
+    captured = {}
+
+    def fake_compose(apk_path, foreground, background, fg_scale=None, full_res=None, index=None, zf=None):
+        captured["index"] = index
+        return Image.new("RGBA", (16, 16), (255, 0, 0, 255)), b"png"
+
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_xmltree", lambda apk, path: _ADAPTIVE_ICON_XML)
+    monkeypatch.setattr(workers_mod, "run_aapt2_dump_resource", lambda apk: full_res)
+    monkeypatch.setattr(workers_mod, "compose_adaptive_icon", fake_compose)
+
+    data = IconWorker()._extract_adaptive_icon("x.apk", "res/icon.xml")
+    assert captured["index"] is not None
+    assert data == b"png"
 
 
 def test_adaptive_icon_failed_dump_is_attempted_once(monkeypatch):

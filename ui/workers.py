@@ -11,8 +11,11 @@ from core.aapt import (
     kill_running_aapt2, run_aapt2_dump_badging, run_aapt2_dump_resource,
     run_aapt2_dump_xmltree
 )
-from core.resources import ResourceIndex, open_apk_zip, sniff_file_kind, BITMAP_EXTS
-from core.vector import rasterize_vector_layer
+from core.resources import (
+    extract_resource_entry, get_resource_index, get_resource_info,
+    open_apk_zip, sniff_file_kind, BITMAP_EXTS
+)
+from core.vector import rasterize_vector_layer, vector_uses_resources
 from core.apk_parser import (
     ICON_SIZE, compose_adaptive_icon, decode_icon_image, find_adaptive_layer_addr,
     find_mipmap_fallback, normalize_icon_image, resolve_icon_layer, to_png_bytes
@@ -179,6 +182,23 @@ def _icon_kind(apk_path: str, icon_path: str, zf=None):
         return None
 
 
+def _adaptive_layers_need_index(full_res: str, *addrs) -> bool:
+    """自适应图标的层是否需要在解析前建全量资源索引。
+
+    绝大多数图标的 fg/bg 直接是 color/image；此时只为两个地址各做一次
+    线性查询就够了，构建整张索引反而更慢（15MB 资源表实测 0.4s vs 0.12s）。
+    只有层值本身还是别名、字符串文件或矢量时，后续可能继续解引用，才值得
+    建索引。
+    """
+    if not full_res:
+        return False
+    for addr in addrs:
+        kind = get_resource_info(extract_resource_entry(full_res, addr))["type"]
+        if kind in ("ref", "string_file", "vector"):
+            return True
+    return False
+
+
 def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     """XML 图标提取（自适应图标或普通 VectorDrawable），返回 (PIL Image, 导出用 PNG 字节)。
 
@@ -201,18 +221,19 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
     root_m = re.search(r"E:\s*(\S+)\s*\(", xml_out or "")
     if root_m and root_m.group(1) == "vector":
         check()
-        # 矢量图标的 fillColor/strokeColor 常引用应用内资源（@0x7f...）。
-        # 这里先建一次资源索引并透传给渲染层：否则每次引用都会走
-        # extract_resource_entry 的无索引路径，对整个 dump（真实包约
-        # 36MB）重复 splitlines + 线性扫描（实测单次约 0.17s，一个图标
-        # 十几条引用就是数秒），并瞬时产生大量行字符串。
-        full_res = run_aapt2_dump_resource(apk_path)
-        if full_res is None:
-            # 本次图标提取已经尝试过资源表 dump 且失败。空串是"已尝试、
-            # 无数据"的哨兵：渲染层看到它不会再把每个颜色引用都重跑一次
-            # aapt2（一次 60s 超时会被放大成 N×60s）。
-            full_res = ""
-        index = ResourceIndex(full_res) if full_res else None
+        # 纯字面量颜色的矢量图标不需要资源表：直接交给渲染层，省掉大包
+        # 上一次 1–2s 的 dump resources。只有 fill/stroke 引用资源时才建
+        # 索引，避免每个引用重复线性扫描几十 MB 的 dump。
+        full_res = None
+        index = None
+        if vector_uses_resources(xml_out):
+            full_res = run_aapt2_dump_resource(apk_path)
+            if full_res is None:
+                # 本次图标提取已经尝试过资源表 dump 且失败。空串是"已尝试、
+                # 无数据"的哨兵：渲染层看到它不会再把每个颜色引用都重跑一次
+                # aapt2（一次 60s 超时会被放大成 N×60s）。
+                full_res = ""
+            index = get_resource_index(full_res)
         img = rasterize_vector_layer(apk_path, icon_path, ICON_SIZE, full_res, index)
         if img is None:
             return None, b""
@@ -228,8 +249,10 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
         if full_res is None:
             full_res = ""  # 已尝试且失败：禁止回退阶段重复 dump
         check()
-        # 一次性索引全量输出，后续所有资源条目查询 O(1)
-        index = ResourceIndex(full_res) if full_res else None
+        # 只有层值还需要继续解引用（别名/字符串文件/矢量）时才构建全量
+        # 索引；直接的 color/image 层用两次线性查询即可，索引反而更慢。
+        if _adaptive_layers_need_index(full_res, fg_addr, bg_addr):
+            index = get_resource_index(full_res)
         fg_kind, fg_val, fg_scale = resolve_icon_layer(apk_path, full_res, fg_addr, index=index, zf=zf)
         bg_kind, bg_val, _bg_scale = resolve_icon_layer(apk_path, full_res, bg_addr, index=index, zf=zf)
         check()
@@ -257,7 +280,7 @@ def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
         if full_res is None:
             full_res = ""
         check()
-        index = ResourceIndex(full_res) if full_res else None
+        index = get_resource_index(full_res)
     fallback = find_mipmap_fallback(full_res, icon_path, index)
     if fallback:
         with open_apk_zip(apk_path, zf) as shared_zf:

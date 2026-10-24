@@ -129,48 +129,117 @@ class ResourceIndex:
 
     采用惰性区间索引映射，避免对大型 APK（30MB+ 文本）全量调用 splitlines()
     和多次 \\n.join() 生成海量字符串碎片，将索引构建内存与耗时降低 70% 以上。
+    by_id 在构造时建立；by_name / by_file 只有真正被查询时才构建：
+    多数图标提取只需要按资源地址查条目，没必要为整张表预先扫描文件行。
+
     by_id 按资源地址（小写 0x...）、by_name 按 `type/name` 形式的资源名、
     by_file 按条目内出现的文件路径索引。
     """
 
-    __slots__ = ("by_id", "by_file", "by_name")
+    __slots__ = ("_full_text", "_by_id", "_by_name", "_by_file", "_build_lock")
 
     def __init__(self, full_output: str):
-        full_text = full_output or ""
-        self.by_id = _LazyEntryMap(full_text)
-        self.by_file = _LazyEntryMap(full_text)
-        self.by_name = _LazyEntryMap(full_text)
-        if not full_text:
-            return
+        self._full_text = full_output or ""
+        self._by_id = _LazyEntryMap(self._full_text)
+        self._by_name = None
+        self._by_file = None
+        self._build_lock = threading.Lock()
+        if self._full_text:
+            self._build_id()
 
+    @property
+    def by_id(self):
+        return self._by_id
+
+    @property
+    def by_name(self):
+        with self._build_lock:
+            if self._by_name is None:
+                self._build_name()
+            return self._by_name
+
+    @property
+    def by_file(self):
+        with self._build_lock:
+            if self._by_file is None:
+                self._build_file()
+            return self._by_file
+
+    def _iter_entries(self):
+        """单次向前扫描资源条目，逐个产出 (id, 名字, 区间)，不保留 Match 列表。"""
+        full_text = self._full_text
         pattern = re.compile(r"(?m)^\s*resource\s+(0x[0-9a-fA-F]+)(?:\s+(\S+))?")
         type_pattern = re.compile(r"(?m)^\s*type\s+\w+\s+id=")
-        file_pattern = re.compile(r"(?m)^\s*\([^)]*\)\s*\(file\)\s*(\S+)")
+        matches = pattern.finditer(full_text)
+        current = next(matches, None)
+        if current is None:
+            return
+        for next_match in matches:
+            yield current.group(1).lower(), current.group(2), self._span(current, next_match.start(), type_pattern)
+            current = next_match
+        yield current.group(1).lower(), current.group(2), self._span(current, len(full_text), type_pattern)
 
-        matches = list(pattern.finditer(full_text))
-        n = len(matches)
-        for idx, m in enumerate(matches):
-            start = m.start()
-            rid = m.group(1).lower()
-            name = m.group(2)
-            next_start = matches[idx + 1].start() if idx + 1 < n else len(full_text)
-            tm = type_pattern.search(full_text, start, next_start)
-            end = tm.start() if tm else next_start
-            span = (start, end)
-            dict.__setitem__(self.by_id, rid, span)
+    def _span(self, match, next_start, type_pattern):
+        start = match.start()
+        tm = type_pattern.search(self._full_text, start, next_start)
+        return start, (tm.start() if tm else next_start)
+
+    def _build_id(self):
+        for rid, _name, span in self._iter_entries():
+            dict.__setitem__(self._by_id, rid, span)
+
+    def _build_name(self):
+        by_name = _LazyEntryMap(self._full_text)
+        for _rid, name, span in self._iter_entries():
             if name:
-                dict.__setitem__(self.by_name, name, span)
-            # 直接在原文本上按偏移扫描文件行：为每个条目物化 entry_slice
-            # 子串正是本类要避免的事（数十万条目会生成海量瞬时字符串）。
+                dict.__setitem__(by_name, name, span)
+        self._by_name = by_name
+
+    def _build_file(self):
+        """按首次出现顺序建立“文件路径 -> 条目区间”索引。
+
+        只有图标回退（find_mipmap_fallback）需要该映射，因此延迟到真正用到
+        时再扫描；直接按资源地址解析的常见路径不再承担这份构建开销。
+        """
+        by_file = _LazyEntryMap(self._full_text)
+        file_pattern = re.compile(r"(?m)^\s*\([^)]*\)\s*\(file\)\s*(\S+)")
+        for span in dict.values(self._by_id):
+            start, end = span
             pos = start
             while True:
-                fm = file_pattern.search(full_text, pos, end)
+                fm = file_pattern.search(self._full_text, pos, end)
                 if fm is None:
                     break
                 fpath = fm.group(1)
-                if not dict.__contains__(self.by_file, fpath):
-                    dict.__setitem__(self.by_file, fpath, span)
+                if not dict.__contains__(by_file, fpath):
+                    dict.__setitem__(by_file, fpath, span)
                 pos = fm.end()
+        self._by_file = by_file
+
+
+# 最近一次成功构建的资源索引。run_aapt2_dump_resource 命中内存/磁盘缓存时
+# 返回同一个字符串对象，因此用对象身份判断是否可以复用索引，避免反复解析
+# 同一份 15–36MB 的资源表（实测重复构建一次约 0.4–0.9s）。
+_resource_index_cache = None
+_resource_index_lock = threading.Lock()
+
+
+def get_resource_index(full_output: str):
+    """返回 full_output 对应的 ResourceIndex；空输出返回 None。
+
+    只缓存最近一份（按字符串对象身份），控制内存占用：索引本身会额外持有
+    条目区间字典。不同 APK 交替解析时会自然重建，不会无限增长。
+    """
+    global _resource_index_cache
+    if not full_output:
+        return None
+    cached = _resource_index_cache
+    if cached is not None and cached[0] is full_output:
+        return cached[1]
+    index = ResourceIndex(full_output)
+    with _resource_index_lock:
+        _resource_index_cache = (full_output, index)
+    return index
 
 
 def _normalize_resource_key(res_id: str) -> str:
