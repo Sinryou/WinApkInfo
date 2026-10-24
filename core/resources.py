@@ -154,11 +154,17 @@ class _ResourceIndex:
             end = tm.start() if tm else next_start
             span = (start, end)
             dict.__setitem__(self.by_id, rid, span)
-            entry_slice = full_text[start:end]
-            for fm in file_pattern.finditer(entry_slice):
+            # 直接在原文本上按偏移扫描文件行：为每个条目物化 entry_slice
+            # 子串正是本类要避免的事（数十万条目会生成海量瞬时字符串）。
+            pos = start
+            while True:
+                fm = file_pattern.search(full_text, pos, end)
+                if fm is None:
+                    break
                 fpath = fm.group(1)
                 if not dict.__contains__(self.by_file, fpath):
                     dict.__setitem__(self.by_file, fpath, span)
+                pos = fm.end()
 
 
 def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
