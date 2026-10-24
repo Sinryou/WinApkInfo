@@ -148,6 +148,77 @@ class TestResourceIndex(unittest.TestCase):
         self.assertIsNone(m.get("0x99999999"))
 
 
+_NAMED_ALIAS_FULL_RES = (
+    "resource 0x7f080162 drawable/fg\n"
+    "    () (file) res/Tx.xml type=XML\n"
+    "resource 0x7f0600f1 color/adaptive_bg\n"
+    "    () @color/brand\n"
+    "resource 0x7f0600ee color/brand\n"
+    "    () #ff0096fa\n"
+)
+
+
+class TestNamedResourceAlias(unittest.TestCase):
+    """aapt2 2.20+ 对表内引用输出 `() @type/name` 命名别名（pixiv 6.201 的
+    adaptive 背景即此形态），旧实现只认 `() @0x...` 数字别名，导致背景层
+    被判为 unknown、图标提取失败。
+
+    完整的失败链路见该样本的 e2e 用例与资源条目：
+        color/adaptive_bg -> @color/brand -> #ff0096fa（pixiv 蓝）
+    """
+
+    def test_named_alias_parsed_as_ref(self):
+        info = res_mod.get_resource_info(
+            "resource 0x7f0600f1 color/bg\n"
+            "    () @color/feature_component_charcoal_brand\n"
+        )
+        self.assertEqual(info, {"type": "ref", "value": "color/feature_component_charcoal_brand"})
+
+    def test_numeric_alias_still_parsed(self):
+        info = res_mod.get_resource_info(
+            "resource 0x7f0600f1 color/bg\n"
+            "    () @0x0106003b\n"
+        )
+        self.assertEqual(info, {"type": "ref", "value": "0x0106003b"})
+
+    def test_extract_entry_by_name_with_index(self):
+        index = res_mod._ResourceIndex(_NAMED_ALIAS_FULL_RES)
+        self.assertIn("#ff0096fa", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "color/brand", index))
+        # @ 前缀可带可不带；数字地址不受影响
+        self.assertIn("res/Tx.xml", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "@drawable/fg", index))
+        self.assertIn("res/Tx.xml", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "0x7f080162", index))
+        # 框架包前缀的命名引用不在应用表内，查不到返回空串
+        self.assertEqual(res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "android:color/white", index), "")
+
+    def test_extract_entry_by_name_without_index(self):
+        self.assertIn("#ff0096fa", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "@color/brand"))
+        self.assertIn("res/Tx.xml", res_mod.extract_resource_entry(_NAMED_ALIAS_FULL_RES, "drawable/fg"))
+
+    def test_named_alias_case_preserved(self):
+        text = ("resource 0x7f060001 color/Bg\n"
+                "    () @color/Brand\n"
+                "resource 0x7f060002 color/Brand\n"
+                "    () #ff112233\n")
+        index = res_mod._ResourceIndex(text)
+        kind, value, scale = apk_parser_mod.resolve_icon_layer("f.apk", text, "0x7f060001", index=index)
+        self.assertEqual((kind, value, scale), ("color", "#ff112233", None))
+
+    def test_resolve_icon_layer_follows_named_alias(self):
+        index = res_mod._ResourceIndex(_NAMED_ALIAS_FULL_RES)
+        kind, value, scale = apk_parser_mod.resolve_icon_layer(
+            "f.apk", _NAMED_ALIAS_FULL_RES, "0x7f0600f1", index=index)
+        self.assertEqual((kind, value, scale), ("color", "#ff0096fa", None))
+
+    def test_resolve_vector_fill_follows_named_alias(self):
+        self.assertEqual(
+            vec_mod._resolve_vector_fill("f.apk", _NAMED_ALIAS_FULL_RES, "@color/brand"),
+            ("color", (0x00, 0x96, 0xfa, 0xff)))
+        # 数字引用行为不变
+        self.assertEqual(
+            vec_mod._resolve_vector_fill("f.apk", _NAMED_ALIAS_FULL_RES, "@0x7f0600ee"),
+            ("color", (0x00, 0x96, 0xfa, 0xff)))
+
+
 class TestVectorRasterization(unittest.TestCase):
     """测试 Qt 原生矢量路径构造与光栅化。"""
 

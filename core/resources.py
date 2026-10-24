@@ -129,18 +129,21 @@ class _ResourceIndex:
 
     采用惰性区间索引映射，避免对大型 APK（30MB+ 文本）全量调用 splitlines()
     和多次 \\n.join() 生成海量字符串碎片，将索引构建内存与耗时降低 70% 以上。
+    by_id 按资源地址（小写 0x...）、by_name 按 `type/name` 形式的资源名、
+    by_file 按条目内出现的文件路径索引。
     """
 
-    __slots__ = ("by_id", "by_file")
+    __slots__ = ("by_id", "by_file", "by_name")
 
     def __init__(self, full_output: str):
         full_text = full_output or ""
         self.by_id = _LazyEntryMap(full_text)
         self.by_file = _LazyEntryMap(full_text)
+        self.by_name = _LazyEntryMap(full_text)
         if not full_text:
             return
 
-        pattern = re.compile(r"(?m)^\s*resource\s+(0x[0-9a-fA-F]+)(?:\s+\S+)?")
+        pattern = re.compile(r"(?m)^\s*resource\s+(0x[0-9a-fA-F]+)(?:\s+(\S+))?")
         type_pattern = re.compile(r"(?m)^\s*type\s+\w+\s+id=")
         file_pattern = re.compile(r"(?m)^\s*\([^)]*\)\s*\(file\)\s*(\S+)")
 
@@ -149,11 +152,14 @@ class _ResourceIndex:
         for idx, m in enumerate(matches):
             start = m.start()
             rid = m.group(1).lower()
+            name = m.group(2)
             next_start = matches[idx + 1].start() if idx + 1 < n else len(full_text)
             tm = type_pattern.search(full_text, start, next_start)
             end = tm.start() if tm else next_start
             span = (start, end)
             dict.__setitem__(self.by_id, rid, span)
+            if name:
+                dict.__setitem__(self.by_name, name, span)
             # 直接在原文本上按偏移扫描文件行：为每个条目物化 entry_slice
             # 子串正是本类要避免的事（数十万条目会生成海量瞬时字符串）。
             pos = start
@@ -167,23 +173,52 @@ class _ResourceIndex:
                 pos = fm.end()
 
 
+def _normalize_resource_key(res_id: str) -> str:
+    """归一化资源引用键：剥掉 @ 前缀；数字地址统一小写。
+
+    命名引用（color/brand）保留原始大小写：资源名大小写敏感，
+    aapt2 dump 输出的别名值与条目头行里的名字来自同一张表，必然逐字符一致。
+    """
+    key = (res_id or "").strip()
+    if key.startswith("@"):
+        key = key[1:]
+    if key[:2].lower() == "0x":
+        key = key.lower()
+    return key
+
+
 def extract_resource_entry(full_output: str, res_id: str, index=None) -> str:
     """
     从 `aapt2 dump resources` 全量输出中精确截取某个资源条目。
 
     条目以 `resource 0x{id} <pkg>/<name>` 行开始，到下一个 `resource 0x` 行
     或 `type <type> id=..` 分节行之前结束（含其所有密度变体行）。
+
+    res_id 支持两种形态（可带 @ 前缀）：
+        - 数字地址：0x7f0600f1（大小写不敏感）；
+        - 命名引用：color/feature_x（按条目头行的 type/name 查询）。
     找不到返回空字符串。传入 index（_ResourceIndex）时 O(1) 查询。
     """
+    key = _normalize_resource_key(res_id)
+    is_hex = key[:2] == "0x"
+
     if index is not None:
-        return index.by_id.get(res_id.lower(), "")
+        if is_hex:
+            return index.by_id.get(key, "")
+        return index.by_name.get(key, "")
 
     lines = (full_output or "").splitlines()
-    rid = res_id.lower()
     start = None
     for i, line in enumerate(lines):
         s = line.strip()
-        if s.startswith("resource ") and s.split()[1].lower() == rid:
+        if not s.startswith("resource "):
+            continue
+        parts = s.split()
+        if is_hex:
+            if len(parts) >= 2 and parts[1] == key:
+                start = i
+                break
+        elif len(parts) >= 3 and parts[2] == key:
             start = i
             break
     if start is None:
@@ -273,13 +308,18 @@ def get_resource_info(entry_text: str) -> dict:
             "type": "image",       "value": 最高密度位图路径（png/webp/jpg/gif）
             "type": "vector",      "value": xml 路径（矢量 drawable，无法直接栅格化）
             "type": "string_file", "value": 指向文件的字符串值（混淆包），需进一步解析
-            "type": "ref",         "value": 另一个资源地址（如 "@0x0106003b"）
+            "type": "ref",         "value": 另一个资源地址（数字 "0x0106003b" 或命名 "color/xxx"）
             "type": "unknown",     "value": None
         }
 
-    "ref" 是 Android 资源别名：`aapt2 dump resources` 对颜色别名输出
-    `() @0x0106003b`（RootMyVivo 的 launcher 颜色就全部是这种写法），
-    旧实现不识别该行，导致颜色层被判为 unknown、整张图标透明。
+    "ref" 是 Android 资源别名，aapt2 有两种输出形态：
+        - `() @0x0106003b`：数字形式（旧版 aapt2，RootMyVivo 的 launcher 颜色
+          就全部是这种写法）；
+        - `() @color/feature_x`：命名形式（aapt2 2.20+ 对表内引用直接输出
+          解析后的名字，pixiv 6.201 的 adaptive 背景即此形态）。
+    旧实现只认数字形式，命名别名会让颜色层被判为 unknown、整张图标透明。
+    命名形式保留 `type/name` 原文（含 android: 包前缀的原样保留——框架资源
+    不在应用资源表内，按名查询落空是预期行为）。
     """
     lines = (entry_text or "").splitlines()
 
@@ -294,6 +334,7 @@ def get_resource_info(entry_text: str) -> dict:
     # #RGB / #ARGB / #RRGGBB / #AARRGGBB 都是合法颜色
     color_re = re.compile(r"^\s*\(\s*\)\s*(#[0-9a-fA-F]{3,8})\s*$")
     ref_re = re.compile(r"^\s*\(\s*\)\s*@?(0x[0-9a-fA-F]+)\s*$")
+    named_ref_re = re.compile(r"^\s*\(\s*\)\s*@?((?:[\w.]+:)?[\w.]+/[\w.]+)\s*$")
 
     for line in lines[1:]:  # 跳过 `resource 0x..` 头部行
         m = file_re.match(line)
@@ -317,6 +358,10 @@ def get_resource_info(entry_text: str) -> dict:
             m = ref_re.match(line)
             if m:
                 ref = m.group(1).lower()
+                continue
+            m = named_ref_re.match(line)
+            if m:
+                ref = m.group(1)
 
     if bitmaps:
         return {"type": "image", "value": _pick_best_density(bitmaps)}

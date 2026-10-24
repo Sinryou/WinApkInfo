@@ -802,13 +802,18 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
         except ValueError:
             return None
     ref = v[1:] if v.startswith("@") else v
-    ref = ref.lower()
-    if not ref.startswith("0x"):
+    # 别名两种形态：数字地址（@0x...，统一小写）与命名引用（@color/xxx，
+    # 资源名大小写敏感，保留原文）。命名引用不含 0x 前缀，走同一张资源表
+    # 按名查询；既非数字也无 / 的值不是合法资源引用。
+    is_hex = ref.lower().startswith("0x")
+    if not is_hex and "/" not in ref:
         return None
-    if ref.startswith("0x01"):
-        if ref in _FRAMEWORK_COLOR_MAP:
-            return ("color", parse_android_color(_FRAMEWORK_COLOR_MAP[ref]))
-        return None
+    if is_hex:
+        ref = ref.lower()
+        if ref.startswith("0x01"):
+            if ref in _FRAMEWORK_COLOR_MAP:
+                return ("color", parse_android_color(_FRAMEWORK_COLOR_MAP[ref]))
+            return None
     if not full_res:
         full_res = run_aapt2_dump_resource(apk_path)
     info = get_resource_info(extract_resource_entry(full_res, ref, index))
@@ -820,9 +825,9 @@ def _resolve_vector_fill(apk_path, full_res, color_value, index=None, depth=0):
     if info["type"] == "ref" and info["value"]:
         if depth >= _MAX_DEREF_DEPTH:
             return None
-        target = info["value"].lower()
-        if target.startswith("0x01"):
-            c = _FRAMEWORK_COLOR_MAP.get(target)
+        target = info["value"]
+        if target.lower().startswith("0x01"):
+            c = _FRAMEWORK_COLOR_MAP.get(target.lower())
             if c:
                 try:
                     return ("color", parse_android_color(c))

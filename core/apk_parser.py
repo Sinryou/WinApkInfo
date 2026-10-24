@@ -103,7 +103,8 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
     支持混淆包的解引用链：字符串值指向文件、无扩展名文件按魔数识别、
     <scale> 包装继续跟随 android:drawable 引用；深度受限防止循环。
     另外支持 Android 框架资源引用（0x01xxxxxx，如 @android:color/transparent）
-    以及应用内资源别名（`() @0x7f......`，颜色资源常见的间接层）。
+    以及应用内资源别名——`() @0x7f......`（数字形式）与 `() @color/......`
+    （aapt2 2.20+ 的命名形式，如 pixiv 6.201 的 adaptive 背景）都能跟随。
     index 为 _ResourceIndex 时条目查询 O(1)。支持传入已有 zf 句柄以复用 I/O。
     """
     rid = (res_id or "").lower()
