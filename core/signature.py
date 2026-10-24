@@ -77,6 +77,81 @@ def _format_fingerprint(data: bytes, algo: str) -> str:
         return ""
 
 
+def _der_tlv(data: bytes, pos: int, end: int):
+    """读取 pos 处的一个 DER TLV，返回 (tag, content_start, content_end)。
+
+    只需覆盖 PKCS#7 签名块用到的形态：单字节标签、定长长度字段
+    （1 字节短格式或 1–4 字节长格式）。越界、畸形或不定长（DER 禁止）
+    返回 None。
+    """
+    if pos + 2 > end:
+        return None
+    tag = data[pos]
+    if tag & 0x1F == 0x1F:  # 多字节标签，PKCS#7 结构里不会出现
+        return None
+    first = data[pos + 1]
+    if first < 0x80:
+        hdr, length = 2, first
+    elif first == 0x80:
+        return None
+    else:
+        n = first & 0x7F
+        if n > 4 or pos + 2 + n > end:
+            return None
+        length = int.from_bytes(data[pos + 2:pos + 2 + n], "big")
+        hdr = 2 + n
+    content_start = pos + hdr
+    if content_start + length > end:
+        return None
+    return tag, content_start, content_start + length
+
+
+def _pkcs7_certificates(data: bytes) -> list:
+    """从 PKCS#7/CMS SignedData 签名块（META-INF/*.RSA/.DSA/.EC）提取全部内嵌 X.509 证书 DER。
+
+    结构：ContentInfo{ OID, [0] EXPLICIT SignedData{ version, digestAlgorithms,
+    encapContentInfo, [0] IMPLICIT SET OF Certificate, … } }。certificates 是
+    IMPLICIT 标签，其内容直接是连排的证书 SEQUENCE。
+
+    旧实现按 \\x30\\x82 字节特征盲扫：首个命中恰是最外层 ContentInfo（覆盖
+    整个文件），而"校验"用的 DER_cert_to_PEM_cert 只做 base64 封装、对任何
+    字节都不失败，于是整个签名块文件被当成"证书"（指纹是文件的、subject
+    恒为未知），真正的证书反而一个都取不到。
+    """
+    certs = []
+    top = _der_tlv(data, 0, len(data))
+    if top is None or top[0] != 0x30:  # ContentInfo SEQUENCE
+        return certs
+    pos = top[1]
+    while pos < top[2]:  # ContentInfo 子元素：contentType OID + [0] EXPLICIT content
+        child = _der_tlv(data, pos, top[2])
+        if child is None:
+            break
+        pos = child[2]
+        if child[0] != 0xA0:
+            continue
+        signed = _der_tlv(data, child[1], child[2])  # [0] 内的 SignedData SEQUENCE
+        if signed is None or signed[0] != 0x30:
+            continue
+        s_pos = signed[1]
+        while s_pos < signed[2]:  # SignedData 子元素，找 [0] IMPLICIT certificates
+            field = _der_tlv(data, s_pos, signed[2])
+            if field is None:
+                break
+            s_pos = field[2]
+            if field[0] != 0xA0:
+                continue
+            c_pos = field[1]
+            while c_pos < field[2]:  # 连排的证书 SEQUENCE
+                cert = _der_tlv(data, c_pos, field[2])
+                if cert is None:
+                    break
+                if cert[0] == 0x30:
+                    certs.append(data[c_pos:cert[2]])
+                c_pos = cert[2]
+    return certs
+
+
 def _parse_x509_der(cert_der: bytes) -> dict:
     """解析单个 DER 编码的 X.509 证书。"""
     info = {
@@ -150,22 +225,7 @@ def extract_apk_signatures(apk_path: str) -> dict:
                 schemes.append("v1 (JAR Signature)")
                 for vf in v1_files:
                     try:
-                        data = zf.read(vf)
-                        idx = 0
-                        while True:
-                            pos = data.find(b"\x30\x82", idx)
-                            if pos == -1 or pos + 4 > len(data):
-                                break
-                            c_len = struct.unpack(">H", data[pos + 2:pos + 4])[0] + 4
-                            if pos + c_len <= len(data):
-                                candidate = data[pos:pos + c_len]
-                                try:
-                                    ssl.DER_cert_to_PEM_cert(candidate)
-                                    certs_raw.append(("v1", candidate))
-                                    break
-                                except Exception:
-                                    pass
-                            idx = pos + 2
+                        certs_raw.extend(("v1", c) for c in _pkcs7_certificates(zf.read(vf)))
                     except Exception:
                         pass
     except Exception as e:

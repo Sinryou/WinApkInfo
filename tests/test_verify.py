@@ -97,6 +97,44 @@ class TestSignatureAndMeta(unittest.TestCase):
                 os.remove(path)
             self.assertEqual(sig, {"schemes": [], "certificates": []})
 
+    @staticmethod
+    def _der_tlv(tag: int, content: bytes) -> bytes:
+        if len(content) < 0x80:
+            return bytes([tag, len(content)]) + content
+        length = len(content).to_bytes((len(content).bit_length() + 7) // 8, "big")
+        return bytes([tag, 0x80 | len(length)]) + length + content
+
+    def test_v1_pkcs7_certificate_extraction(self):
+        """v1 证书必须按 PKCS#7 结构下钻提取，而不是把签名块文件当成证书。
+
+        旧实现按 \\x30\\x82 字节盲扫 + DER_cert_to_PEM_cert"校验"（只做
+        base64 封装、对任何字节都不失败），首个命中恰是最外层 ContentInfo，
+        导致 v1 APK 展示的"证书"指纹是签名块文件的、subject 恒为未知。
+        """
+        cert1 = self._der_tlv(0x30, b"certificate-1-body")
+        cert2 = self._der_tlv(0x30, b"certificate-2-body-longer")
+        signed_data = self._der_tlv(
+            0x30,
+            self._der_tlv(0x02, b"\x01")            # version
+            + self._der_tlv(0x31, b"")              # digestAlgorithms SET
+            + self._der_tlv(0x30, b"")              # encapContentInfo
+            + self._der_tlv(0xA0, cert1 + cert2)    # [0] IMPLICIT certificates
+        )
+        content_info = self._der_tlv(
+            0x30,
+            self._der_tlv(0x06, b"\x2a\x86\x48\x86\xf7\x0d\x01\x07\x02")  # signedData OID
+            + self._der_tlv(0xA0, signed_data),
+        )
+        self.assertEqual(sig_mod._pkcs7_certificates(content_info), [cert1, cert2])
+        # 非 PKCS#7 / 畸形输入不产出任何"证书"
+        self.assertEqual(sig_mod._pkcs7_certificates(b"garbage"), [])
+        self.assertEqual(sig_mod._pkcs7_certificates(b""), [])
+        # 长度字段声明超出数据的畸形 TLV
+        self.assertEqual(
+            sig_mod._pkcs7_certificates(bytes([0x30, 0x82, 0xFF, 0xFF]) + b"short"),
+            [],
+        )
+
     def test_file_metadata_and_hashes(self):
         if not self.samples:
             self.skipTest("testSample 目录无 APK 样本")
@@ -116,6 +154,14 @@ class TestSignatureAndMeta(unittest.TestCase):
             self.assertIsInstance(sig["schemes"], list)
             self.assertGreater(len(sig["schemes"]), 0, f"{apk} 应至少包含一种签名方案")
             self.assertIsInstance(sig["certificates"], list)
+            if any(s.startswith("v1") for s in sig["schemes"]):
+                # v1 路径提取的必须是真正的证书（旧实现把 PKCS#7 容器当
+                # 证书，subject 解不出恒为"(未知)"，指纹是签名块文件的）
+                self.assertTrue(sig["certificates"], f"{apk} 声明了 v1 签名但未提取到证书")
+                self.assertNotEqual(
+                    sig["certificates"][0]["subject"], "(未知)",
+                    f"{apk} 的 v1 证书未解析出 Subject",
+                )
             if sig["certificates"]:
                 cert = sig["certificates"][0]
                 self.assertIn("subject", cert)
