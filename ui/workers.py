@@ -11,8 +11,8 @@ from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2
 from core.resources import ResourceIndex, open_apk_zip, sniff_file_kind, BITMAP_EXTS
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
-    ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
-    extract_icon_bytes, find_mipmap_fallback, normalize_icon_png
+    ICON_SIZE, compose_adaptive_icon, decode_icon_image, find_adaptive_layer_addr,
+    find_mipmap_fallback, normalize_icon_image, resolve_icon_layer, to_png_bytes
 )
 
 class _Cancelled(Exception):
@@ -131,6 +131,20 @@ def _load_image(img: QtGui.QImage, data: bytes) -> bool:
         return False
 
 
+def _qimage_from_pil(im: Image.Image) -> QtGui.QImage:
+    """PIL RGBA Image → QImage：像素直接搬运，不经 PNG 编码/解码。
+
+    QImage 构造函数不接管外部缓冲的生命周期，copy() 一次把像素拷进
+    Qt 自有内存后，中间字节缓冲即可释放。
+    """
+    if im.mode != "RGBA":
+        im = im.convert("RGBA")
+    buf = im.tobytes("raw", "RGBA")
+    qimg = QtGui.QImage(buf, im.width, im.height, im.width * 4,
+                        QtGui.QImage.Format.Format_RGBA8888)
+    return qimg.copy()
+
+
 def _icon_kind(apk_path: str, icon_path: str, zf=None):
     """按后缀/魔数判断图标是位图还是 XML。
 
@@ -149,8 +163,8 @@ def _icon_kind(apk_path: str, icon_path: str, zf=None):
         return None
 
 
-def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes:
-    """XML 图标提取（自适应图标或普通 VectorDrawable），返回导出用 PNG 字节。
+def _adaptive_icon_result(apk_path: str, icon_path: str, check, zf=None):
+    """XML 图标提取（自适应图标或普通 VectorDrawable），返回 (PIL Image, 导出用 PNG 字节)。
 
     1) 根元素是 <vector> 时直接栅格化。部分 APK（实测月虹）会把
        mipmap/ic_launcher 直接指向一个普通矢量 drawable，它的
@@ -162,7 +176,8 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
        icon xml 所属 mipmap 条目的最高密度位图（8.0 之前的传统图标）。
 
     `dump resources` 只在确实需要时执行。check 为取消检查回调，请求
-    过期时抛 _Cancelled。
+    过期时抛 _Cancelled。Image 供显示直接转 QImage；导出字节随图像
+    一次成型，不再"编码成 PNG 交调用方解码回来"。
     """
     check()
     xml_out = run_aapt2_dump_xmltree(apk_path, icon_path)
@@ -179,10 +194,8 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
         index = ResourceIndex(full_res) if full_res else None
         img = rasterize_vector_layer(apk_path, icon_path, ICON_SIZE, full_res, index)
         if img is None:
-            return b""
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+            return None, b""
+        return img, to_png_bytes(img)
 
     fg_addr = find_adaptive_layer_addr(xml_out, "foreground")
     bg_addr = find_adaptive_layer_addr(xml_out, "background")
@@ -199,7 +212,7 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
         check()
         if fg_kind in ("image", "color", "vector") and bg_kind in ("image", "color", "vector"):
             try:
-                return extract_icon_bytes(
+                return compose_adaptive_icon(
                     apk_path,
                     {"type": fg_kind, "value": fg_val},
                     {"type": bg_kind, "value": bg_val},
@@ -223,12 +236,11 @@ def _adaptive_icon_bytes(apk_path: str, icon_path: str, check, zf=None) -> bytes
     fallback = find_mipmap_fallback(full_res, icon_path, index)
     if fallback:
         with open_apk_zip(apk_path, zf) as shared_zf:
-            img = Image.open(shared_zf.open(fallback)).convert("RGBA")
+            with shared_zf.open(fallback) as f:
+                img = Image.open(f).convert("RGBA")
         img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    return b""
+        return img, to_png_bytes(img)
+    return None, b""
 
 
 def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
@@ -246,8 +258,13 @@ def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
         kind = _icon_kind(apk_path, icon_path, shared_zf)
         if kind == "image":
             raw = shared_zf.open(icon_path).read()
-            data = normalize_icon_png(raw) or raw
-            if not _load_image(img, data):
+            # 只解码一次：显示直接搬运像素，导出复用同一次解码结果归一化。
+            # 旧实现先归一化编码成 PNG、再把 PNG 交给 Qt 解码，白多一编一解。
+            im, fmt = decode_icon_image(raw)
+            if im is not None:
+                display, data = normalize_icon_image(raw, im=im, fmt=fmt)
+                img = _qimage_from_pil(display)
+            elif not _load_image(img, raw):
                 # 后缀可能是伪装/错误的：按魔数再确认一次是否为 XML。
                 # 例如 AndResGuard 有时会把二进制 XML 改名成 .png。
                 if sniff_file_kind(apk_path, icon_path, zf=shared_zf) == "xml":
@@ -256,10 +273,11 @@ def extract_icon(apk_path: str, icon_path: str, check_cancel=None, zf=None):
                     raise ValueError(f"图标文件无法解码为图片: {icon_path}")
 
         if kind == "xml":
-            data = _adaptive_icon_bytes(apk_path, icon_path, check, zf=shared_zf)
+            im, data = _adaptive_icon_result(apk_path, icon_path, check, zf=shared_zf)
             if not data:
                 raise ValueError("自适应图标的前景/背景均无法渲染，且未找到位图回退图标")
-            if not _load_image(img, data):
+            img = _qimage_from_pil(im) if im is not None else QtGui.QImage()
+            if img.isNull():
                 raise ValueError("合成后的图标无法解码为图片")
         elif kind != "image":
             raise ValueError(f"无法识别图标类型（非图片也非 XML）: {icon_path}")
@@ -312,8 +330,8 @@ class IconWorker(QtCore.QThread):
     _load_image = staticmethod(_load_image)
 
     def _extract_adaptive_icon(self, apk_path: str, icon_path: str, zf=None) -> bytes:
-        """向后兼容入口：实现见模块级 _adaptive_icon_bytes。"""
-        return _adaptive_icon_bytes(apk_path, icon_path, self._check_cancel, zf)
+        """向后兼容入口：实现见模块级 _adaptive_icon_result（返回其中的 PNG 字节）。"""
+        return _adaptive_icon_result(apk_path, icon_path, self._check_cancel, zf)[1]
 
     def _extract(self, apk_path: str, icon_path: str, zf=None):
         """向后兼容入口：实现见模块级 extract_icon。"""

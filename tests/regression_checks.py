@@ -1171,11 +1171,12 @@ def check_new_fixes():
     # --- 统一导出规格 ---
     src = io.BytesIO()
     Image.new("RGB", (37, 91), (10, 20, 30)).save(src, format="PNG")
-    out = apk_parser_mod.normalize_icon_png(src.getvalue())
-    out_size = Image.open(io.BytesIO(out)).size if out else None
-    C.check("位图图标归一化为 512×512", out_size == (512, 512), "%s" % (out_size,))
-    C.check("不可解码的字节返回 None（由调用方回退原始字节）",
-            apk_parser_mod.normalize_icon_png(b"not an image") is None)
+    out_im, out = apk_parser_mod.normalize_icon_image(src.getvalue())
+    out_size = out_im.size if out_im else None
+    C.check("位图图标归一化为 512×512 PNG",
+            out_size == (512, 512) and out.startswith(b"\x89PNG"), "%s" % (out_size,))
+    C.check("不可解码的字节返回 (None, b'')（由调用方回退原始字节）",
+            apk_parser_mod.normalize_icon_image(b"not an image") == (None, b""))
 
     # --- 子线程只碰 QImage ---
     C.check("图标链路改用 QImage（子线程不再创建 QPixmap）",

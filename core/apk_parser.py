@@ -218,27 +218,48 @@ def load_resource(apk_path, res_path_or_color, size, full_res=None, index=None, 
     return img.resize((size, size), Image.LANCZOS)
 
 
-def normalize_icon_png(raw: bytes, size: int = ICON_SIZE):
-    """把任意可解码的位图字节统一成 size×size 的 PNG；解不了返回 None。
+def to_png_bytes(img) -> bytes:
+    """RGBA Image → PNG 字节（导出与跨线程传递共用）。"""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def decode_icon_image(raw: bytes):
+    """解码任意图标字节，返回 (RGBA Image, 原始格式名大写)；解不了返回 (None, "")。
+
+    显示与导出共用同一次解码：显示直接搬运像素（ui.workers._qimage_from_pil），
+    导出交给 normalize_icon_image 归一化，不再各自解一遍。
+    """
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            fmt = (im.format or "").upper()
+            return im.convert("RGBA"), fmt
+    except Exception:
+        logging.debug("位图图标解码失败，由调用方回退处理", exc_info=True)
+        return None, ""
+
+
+def normalize_icon_image(raw: bytes, im=None, fmt: str = "", size: int = ICON_SIZE):
+    """把位图图标统一成 (size×size RGBA Image, 导出用 PNG 字节)。
 
     位图图标旧实现直接导出 APK 里的原始文件，导出尺寸随资源密度变化，
     与自适应/矢量链路固定的 ICON_SIZE² 不一致：同一个"导出图标"按钮
     对不同 APK 给出不同规格的文件。
 
-    已经是目标尺寸的 PNG 原样返回：省掉一整圈解码 + LANCZOS + 重编码，
-    且导出字节与 APK 内原始文件逐位一致。
+    raw 已经是目标尺寸的 PNG 时导出字节原样返回：省掉一整圈 LANCZOS +
+    重编码，且导出字节与 APK 内原始文件逐位一致。im/fmt 是调用方为显示
+    已做过的 decode_icon_image 结果，传入可避免同一份字节解码两次。
+    解码失败返回 (None, b"")。
     """
-    try:
-        with Image.open(io.BytesIO(raw)) as im:
-            if im.size == (size, size) and (im.format or "").upper() == "PNG":
-                return raw
-            img = im.convert("RGBA").resize((size, size), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        logging.debug("位图图标转码为统一规格失败，回退原始字节", exc_info=True)
-        return None
+    if im is None:
+        im, fmt = decode_icon_image(raw)
+        if im is None:
+            return None, b""
+    if im.size == (size, size) and fmt == "PNG":
+        return im, raw
+    img = im.resize((size, size), Image.LANCZOS)
+    return img, to_png_bytes(img)
 
 
 def _place_by_gravity(size: int, w: int, h: int, gravity: int):
@@ -266,12 +287,15 @@ def _place_by_gravity(size: int, w: int, h: int, gravity: int):
     return x, y
 
 
-def extract_icon_bytes(apk_path, foreground, background, size=ICON_SIZE, fg_scale=None, full_res=None, index=None, zf=None):
+def compose_adaptive_icon(apk_path, foreground, background, size=ICON_SIZE, fg_scale=None, full_res=None, index=None, zf=None):
     """
-    自动解析 adaptive icon 的前景和背景，合成完整 PNG，返回字节流。
+    解析 adaptive icon 的前景和背景并合成，返回 (RGBA Image, 导出用 PNG 字节)。
 
     fg_scale: (width%, height%, gravity)，来自 <scale> 包装 drawable；
               None 表示前景按整层尺寸渲染。
+
+    返回的 Image 供显示直接转 QImage；PNG 字节供导出。旧实现只返回
+    字节流，调用方为了显示还得把 PNG 再解码一遍。
     """
     with open_apk_zip(apk_path, zf) as shared_zf:
         # 加载前景
@@ -291,11 +315,7 @@ def extract_icon_bytes(apk_path, foreground, background, size=ICON_SIZE, fg_scal
 
         # 合成 (背景在下，前景在上)
         final_img = Image.alpha_composite(background_img, foreground_img)
-
-        # 转字节流
-        output = io.BytesIO()
-        final_img.save(output, format="PNG")
-        return output.getvalue()
+        return final_img, to_png_bytes(final_img)
 
 def parse_aapt2_output(text: str) -> dict:
     """
