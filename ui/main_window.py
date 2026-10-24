@@ -582,6 +582,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("已复制摘要到剪贴板。", 3000)
 
     def do_rename(self):
+        # 解析在途时 badging 子进程持有 APK 读句柄，os.replace 会报
+        # WinError 32。正常流程下"解析中 ⇒ _parse_ok_path 为空"的守卫
+        # 已先拦截，这里显式拒绝是防御未来流程变化破坏该不变量。
+        if self._busy:
+            QtWidgets.QMessageBox.warning(self, "提示", "正在解析 APK，请稍候后再重命名。")
+            return
         old_path = self._current_apk_path()
         # 预览框现在可编辑：重新净化，非法字符/保留设备名不能带进 os.replace
         new_name = sanitize_apk_name(self.rename_preview.text())

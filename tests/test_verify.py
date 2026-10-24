@@ -724,6 +724,30 @@ def test_replace_with_retry_handles_sharing_violation(tmp_path, monkeypatch):
     assert calls["n"] == 3
 
 
+def test_rename_rejected_while_parsing(app, tmp_path, monkeypatch):
+    """解析在途时重命名入口要显式拒绝，不动任何文件。
+
+    badging 子进程持有 APK 读句柄期间 os.replace 会报 WinError 32；
+    正常流程下 _parse_ok_path 守卫已先拦截，这里守护该显式检查本身。
+    """
+    win = MainWindow()
+    src = tmp_path / "old.apk"
+    src.write_bytes(b"apk")
+    win._apk_path = str(src)
+    win._parse_ok_path = str(src)
+    win.rename_preview.setText("new.apk")
+    win._busy = True
+    try:
+        win.do_rename()
+        assert src.exists()
+        assert not (tmp_path / "new.apk").exists()
+        assert win._apk_path == str(src)
+        assert win._parse_ok_path == str(src)
+    finally:
+        win._busy = False
+        win.close()
+
+
 def test_rename_cancels_busy_icon_worker(app, tmp_path):
     """图标提取在途时重命名应先取消/等待，避免 ZipFile 占用导致失败。"""
     win = MainWindow()
