@@ -13,6 +13,7 @@
   - ui.main_window: 主窗口（MainWindow）与全局异常捕获钩子。
 
 """
+import argparse
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -94,6 +95,30 @@ def _default_log_path() -> str:
     return os.path.join(log_dir, "winapkinfo.log")
 
 
+def _parse_args(argv=None):
+    """命令行入口定义：--version / --self-test [apk] / 可选的 APK 位置参数。
+
+    用 parse_known_args 忽略多余参数：把 APK 拖到 exe 图标上会以该路径为
+    位置参数启动进程，严格 parse_args 会报"unrecognized arguments"并以
+    退出码 2 结束，窗口模式（console=False）下表现为程序"双击不启动"。
+    """
+    parser = argparse.ArgumentParser(
+        prog="WinApkInfo",
+        description="基于 PyQt6 + aapt2 的图形化 APK 信息查看与图标提取工具。",
+    )
+    parser.add_argument("--version", action="store_true", help="打印版本号后退出")
+    parser.add_argument(
+        "--self-test", nargs="?", const="", default=None, metavar="APK",
+        help="打包自检：检查 aapt2 与随包资源；附带样本 APK 时完整验证图标提取链路",
+    )
+    parser.add_argument(
+        "apk", nargs="?", default="",
+        help="启动后立即解析的 APK 文件（等价于把文件拖到程序图标上）",
+    )
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
 def main():
     # 日志：控制台模式输出到 stderr，同时统一落盘到标准日志路径 %LOCALAPPDATA%/WinApkInfo/winapkinfo.log
     log_path = _default_log_path()
@@ -116,16 +141,13 @@ def main():
     )
 
     # 构建/排障入口：--version 输出版本，--self-test 检查打包产物是否完整
-    if "--version" in sys.argv:
+    args = _parse_args()
+    if args.version:
         if sys.stdout is not None:
             print(__version__)
         return 0
-    if "--self-test" in sys.argv:
-        index = sys.argv.index("--self-test")
-        apk_path = None
-        if index + 1 < len(sys.argv) and not sys.argv[index + 1].startswith("-"):
-            apk_path = sys.argv[index + 1]
-        return _self_test(apk_path)
+    if args.self_test is not None:
+        return _self_test(args.self_test or None)
 
     # 高分屏适配：Qt6 默认启用 high-DPI 缩放（AA_EnableHighDpiScaling /
     # AA_UseHighDpiPixmaps 已废弃），无需再设置任何属性。
@@ -136,6 +158,9 @@ def main():
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
+    # 命令行/拖放启动时带上了 APK 路径：窗口就绪后立即进入解析流程
+    if args.apk:
+        w.process_apk(args.apk)
     code = app.exec()
     # 事件循环结束后必须确认后台线程已退出：QThread 运行中被析构会让进程崩溃
     w.shutdown_background()
