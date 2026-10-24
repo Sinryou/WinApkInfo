@@ -352,6 +352,20 @@ class TestSmartIconExportNaming(unittest.TestCase):
         finally:
             win.close()
 
+    def test_architecture_display(self):
+        _ = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+        win = MainWindow()
+        try:
+            # 纯 Java/Kotlin 应用：无 native 架构
+            win.fill_info({"architectures": []}, refresh_icon=False)
+            self.assertEqual(win.le_arch.text(), "无 Native 库（纯 Java/Kotlin）")
+
+            # 带架构应用
+            win.fill_info({"architectures": ["arm64-v8a", "armeabi-v7a"]}, refresh_icon=False)
+            self.assertEqual(win.le_arch.text(), "arm64-v8a, armeabi-v7a")
+        finally:
+            win.close()
+
 
 class TestBadgingLabelParsing(unittest.TestCase):
     """badging 标签含 aapt2 转义字符（\\'）时的解析回归。

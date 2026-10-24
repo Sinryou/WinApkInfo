@@ -390,7 +390,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.le_launch.setText(info.get("launchable_activity", ""))
 
         archs = info.get("architectures", [])
-        self.le_arch.setText(", ".join(archs) if archs else "(未检测到)")
+        self.le_arch.setText(", ".join(archs) if archs else "无 Native 库（纯 Java/Kotlin）")
 
         # 权限
         perms = info.get("permissions", [])
