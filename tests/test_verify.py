@@ -385,6 +385,26 @@ class TestBadgingLabelParsing(unittest.TestCase):
         info = apk_parser_mod.parse_aapt2_output(text)
         self.assertEqual(info["app_name"], "McDonald's App")
 
+    def test_permissions_extraction_and_sdk23(self):
+        text = (
+            "package: name='com.example.demo' versionCode='1' versionName='1.0'\n"
+            "uses-permission: name='android.permission.INTERNET'\n"
+            "uses-permission-sdk-23: name='android.permission.REQUEST_INSTALL_PACKAGES'\n"
+            "uses-permission-sdk-23: name='android.permission.WRITE_EXTERNAL_STORAGE' maxSdkVersion='28'\n"
+            "uses-permission: name='android.permission.INTERNET'\n"
+            "uses-permission: name='com.example.CUSTOM\\'PERMISSION'\n"
+        )
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(
+            info["permissions"],
+            [
+                "android.permission.INTERNET",
+                "android.permission.REQUEST_INSTALL_PACKAGES",
+                "android.permission.WRITE_EXTERNAL_STORAGE",
+                "com.example.CUSTOM'PERMISSION",
+            ],
+        )
+
 
 _VECTOR_ICON_XML = (
     "E: vector (line=1)\n"

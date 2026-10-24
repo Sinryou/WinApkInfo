@@ -404,7 +404,13 @@ def parse_aapt2_output(text: str) -> dict:
         info["launchable_activity"] = m_launch.group(1)
 
     # --- 权限 ---
-    info["permissions"] = re.findall(r"uses-permission:\s+name='([^']+)'", text)
+    # 支持 uses-permission 与 uses-permission-sdk-23，保持顺序去重并支持转义单引号
+    perms = []
+    for p in re.findall(r"uses-permission(?:-sdk-23)?:\s+name=" + _BADGING_QUOTED, text):
+        cleaned = _unescape_badging_value(p)
+        if cleaned not in perms:
+            perms.append(cleaned)
+    info["permissions"] = perms
 
     # --- Feature ---
     info["features"] = re.findall(r"uses-feature:\s+name='([^']+)'", text)
