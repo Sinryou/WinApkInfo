@@ -187,7 +187,10 @@ class _Aapt2OutputCache:
     def _remember(self, key, value):
         """写入内存层（调用方需持有 _lock）。"""
         if isinstance(value, str):
-            size = len(value.encode("utf-8"))
+            # 字节量统计：ASCII 串直接取字符数（isascii 是 C 级检查、零拷贝），
+            # 只有含非 ASCII 时才整串 encode。几十 MB 的 resources dump
+            # 每 put 一次都编码成临时 bytes 会让瞬时内存翻倍。
+            size = len(value) if value.isascii() else len(value.encode("utf-8"))
         elif isinstance(value, (bytes, bytearray)):
             size = len(value)
         else:
