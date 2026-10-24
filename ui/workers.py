@@ -8,15 +8,12 @@ from PIL import Image
 from PyQt6 import QtCore, QtGui
 
 from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2_dump_xmltree
-from core.resources import _ResourceIndex, _open_apk_zip, _sniff_file_kind
+from core.resources import _ResourceIndex, _open_apk_zip, _sniff_file_kind, BITMAP_EXTS
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
     _ICON_SIZE, find_adaptive_layer_addr, resolve_icon_layer,
     extract_icon_bytes, find_mipmap_fallback, _normalize_icon_png
 )
-
-# 图标路径的快速后缀判断；后缀不可信（混淆包可能没有扩展名）时再按魔数嗅探
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 class _Cancelled(Exception):
     """内部取消信号：请求被更新的请求覆盖、或窗口关闭时抛出让工作者丢弃本轮。"""
@@ -141,7 +138,7 @@ def _icon_kind(apk_path: str, icon_path: str, zf=None):
     endswith 分派，否则明明能读取的图标会被判成"不支持的类型"。
     """
     lower = icon_path.lower()
-    if lower.endswith(_IMAGE_EXTENSIONS):
+    if lower.endswith(BITMAP_EXTS):
         return "image"
     if lower.endswith(".xml"):
         return "xml"

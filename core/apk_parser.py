@@ -11,7 +11,7 @@ from core.colors import _FRAMEWORK_COLOR_MAP, parse_android_color
 from core.resources import (
     _entry_span, extract_resource_entry, _density_of,
     _pick_best_density, _sniff_file_kind, get_resource_info,
-    _BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
+    BITMAP_EXTS, _MAX_DEREF_DEPTH, _open_apk_zip
 )
 from core.vector import rasterize_vector_layer
 
@@ -136,7 +136,7 @@ def resolve_icon_layer(apk_path: str, full_res: str, res_id: str, depth: int = 0
         return resolve_icon_layer(apk_path, full_res, value, depth + 1, index, zf=zf)
     if kind == "string_file":
         ext = os.path.splitext(value)[1].lower()
-        if ext in _BITMAP_EXTS:
+        if ext in BITMAP_EXTS:
             return ("image", value, None)
         if ext == ".xml":
             return _resolve_xml_wrapper(apk_path, full_res, value, depth, index, zf=zf)
@@ -159,7 +159,7 @@ def _collect_bitmap_variants(entry_text: str) -> dict:
     variants = {}
     for line in (entry_text or "").splitlines():
         m = re.match(r"^\s*\(([^)]*)\)\s*\(file\)\s*(\S+)", line)
-        if m and m.group(2).lower().endswith(_BITMAP_EXTS):
+        if m and m.group(2).lower().endswith(BITMAP_EXTS):
             variants[_density_of(m.group(1))] = m.group(2)
     return variants
 

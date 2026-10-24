@@ -292,7 +292,9 @@ def _sniff_file_kind(apk_path: str, inner_path: str, zf=None):
 # aapt2 dump resources 里「文件型」条目会标注 type=PNG / type=XML；
 # 但 WebP 等位图不标注任何 type（形如 `(xxhdpi) (file) res/Sn.webp`），
 # 所以位图识别必须按扩展名兜底，不能只看 type=PNG。
-_BITMAP_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
+# 这是全项目唯一的位图扩展名清单：资源条目分类（本模块）、图标层
+# 解析（apk_parser）与图标类型分派（ui.workers._icon_kind）共用。
+BITMAP_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
 
 # 混淆包中字符串引用/包装 XML 的最大解引用深度，防止循环引用
 _MAX_DEREF_DEPTH = 3
@@ -340,7 +342,7 @@ def get_resource_info(entry_text: str) -> dict:
         m = file_re.match(line)
         if m:
             qual, path, typ = m.group(1).strip(), m.group(2), m.group(3)
-            if typ == "PNG" or path.lower().endswith(_BITMAP_EXTS):
+            if typ == "PNG" or path.lower().endswith(BITMAP_EXTS):
                 bitmaps[_density_of(qual)] = path
             else:
                 xml_files.append(path)
