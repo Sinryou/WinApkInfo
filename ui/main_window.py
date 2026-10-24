@@ -12,7 +12,8 @@ from version import __version__
 from core.aapt import kill_running_aapt2, get_disk_cache_info, clear_disk_cache
 from core.resources import local_resource_path, load_sdk_versions
 from core.apk_parser import (
-    _sanitize_apk_name, _sanitize_filename, parse_aapt2_output, _CHINESE_LOCALE_PRIORITY
+    _sanitize_apk_name, _sanitize_filename, parse_aapt2_output, pick_best_icon,
+    _CHINESE_LOCALE_PRIORITY
 )
 from ui.workers import IconWorker, ApkInfoWorker
 from ui.widgets import DropLineEdit
@@ -486,8 +487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif apk_path and os.path.isfile(apk_path):
             try:
                 # 选择最大 density 的 icon（adaptive icon 的 anydpi XML 会排在最高位）
-                best = max(icons.items(), key=lambda x: int(x[0]))
-                self._start_icon_worker(apk_path, best[1])
+                self._start_icon_worker(apk_path, pick_best_icon(icons))
             except Exception as e:
                 logging.exception("提取图标失败: %s", e)
         else:

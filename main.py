@@ -23,7 +23,7 @@ import tempfile
 from PyQt6 import QtWidgets
 
 from core.aapt import aapt2_version, find_aapt2, run_aapt2_dump_badging
-from core.apk_parser import parse_aapt2_output
+from core.apk_parser import parse_aapt2_output, pick_best_icon
 from core.paths import default_log_dir
 from core.resources import load_sdk_versions, local_resource_path
 from ui.main_window import MainWindow, install_excepthook
@@ -64,11 +64,10 @@ def _self_test(apk_path: str = None) -> int:
     if apk_path:
         try:
             info = parse_aapt2_output(run_aapt2_dump_badging(apk_path))
-            icons = info.get("icons") or {}
-            if not icons:
+            icon_path = pick_best_icon(info.get("icons") or {})
+            if not icon_path:
                 problems.append(f"样本 APK 没有可用图标：{apk_path}")
             else:
-                icon_path = max(icons.items(), key=lambda item: int(item[0]))[1]
                 image, data = extract_icon(apk_path, icon_path)
                 if image.isNull() or not data:
                     problems.append(f"样本 APK 图标提取结果为空：{icon_path}")

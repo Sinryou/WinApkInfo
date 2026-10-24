@@ -460,6 +460,17 @@ def parse_aapt2_output(text: str) -> dict:
     return info
 
 
+def pick_best_icon(icons: dict) -> str:
+    """从 badging 的 {density: 路径} 中选最高密度的图标路径，空表返回空串。
+
+    密度键是十进制数字字符串（自适应图标的 anydpi 变体密度值最大），
+    按数值比较即可。--self-test 与主窗口 fill_info 共用本逻辑。
+    """
+    if not icons:
+        return ""
+    return max(icons.items(), key=lambda item: int(item[0]))[1]
+
+
 def _sanitize_filename(name: str, ext: str = "") -> str:
     """把应用名/文件名整理成合法的 Windows 文件名（可选指定扩展名）。
 
