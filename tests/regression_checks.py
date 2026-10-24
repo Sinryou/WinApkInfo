@@ -1049,8 +1049,8 @@ def check_b2(full_mode):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    C.check("默认上限：单条 8MB / 磁盘 200MB / 内存 64MB",
-            aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY == 8 * 1024 * 1024 and
+    C.check("默认上限：单条 64MB / 磁盘 200MB / 内存 64MB",
+            aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY == 64 * 1024 * 1024 and
             aapt_mod._Aapt2OutputCache.DISK_MAX_BYTES == 200 * 1024 * 1024 and
             aapt_mod._Aapt2OutputCache.MEM_MAX_BYTES == 64 * 1024 * 1024)
     if not full_mode:
@@ -1061,11 +1061,11 @@ def check_b2(full_mode):
         return
     largest = pick_apk(apks, largest=True)
     aapt_mod.run_aapt2_dump_badging(largest)
-    aapt_mod.run_aapt2_dump_resource(largest)      # 该 dump 约 36MB，应只留内存
+    aapt_mod.run_aapt2_dump_resource(largest)      # 最贵的 resources dump 也应可落盘复用
     files = [(os.path.getsize(os.path.join(disk_dir, f)), f) for f in os.listdir(disk_dir)]
     biggest = max((s for s, _ in files), default=0)
     total = sum(s for s, _ in files)
-    C.check("真实样本：单条不超过 8MB", biggest <= aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY,
+    C.check("真实样本：单条不超过上限", biggest <= aapt_mod._Aapt2OutputCache.DISK_MAX_ENTRY,
             "最大 %.1f MB" % (biggest / 1048576))
     C.check("真实样本：总量不超过 200MB", total <= aapt_mod._Aapt2OutputCache.DISK_MAX_BYTES,
             "合计 %.1f MB / %d 条" % (total / 1048576, len(files)))

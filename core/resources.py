@@ -242,6 +242,13 @@ def get_resource_index(full_output: str):
     return index
 
 
+def clear_resource_index_cache():
+    """释放最近一次资源索引（清理缓存/测试时使用）。"""
+    global _resource_index_cache
+    with _resource_index_lock:
+        _resource_index_cache = None
+
+
 def _normalize_resource_key(res_id: str) -> str:
     """归一化资源引用键：剥掉 @ 前缀；数字地址统一小写。
 

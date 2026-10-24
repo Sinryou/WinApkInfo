@@ -28,6 +28,20 @@ class Aapt2Error(RuntimeError):
 
 # 单个 aapt2 子进程的最长运行时间（秒）：异常的 APK 不应让工作线程永久阻塞
 _AAPT2_TIMEOUT = 60
+# 可由环境变量覆盖，方便在慢速磁盘/超大 APK 上排障；限制在合理范围。
+_AAPT2_TIMEOUT_ENV = "WINAPKINFO_AAPT2_TIMEOUT"
+
+
+def _aapt2_timeout() -> int:
+    """返回当前配置的 aapt2 超时秒数（环境变量非法时回退默认值）。"""
+    raw = os.environ.get(_AAPT2_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _AAPT2_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _AAPT2_TIMEOUT
+    return max(5, min(value, 3600))
 
 # 缓存键的 schema 版本：解析逻辑或输出格式变化时递增，让旧磁盘条目自然失效
 _AAPT2_CACHE_VERSION = 2
@@ -40,15 +54,18 @@ _running_procs = {}
 _running_procs_lock = threading.Lock()
 
 
-def _run_aapt2(cmd, timeout=_AAPT2_TIMEOUT, tag=None):
+def _run_aapt2(cmd, timeout=None, tag=None):
     """运行 aapt2 子进程，返回 (returncode, stdout, stderr)。
 
     与 subprocess.run 的区别：
-    - 带 timeout：超时先 kill 再抛 Aapt2Error；
+    - 带 timeout（默认读取 WINAPKINFO_AAPT2_TIMEOUT，未设置时 60s）：超时先
+      kill 再抛 Aapt2Error；
     - 运行期间把 Popen 登记到 _running_procs（附用途标签），便于按需结束。
 
     tag 用于定向终止：kill_running_aapt2(tags=...) 只会结束命中的进程。
     """
+    if timeout is None:
+        timeout = _aapt2_timeout()
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -120,9 +137,10 @@ class _Aapt2OutputCache:
     的键同样包含 mtime_ns 与文件大小，不会读到过期内容；写入用临时文件 +
     os.replace，保证并发下不会读到半个文件。
 
-    磁盘层有双重上限：单条超过 disk_max_entry 的输出（例如几十 MB 的
-    resources dump）只留在内存不落盘，整目录再受 disk_limit 条数与
-    disk_max_bytes 总字节约束，超限按 mtime 从最旧的开始删。
+    磁盘层有双重上限：单条超过 disk_max_entry 的输出不落盘，整目录再受
+    disk_limit 条数与 disk_max_bytes 总字节约束，超限按 mtime 从最旧的
+    开始删。上限要覆盖最贵的 resources dump（Play 商店包实测单条约 36MB），
+    否则"跨进程复用"恰好对最慢的包失效。
 
     内存层同样有字节上限：capacity 只能限制条数，单条 resources dump
     可达几十 MB，必须再按总字节淘汰，避免长时间运行累积成数百 MB。
@@ -130,8 +148,9 @@ class _Aapt2OutputCache:
 
     """
 
-    # 单条超过 8MB 的 dump 不落盘（Play 商店包实测单条 resources dump 36MB）
-    DISK_MAX_ENTRY = 8 * 1024 * 1024
+    # 单条 64MB：覆盖 Play 商店级 resources dump（实测约 36MB），
+    # 又受下面的 200MB 总量上限约束。
+    DISK_MAX_ENTRY = 64 * 1024 * 1024
     # 磁盘缓存总量上限 200MB / 300 条
     DISK_MAX_BYTES = 200 * 1024 * 1024
     DISK_LIMIT = 300
@@ -227,16 +246,27 @@ class _Aapt2OutputCache:
     def _disk_put(self, key, value):
         if not self._disk_dir:
             return
-        # 先编码成字节：既能拿到真实落盘体积，也避免写文件时再编码一次
-        try:
-            payload = value.encode("utf-8")
-        except UnicodeEncodeError:
-            return
-        if len(payload) > self._disk_max_entry:
-            # 超大 dump（如 30MB+ 的 resources 输出）只留在内存层
+        # ASCII 文本先按字符数判断超限：resources dump 往往几十 MB，
+        # 先 encode 出完整 bytes 再丢弃会让图标线程瞬时多占一份内存。
+        payload = None
+        if value.isascii():
+            size = len(value)
+        else:
+            try:
+                payload = value.encode("utf-8")
+            except UnicodeEncodeError:
+                return
+            size = len(payload)
+        if size > self._disk_max_entry:
+            # 单条超限的 dump 只留在内存层
             logging.debug("dump 输出 %.1fMB 超过单条上限，不写入磁盘缓存",
-                          len(payload) / 1048576)
+                          size / 1048576)
             return
+        if payload is None:
+            try:
+                payload = value.encode("utf-8")
+            except UnicodeEncodeError:
+                return
         path = self._disk_path(key)
         # 临时文件名必须唯一：缓存目录是跨进程共享的（多开本程序时），
         # 固定用 path + ".tmp" 会让并发写互相截断，把半截内容 replace 成正式条目。
@@ -505,6 +535,12 @@ def get_disk_cache_info() -> dict:
 def clear_disk_cache() -> int:
     """清空磁盘缓存与内存缓存，返回释放的字节数。"""
     _aapt2_cache.clear()
+    try:
+        # 资源索引单独缓存了一份大 dump 的条目区间；清理缓存时一并释放。
+        from core.resources import clear_resource_index_cache
+        clear_resource_index_cache()
+    except Exception:
+        pass
     disk_dir = _default_disk_cache_dir()
     if not disk_dir or not os.path.isdir(disk_dir):
         return 0
