@@ -1024,17 +1024,17 @@ def _cmds_to_qpainterpath(cmds, m, fill_rule="nonzero", step=1.0) -> QtGui.QPain
     return qpath
 
 
-def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=None):
-    """使用 PyQt6 原生 QPainterPath / QPainter 进行 C++ 矢量光栅化。"""
+def _load_vector_elements(apk_path, xml_path):
+    """解析 xmltree 并定位根 <vector>，返回 (元素列表, viewport 宽, viewport 高)。
+
+    viewport 缺省回退 width/height，仍非法时按 108 处理；输出为空或根
+    元素不是 vector 时返回 None。
+    """
     xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
     if not xml_out:
         return None
     elems = _parse_vector_elements(xml_out)
-    root = None
-    for el in elems:
-        if el["tag"] == "vector":
-            root = el
-            break
+    root = next((el for el in elems if el["tag"] == "vector"), None)
     if root is None:
         return None
     attrs = root["attrs"]
@@ -1042,141 +1042,35 @@ def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=No
     vh = _attr_float(attrs, "viewportHeight", _attr_float(attrs, "height", 108.0))
     if vw <= 0 or vh <= 0:
         vw = vh = 108.0
+    return elems, vw, vh
 
-    W = size
-    H = size
+
+def _iter_path_draw_ops(elems, vw, vh, W, H):
+    """共享的矢量元素树遍历：为每个可绘制的 <path> 产出渲染参数。
+
+    Qt 与 Pillow 两个光栅化后端消费同一序列：group 矩阵栈维护、
+    viewport→像素缩放、alpha 累积、pathData 解析与 fillType 判定只在
+    这里实现一次（与路径命令遍历器 _iter_path_ops 同一思路），后端只
+    保留"怎么画"的差异。产出 dict：
+        cmds      解析后的 path 命令列表（无 pathData / 空命令的 path 已跳过）
+        matrix    视口缩放 × 全部 group 变换的仿射矩阵（描边宽度换算同源）
+        alpha     vector/group alpha 的累积值
+        fill_type "nonzero" / "evenodd"
+        step      曲线采样步长（viewport 单位）
+        attrs     path 元素原始属性（fillColor / strokeColor 等由后端读取）
+    """
     sx = W / vw
     sy = H / vh
     step = max(0.5, max(vw, vh) / 160.0)
-    vec_alpha = _attr_float(attrs, "alpha", 1.0)
-
-    qimg = QtGui.QImage(W, H, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
-    qimg.fill(QtCore.Qt.GlobalColor.transparent)
-    painter = QtGui.QPainter(qimg)
-    try:
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        stack = []  # (indent, 累计矩阵, 累计 alpha)
-        for el in elems:
-            tag = el["tag"]
-            indent = el["indent"]
-            while stack and stack[-1][0] >= indent:
-                stack.pop()
-            if tag == "vector":
-                stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
-                continue
-            if tag == "group":
-                if not stack:
-                    continue
-                a = el["attrs"]
-                m = _group_matrix(
-                    _attr_float(a, "translateX", 0.0), _attr_float(a, "translateY", 0.0),
-                    _attr_float(a, "pivotX", 0.0), _attr_float(a, "pivotY", 0.0),
-                    _attr_float(a, "rotation", 0.0),
-                    _attr_float(a, "scaleX", 1.0), _attr_float(a, "scaleY", 1.0),
-                )
-                pm, pa = stack[-1][1], stack[-1][2]
-                stack.append((indent, _mat_mul(pm, m), pa * _attr_float(a, "alpha", 1.0)))
-                continue
-            if tag == "path":
-                if not stack:
-                    continue
-                pm, pa = stack[-1][1], stack[-1][2]
-                a = el["attrs"]
-                path_data = a.get("pathData")
-                if not path_data:
-                    continue
-                cmds = _parse_path_commands(_tokenize_path_data(path_data))
-                if not cmds:
-                    continue
-                m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
-                fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
-                qpath = _cmds_to_qpainterpath(cmds, m, fill_rule, step)
-                if qpath.isEmpty():
-                    continue
-
-                if "fillColor" in a:
-                    fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
-                    if fill is not None:
-                        falpha = pa * _attr_float(a, "fillAlpha", 1.0)
-                        brush = _create_qbrush(fill, m, falpha, W, H)
-                        if brush is not None:
-                            painter.fillPath(qpath, brush)
-
-                if "strokeColor" in a:
-                    sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
-                    if sc is not None:
-                        sw = _attr_float(a, "strokeWidth", 0.0)
-                        sa = pa * _attr_float(a, "strokeAlpha", 1.0)
-                        if sw > 0 and sa > 0:
-                            wpx = max(1.0, sw * _mat_scale(m))
-                            cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
-                            if cap_enum in ("1", "round"):
-                                cap = QtCore.Qt.PenCapStyle.RoundCap
-                            elif cap_enum in ("2", "square"):
-                                cap = QtCore.Qt.PenCapStyle.SquareCap
-                            else:
-                                cap = QtCore.Qt.PenCapStyle.FlatCap
-
-                            join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
-                            if join_enum in ("0", "miter"):
-                                join = QtCore.Qt.PenJoinStyle.MiterJoin
-                            elif join_enum in ("2", "bevel"):
-                                join = QtCore.Qt.PenJoinStyle.BevelJoin
-                            else:
-                                join = QtCore.Qt.PenJoinStyle.RoundJoin
-
-                            pen = QtGui.QPen()
-                            pen.setWidthF(wpx)
-                            pen.setCapStyle(cap)
-                            pen.setJoinStyle(join)
-                            brush = _create_qbrush(sc, m, sa, W, H)
-                            if brush is not None:
-                                pen.setBrush(brush)
-                                painter.strokePath(qpath, pen)
-    finally:
-        # 中途抛异常时（外层捕获后回退 Pillow 渲染）也必须结束 painter，
-        # 否则 Qt 会留下"QPainter 未 end"的警告与未定义状态。
-        painter.end()
-    return _qimage_to_pil(qimg)
-
-
-def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=None):
-    """纯 Python/Pillow 栅格化回退实现。"""
-    xml_out = run_aapt2_dump_xmltree(apk_path, xml_path)
-    if not xml_out:
-        return None
-    elems = _parse_vector_elements(xml_out)
-    root = None
-    for el in elems:
-        if el["tag"] == "vector":
-            root = el
-            break
-    if root is None:
-        return None
-    attrs = root["attrs"]
-    vw = _attr_float(attrs, "viewportWidth", _attr_float(attrs, "width", 108.0))
-    vh = _attr_float(attrs, "viewportHeight", _attr_float(attrs, "height", 108.0))
-    if vw <= 0 or vh <= 0:
-        vw = vh = 108.0
-    ss = 2  # 超采样，最后 LANCZOS 缩小抗锯齿
-    W = size * ss
-    H = size * ss
-    sx = W / vw
-    sy = H / vh
-    step = max(0.5, max(vw, vh) / 160.0)
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    transparent = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # 每路径复用的透明底图
-    vec_alpha = _attr_float(attrs, "alpha", 1.0)
-    stack = []  # (indent, 累计矩阵, 累计 alpha)
+    stack = []  # (indent, group 空间累计矩阵, 累计 alpha)
     for el in elems:
         tag = el["tag"]
         indent = el["indent"]
         while stack and stack[-1][0] >= indent:
             stack.pop()
         if tag == "vector":
-            stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), vec_alpha))
+            stack.append((indent, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+                          _attr_float(el["attrs"], "alpha", 1.0)))
             continue
         if tag == "group":
             if not stack:
@@ -1194,56 +1088,145 @@ def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=N
         if tag == "path":
             if not stack:
                 continue
-            pm, pa = stack[-1][1], stack[-1][2]
             a = el["attrs"]
             path_data = a.get("pathData")
             if not path_data:
                 continue
             cmds = _parse_path_commands(_tokenize_path_data(path_data))
-            subpaths = _flatten_subpaths(cmds, step)
-            if not subpaths:
+            if not cmds:
                 continue
-            m = _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm)
-            tsubs = [[_mat_apply(m, x, y) for (x, y) in pts] for pts in subpaths]
-            # fillType 是枚举：aapt2 输出十进制 0=nonZero / 1=evenOdd，
-            # 旧实现只与字符串 "evenodd" 比较，导致 evenOdd 路径全部被
-            # 当成 nonzero 渲染（同向子路径的"洞"会被填实）。
-            fill_rule = "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero"
+            pm, pa = stack[-1][1], stack[-1][2]
+            yield {
+                "cmds": cmds,
+                "matrix": _mat_mul((sx, 0.0, 0.0, sy, 0.0, 0.0), pm),
+                "alpha": pa,
+                "fill_type": "evenodd" if _attr_enum(a.get("fillType")) in ("1", "evenodd") else "nonzero",
+                "step": step,
+                "attrs": a,
+            }
+
+
+def _rasterize_vector_layer_qt(apk_path, xml_path, size, full_res=None, index=None):
+    """使用 PyQt6 原生 QPainterPath / QPainter 进行 C++ 矢量光栅化。"""
+    loaded = _load_vector_elements(apk_path, xml_path)
+    if loaded is None:
+        return None
+    elems, vw, vh = loaded
+
+    W = size
+    H = size
+    qimg = QtGui.QImage(W, H, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+    qimg.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(qimg)
+    try:
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        for op in _iter_path_draw_ops(elems, vw, vh, W, H):
+            a = op["attrs"]
+            qpath = _cmds_to_qpainterpath(op["cmds"], op["matrix"], op["fill_type"], op["step"])
+            if qpath.isEmpty():
+                continue
+
             if "fillColor" in a:
                 fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
                 if fill is not None:
-                    falpha = pa * _attr_float(a, "fillAlpha", 1.0)
-                    if fill[0] == "color":
-                        ca = int(round(fill[1][3] * falpha))
-                        if ca > 0:
-                            mask = _build_fill_mask(W, H, tsubs, fill_rule)
-                            tint = Image.new("RGBA", (W, H), (fill[1][0], fill[1][1], fill[1][2], ca))
-                            layer.alpha_composite(Image.composite(tint, transparent, mask))
-                    else:  # gradient 填充
-                        mask = _build_fill_mask(W, H, tsubs, fill_rule)
-                        gimg = _scale_alpha(_render_gradient(W, H, fill[1], m), falpha)
-                        gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
-                        layer.alpha_composite(gimg)
+                    falpha = op["alpha"] * _attr_float(a, "fillAlpha", 1.0)
+                    brush = _create_qbrush(fill, op["matrix"], falpha, W, H)
+                    if brush is not None:
+                        painter.fillPath(qpath, brush)
+
             if "strokeColor" in a:
                 sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
                 if sc is not None:
                     sw = _attr_float(a, "strokeWidth", 0.0)
-                    sa = pa * _attr_float(a, "strokeAlpha", 1.0)
+                    sa = op["alpha"] * _attr_float(a, "strokeAlpha", 1.0)
                     if sw > 0 and sa > 0:
-                        # 描边宽度按完整变换（viewport 缩放 × group 缩放/旋转）换算，
-                        # 不能只用 sx/sy，否则带 group scale 的图标描边会粗成实心块。
-                        wpx = max(1, int(round(sw * _mat_scale(m))))
-                        cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
-                        if sc[0] == "color":
-                            _draw_stroke(layer, tsubs, sc[1], sa, wpx, cap)
-                        elif sc[0] == "gradient":
-                            mask = _stroke_mask(layer.size, tsubs, wpx, cap)
-                            if sa < 0.999:
-                                mask = mask.point(lambda v: int(round(v * sa)))
-                            gimg = _render_gradient(W, H, sc[1], m)
-                            # 只把描边覆盖率写进 alpha，保留渐变 RGB，避免描边发暗
-                            gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
-                            layer.alpha_composite(gimg)
+                        wpx = max(1.0, sw * _mat_scale(op["matrix"]))
+                        cap_enum = _attr_enum(a.get("strokeLineCap", "butt"))
+                        if cap_enum in ("1", "round"):
+                            cap = QtCore.Qt.PenCapStyle.RoundCap
+                        elif cap_enum in ("2", "square"):
+                            cap = QtCore.Qt.PenCapStyle.SquareCap
+                        else:
+                            cap = QtCore.Qt.PenCapStyle.FlatCap
+
+                        join_enum = _attr_enum(a.get("strokeLineJoin", "round"))
+                        if join_enum in ("0", "miter"):
+                            join = QtCore.Qt.PenJoinStyle.MiterJoin
+                        elif join_enum in ("2", "bevel"):
+                            join = QtCore.Qt.PenJoinStyle.BevelJoin
+                        else:
+                            join = QtCore.Qt.PenJoinStyle.RoundJoin
+
+                        pen = QtGui.QPen()
+                        pen.setWidthF(wpx)
+                        pen.setCapStyle(cap)
+                        pen.setJoinStyle(join)
+                        brush = _create_qbrush(sc, op["matrix"], sa, W, H)
+                        if brush is not None:
+                            pen.setBrush(brush)
+                            painter.strokePath(qpath, pen)
+    finally:
+        # 中途抛异常时（外层捕获后回退 Pillow 渲染）也必须结束 painter，
+        # 否则 Qt 会留下"QPainter 未 end"的警告与未定义状态。
+        painter.end()
+    return _qimage_to_pil(qimg)
+
+
+def _rasterize_vector_layer_pil(apk_path, xml_path, size, full_res=None, index=None):
+    """纯 Python/Pillow 栅格化回退实现。"""
+    loaded = _load_vector_elements(apk_path, xml_path)
+    if loaded is None:
+        return None
+    elems, vw, vh = loaded
+
+    ss = 2  # 超采样，最后 LANCZOS 缩小抗锯齿
+    W = size * ss
+    H = size * ss
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    transparent = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # 每路径复用的透明底图
+    for op in _iter_path_draw_ops(elems, vw, vh, W, H):
+        a = op["attrs"]
+        m = op["matrix"]
+        tsubs = [[_mat_apply(m, x, y) for (x, y) in pts]
+                 for pts in _flatten_subpaths(op["cmds"], op["step"])]
+        if not tsubs:
+            continue
+        if "fillColor" in a:
+            fill = _resolve_vector_fill(apk_path, full_res, a["fillColor"], index)
+            if fill is not None:
+                falpha = op["alpha"] * _attr_float(a, "fillAlpha", 1.0)
+                if fill[0] == "color":
+                    ca = int(round(fill[1][3] * falpha))
+                    if ca > 0:
+                        mask = _build_fill_mask(W, H, tsubs, op["fill_type"])
+                        tint = Image.new("RGBA", (W, H), (fill[1][0], fill[1][1], fill[1][2], ca))
+                        layer.alpha_composite(Image.composite(tint, transparent, mask))
+                else:  # gradient 填充
+                    mask = _build_fill_mask(W, H, tsubs, op["fill_type"])
+                    gimg = _scale_alpha(_render_gradient(W, H, fill[1], m), falpha)
+                    gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
+                    layer.alpha_composite(gimg)
+        if "strokeColor" in a:
+            sc = _resolve_vector_fill(apk_path, full_res, a["strokeColor"], index)
+            if sc is not None:
+                sw = _attr_float(a, "strokeWidth", 0.0)
+                sa = op["alpha"] * _attr_float(a, "strokeAlpha", 1.0)
+                if sw > 0 and sa > 0:
+                    # 描边宽度按完整变换（viewport 缩放 × group 缩放/旋转）换算，
+                    # 不能只用 sx/sy，否则带 group scale 的图标描边会粗成实心块。
+                    wpx = max(1, int(round(sw * _mat_scale(m))))
+                    cap = _VECTOR_CAPS.get(_attr_enum(a.get("strokeLineCap", "butt")), 0)
+                    if sc[0] == "color":
+                        _draw_stroke(layer, tsubs, sc[1], sa, wpx, cap)
+                    elif sc[0] == "gradient":
+                        mask = _stroke_mask(layer.size, tsubs, wpx, cap)
+                        if sa < 0.999:
+                            mask = mask.point(lambda v: int(round(v * sa)))
+                        gimg = _render_gradient(W, H, sc[1], m)
+                        # 只把描边覆盖率写进 alpha，保留渐变 RGB，避免描边发暗
+                        gimg.putalpha(ImageChops.multiply(gimg.getchannel("A"), mask))
+                        layer.alpha_composite(gimg)
     return layer.resize((size, size), Image.LANCZOS)
 
 
