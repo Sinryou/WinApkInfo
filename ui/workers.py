@@ -7,7 +7,10 @@ import re
 from PIL import Image
 from PyQt6 import QtCore, QtGui
 
-from core.aapt import run_aapt2_dump_badging, run_aapt2_dump_resource, run_aapt2_dump_xmltree
+from core.aapt import (
+    kill_running_aapt2, run_aapt2_dump_badging, run_aapt2_dump_resource,
+    run_aapt2_dump_xmltree
+)
 from core.resources import ResourceIndex, open_apk_zip, sniff_file_kind, BITMAP_EXTS
 from core.vector import rasterize_vector_layer
 from core.apk_parser import (
@@ -325,8 +328,17 @@ class IconWorker(QtCore.QThread):
         self.quit()
 
     def cancel(self):
-        """作废当前在途的提取任务（新一轮解析开始时调用）。"""
+        """作废在途/待办的提取任务，并终止图标线程正在跑的 aapt2 dump。
+
+        新一轮解析开始时调用：当前文件已经换掉，上一个 APK 的图标任务
+        没有继续的必要。除了推进代数让工作线程在检查点退出，还要结束
+        已在运行的 resources/xmltree 子进程——否则旧 APK 的 dump 可能
+        继续占用常驻图标线程，新 APK 的图标要排队等到它超时（最坏 60s）。
+        """
         self._core.cancel()
+        # 只终止图标线程自己的标签：badging 由 MainWindow.process_apk
+        # 定向终止，这里不能无差别 kill。
+        kill_running_aapt2(tags=("resources", "xmltree"))
 
     def _is_stale(self, gen: int) -> bool:
         return self._core.is_stale(gen)

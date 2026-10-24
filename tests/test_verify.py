@@ -690,6 +690,20 @@ def test_empty_resource_sentinel_prevents_retry():
     dump.assert_not_called()
 
 
+def test_icon_worker_cancel_kills_only_icon_dumps(app, monkeypatch):
+    """新一轮解析让路时必须结束旧 APK 的 resources/xmltree，且不碰 badging。"""
+    calls = []
+    monkeypatch.setattr(workers_mod, "kill_running_aapt2",
+                        lambda tags=None: calls.append(tags))
+    worker = IconWorker()
+    try:
+        worker.cancel()
+        assert calls == [("resources", "xmltree")]
+    finally:
+        worker.stop()
+        worker.wait(1000)
+
+
 class TestMiniFixtureAPK(unittest.TestCase):
     """迷你 APK 固件：CI 上也能跑的端到端链路（badging → 图标提取）。
 

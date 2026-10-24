@@ -228,12 +228,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
         self._apk_path = path
-        # 开始新一轮解析前清空上一轮的可导出/可重命名状态：
-        # 否则新 APK 解析失败时，旧图标和旧文件名预览会被误认为属于新文件。
+        # 开始新一轮解析前清空上一轮状态：_reset_result_state 会作废上一
+        # APK 的图标提取并终止其 resources/xmltree 子进程（文件都已换掉，
+        # 旧图标结果没有再等待的价值）。
         self._reset_result_state()
-        # 若已有任务正在解析，强制中断前序 badging 子进程以快速让路，不再弹
-        # 模态弹窗打断用户。只终止基础解析：图标线程可能正在跑同一个 APK
-        # 的 resources/xmltree，无差别 kill 会把它误伤成"图标提取失败"。
+        # 若已有解析在途，再定向中断前序 badging 子进程以快速让路。badging
+        # 与图标 dump 按标签分别终止，避免把互不相关的任务一起杀掉。
         if self._busy:
             kill_running_aapt2(tags=("badging",))
         try:
