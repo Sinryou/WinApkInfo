@@ -18,6 +18,16 @@ from core.vector import rasterize_vector_layer
 _ICON_SIZE = 512
 _CHINESE_LOCALE_PRIORITY = ("zh-CN", "zh-HK", "zh-TW")
 
+# badging 的字符串值包在单引号里，值内的 ' 与 \ 会被 aapt2 转义成 \' 与 \\。
+# [^']* 在转义引号处提前截断：含撇号的标签（如 It\'s）会被剪断，
+# 甚至把后续字段吞进匹配。用支持转义的引号模式取值，再统一还原。
+_BADGING_QUOTED = r"'((?:[^'\\]|\\.)*)'"
+
+
+def _unescape_badging_value(value: str) -> str:
+    """还原 aapt2 badging 单引号字符串值的转义（\\' → '，\\\\ → \\）。"""
+    return re.sub(r"\\(.)", r"\1", value)
+
 # Windows 保留设备名不能作为文件名（含带扩展名的形式，如 CON.apk）
 _RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -363,16 +373,16 @@ def parse_aapt2_output(text: str) -> dict:
         info["target_sdk"] = m_target.group(1)
 
     # --- 应用名（多语言） ---
-    for loc, label in re.findall(r"application-label-([\w-]+):'([^']*)'", text):
-        info["app_name_labels"][loc] = label
+    for loc, label in re.findall(r"application-label-([\w-]+):" + _BADGING_QUOTED, text):
+        info["app_name_labels"][loc] = _unescape_badging_value(label)
 
     # 通用标签
-    m_label_generic = re.search(r"application-label:'([^']*)'", text)
-    generic_label = m_label_generic.group(1) if m_label_generic else ""
+    m_label_generic = re.search(r"application-label:" + _BADGING_QUOTED, text)
+    generic_label = _unescape_badging_value(m_label_generic.group(1)) if m_label_generic else ""
 
     # application 节点的 label
-    m_label_app = re.search(r"application:\s+label='([^']*)'", text)
-    app_node_label = m_label_app.group(1) if m_label_app else ""
+    m_label_app = re.search(r"application:\s+label=" + _BADGING_QUOTED, text)
+    app_node_label = _unescape_badging_value(m_label_app.group(1)) if m_label_app else ""
 
     # 选择优先中文
     for pref in _CHINESE_LOCALE_PRIORITY:

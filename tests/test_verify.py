@@ -353,6 +353,39 @@ class TestSmartIconExportNaming(unittest.TestCase):
             win.close()
 
 
+class TestBadgingLabelParsing(unittest.TestCase):
+    """badging 标签含 aapt2 转义字符（\\'）时的解析回归。
+
+    旧正则 [^']* 在转义引号处提前截断，含撇号的应用名（如
+    McDonald's → badging 里写作 McDonald\\'s）会被剪断。
+    """
+
+    _BADGING = (
+        "package: name='com.example.demo' versionCode='1' versionName='1.0'\n"
+        "application-label:'It\\'s OK'\n"
+        "application-label-zh-CN:'星\\'际'\n"
+        "application: label='McDonald\\'s App' icon='res/ic.png'\n"
+        "application-icon-480:'res/ic.png'\n"
+    )
+
+    def test_labels_unescaped(self):
+        info = apk_parser_mod.parse_aapt2_output(self._BADGING)
+        self.assertEqual(info["app_name_labels"]["zh-CN"], "星'际")
+        # 中文 locale 存在时优先
+        self.assertEqual(info["app_name"], "星'际")
+
+    def test_generic_label_unescaped(self):
+        text = self._BADGING.replace("application-label-zh-CN:'星\\'际'\n", "")
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(info["app_name"], "It's OK")
+
+    def test_app_node_label_fallback_unescaped(self):
+        text = self._BADGING.replace("application-label:'It\\'s OK'\n", "")
+        text = text.replace("application-label-zh-CN:'星\\'际'\n", "")
+        info = apk_parser_mod.parse_aapt2_output(text)
+        self.assertEqual(info["app_name"], "McDonald's App")
+
+
 _VECTOR_ICON_XML = (
     "E: vector (line=1)\n"
     "  A: http://schemas.android.com/apk/res/android:viewportWidth(0x01010402)=108.0\n"
