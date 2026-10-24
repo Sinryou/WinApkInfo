@@ -165,6 +165,132 @@ def _parse_path_commands(tokens):
     return cmds
 
 
+def _iter_path_ops(cmds):
+    """把 _parse_path_commands 的命令列表规整为绝对坐标的绘制原语序列。
+
+    Qt（_cmds_to_qpainterpath）与 Pillow（_flatten_subpaths）两个光栅化
+    后端都消费该序列：相对坐标、S/T 镜像控制点等 SVG 语义只在这里实现
+    一次，避免两份手写状态机随时间不同步。
+
+    产出（坐标全部为绝对值）：
+        ("M", x, y) / ("L", x, y)
+        ("C", x1, y1, x2, y2, x, y)      # S 已按上一控制点还原成 C
+        ("Q", x1, y1, x, y)              # T 已按上一控制点还原成 Q
+        ("A", x0, y0, rx, ry, rot, large, sweep, x, y)  # x0/y0 为弧起点
+        ("Z",)
+    """
+    cur = [0.0, 0.0]
+    start = [0.0, 0.0]
+    last_cmd = None
+    last_ctrl = None
+    for cmd, args in cmds:
+        rel = cmd.islower()
+        base = cmd.upper()
+        if base == "Z":
+            yield ("Z",)
+            cur = [start[0], start[1]]
+            last_cmd = base
+            last_ctrl = None
+            continue
+        if base == "M":
+            x, y = args[0], args[1]
+            if rel:
+                x += cur[0]
+                y += cur[1]
+            cur = [x, y]
+            start = [x, y]
+            yield ("M", x, y)
+            last_cmd = base
+            last_ctrl = None
+            continue
+        if base == "L":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                cur = [x, y]
+                yield ("L", x, y)
+        elif base == "H":
+            for x in args:
+                if rel:
+                    x += cur[0]
+                cur = [x, cur[1]]
+                yield ("L", x, cur[1])
+        elif base == "V":
+            for y in args:
+                if rel:
+                    y += cur[1]
+                cur = [cur[0], y]
+                yield ("L", cur[0], y)
+        elif base == "C":
+            for k in range(0, len(args), 6):
+                x1, y1, x2, y2, x, y = args[k:k + 6]
+                if rel:
+                    x1 += cur[0]
+                    y1 += cur[1]
+                    x2 += cur[0]
+                    y2 += cur[1]
+                    x += cur[0]
+                    y += cur[1]
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+                yield ("C", x1, y1, x2, y2, x, y)
+        elif base == "S":
+            for k in range(0, len(args), 4):
+                x2, y2, x, y = args[k:k + 4]
+                if rel:
+                    x2 += cur[0]
+                    y2 += cur[1]
+                    x += cur[0]
+                    y += cur[1]
+                if last_cmd in ("C", "S") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur[0], cur[1]
+                cur = [x, y]
+                last_ctrl = (x2, y2)
+                yield ("C", x1, y1, x2, y2, x, y)
+        elif base == "Q":
+            for k in range(0, len(args), 4):
+                x1, y1, x, y = args[k:k + 4]
+                if rel:
+                    x1 += cur[0]
+                    y1 += cur[1]
+                    x += cur[0]
+                    y += cur[1]
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+                yield ("Q", x1, y1, x, y)
+        elif base == "T":
+            for k in range(0, len(args), 2):
+                x, y = args[k], args[k + 1]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                if last_cmd in ("Q", "T") and last_ctrl is not None:
+                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
+                else:
+                    x1, y1 = cur[0], cur[1]
+                cur = [x, y]
+                last_ctrl = (x1, y1)
+                yield ("Q", x1, y1, x, y)
+        elif base == "A":
+            for k in range(0, len(args), 7):
+                rx, ry, rot, large, sweep, x, y = args[k:k + 7]
+                if rel:
+                    x += cur[0]
+                    y += cur[1]
+                yield ("A", cur[0], cur[1], rx, ry, rot, large, sweep, x, y)
+                cur = [x, y]
+                last_ctrl = None
+        else:
+            continue
+        last_cmd = base
+        if base not in ("C", "S", "Q", "T"):
+            last_ctrl = None  # L/H/V/A 不携带可镜像的控制点
+
+
 def _bezier_points(p0, p1, p2, p3, step):
     ext = max(abs(p1[0] - p0[0]), abs(p2[0] - p0[0]), abs(p3[0] - p0[0]),
               abs(p1[1] - p0[1]), abs(p2[1] - p0[1]), abs(p3[1] - p0[1]))
@@ -236,118 +362,56 @@ def _arc_points(x0, y0, rx, ry, phi_deg, large, sweep, x1, y1, step):
 
 
 def _flatten_subpaths(cmds, step):
-    """命令列表 → 子路径点列 [[(x,y), ...], ...]（隐式闭合由填充阶段处理）。"""
+    """命令列表 → 子路径点列 [[(x,y), ...], ...]（隐式闭合由填充阶段处理）。
+
+    SVG 语义（相对坐标、S/T 镜像）已由 _iter_path_ops 规整成绝对坐标
+    原语；这里只负责按 step 把曲线/圆弧采样成折线并维护子路径分组。
+    """
     subpaths = []
-    cur = [0.0, 0.0]
-    start = [0.0, 0.0]
     sub = None
-    last_cmd = None
-    last_ctrl = None
-    for cmd, args in cmds:
-        c = cmd
-        if c in "Zz":
+    pen = (0.0, 0.0)       # 当前笔位
+    sub_start = (0.0, 0.0)  # 当前子路径起点
+    for op in _iter_path_ops(cmds):
+        tag = op[0]
+        if tag == "M":
             if sub is not None:
-                sub.append((start[0], start[1]))
+                # 填充语义下未闭合的子路径隐式连回起点
+                sub.append(sub_start)
                 subpaths.append(sub)
-                sub = None
-            cur = [start[0], start[1]]
-            last_cmd = c.upper()
-            last_ctrl = None
-            continue
-        if c in "Mm":
-            if sub is not None:
-                sub.append((start[0], start[1]))
-                subpaths.append(sub)
-                sub = None
-            x, y = args[0], args[1]
-            if c == "m":
-                x += cur[0]
-                y += cur[1]
-            cur = [x, y]
-            start = [x, y]
+            x, y = op[1], op[2]
+            sub_start = (x, y)
+            pen = (x, y)
             sub = [(x, y)]
-            last_cmd = c.upper()
-            last_ctrl = None
-            continue
-        if sub is None:
-            sub = [(cur[0], cur[1])]
-        rel = c.islower()
-        base = c.upper()
-        if base == "L":
-            for k in range(0, len(args), 2):
-                x, y = args[k], args[k + 1]
-                if rel:
-                    x += cur[0]
-                    y += cur[1]
-                sub.append((x, y))
-                cur = [x, y]
-        elif base == "H":
-            for k in range(0, len(args), 1):
-                x = args[k]
-                if rel:
-                    x += cur[0]
-                sub.append((x, cur[1]))
-                cur = [x, cur[1]]
-        elif base == "V":
-            for k in range(0, len(args), 1):
-                y = args[k]
-                if rel:
-                    y += cur[1]
-                sub.append((cur[0], y))
-                cur = [cur[0], y]
-        elif base == "C":
-            for k in range(0, len(args), 6):
-                x1, y1, x2, y2, x, y = args[k:k + 6]
-                if rel:
-                    x1 += cur[0]; y1 += cur[1]; x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
-                sub.extend(_bezier_points(tuple(cur), (x1, y1), (x2, y2), (x, y), step))
-                cur = [x, y]
-                last_ctrl = (x2, y2)
-        elif base == "S":
-            for k in range(0, len(args), 4):
-                x2, y2, x, y = args[k:k + 4]
-                if rel:
-                    x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
-                if last_cmd in ("C", "S") and last_ctrl is not None:
-                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
-                else:
-                    x1, y1 = cur
-                sub.extend(_bezier_points(tuple(cur), (x1, y1), (x2, y2), (x, y), step))
-                cur = [x, y]
-                last_ctrl = (x2, y2)
-        elif base == "Q":
-            for k in range(0, len(args), 4):
-                x1, y1, x, y = args[k:k + 4]
-                if rel:
-                    x1 += cur[0]; y1 += cur[1]; x += cur[0]; y += cur[1]
-                sub.extend(_quad_points(tuple(cur), (x1, y1), (x, y), step))
-                cur = [x, y]
-                last_ctrl = (x1, y1)
-        elif base == "T":
-            for k in range(0, len(args), 2):
-                x, y = args[k], args[k + 1]
-                if rel:
-                    x += cur[0]
-                    y += cur[1]
-                if last_cmd in ("Q", "T") and last_ctrl is not None:
-                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
-                else:
-                    x1, y1 = cur
-                sub.extend(_quad_points(tuple(cur), (x1, y1), (x, y), step))
-                cur = [x, y]
-                last_ctrl = (x1, y1)
-        elif base == "A":
-            for k in range(0, len(args), 7):
-                rx, ry, rot, large, sweep, x, y = args[k:k + 7]
-                if rel:
-                    x += cur[0]
-                    y += cur[1]
-                sub.extend(_arc_points(cur[0], cur[1], rx, ry, rot, large != 0, sweep != 0, x, y, step))
-                cur = [x, y]
-                last_ctrl = None
-        # 统一存大写：S/T 分支要判断「上一条命令是不是 C/S」「Q/T」，
-        # 存原始大小写会让相对命令 c/q 后的 s/t 判不出镜像控制点。
-        last_cmd = c.upper()
+        elif tag == "Z":
+            if sub is not None:
+                sub.append(sub_start)
+                subpaths.append(sub)
+                sub = None
+            pen = sub_start
+        elif tag == "L":
+            x, y = op[1], op[2]
+            if sub is None:
+                sub = [pen]
+            sub.append((x, y))
+            pen = (x, y)
+        elif tag == "C":
+            x1, y1, x2, y2, x, y = op[1:]
+            if sub is None:
+                sub = [pen]
+            sub.extend(_bezier_points(pen, (x1, y1), (x2, y2), (x, y), step))
+            pen = (x, y)
+        elif tag == "Q":
+            x1, y1, x, y = op[1:]
+            if sub is None:
+                sub = [pen]
+            sub.extend(_quad_points(pen, (x1, y1), (x, y), step))
+            pen = (x, y)
+        elif tag == "A":
+            x0, y0, rx, ry, rot, large, sweep, x, y = op[1:]
+            if sub is None:
+                sub = [pen]
+            sub.extend(_arc_points(x0, y0, rx, ry, rot, large != 0, sweep != 0, x, y, step))
+            pen = (x, y)
     if sub is not None:
         subpaths.append(sub)
     return subpaths
@@ -918,137 +982,44 @@ def _create_qbrush(fill, m, falpha: float, width=None, height=None):
 
 
 def _cmds_to_qpainterpath(cmds, m, fill_rule="nonzero", step=1.0) -> QtGui.QPainterPath:
-    """把 SVG path 命令直接构造成 Qt 原生 QPainterPath，利用 C++ 原生三次/二次贝塞尔与圆弧渲染。"""
+    """把 SVG path 命令构造成 Qt 原生 QPainterPath，利用 C++ 原生三次/二次
+    贝塞尔渲染（圆弧按 step 折线化）。
+
+    SVG 语义（相对坐标、S/T 镜像控制点）已由 _iter_path_ops 规整成绝对
+    坐标原语；这里只负责把原语经矩阵变换后写入路径。
+    """
     qpath = QtGui.QPainterPath()
     qpath.setFillRule(
         QtCore.Qt.FillRule.OddEvenFill if fill_rule == "evenodd" else QtCore.Qt.FillRule.WindingFill
     )
-    cur = [0.0, 0.0]
-    start = [0.0, 0.0]
-    last_cmd = None
-    last_ctrl = None
 
-    for cmd, args in cmds:
-        c = cmd
-        if c in ("Z", "z"):
-            qpath.closeSubpath()
-            cur = [start[0], start[1]]
-            last_cmd = "Z"
-            last_ctrl = None
-            continue
-
-        if c in ("M", "m"):
-            x, y = args[0], args[1]
-            if c == "m":
-                x += cur[0]
-                y += cur[1]
-            cur = [x, y]
-            start = [x, y]
-            tx, ty = _mat_apply(m, x, y)
+    for op in _iter_path_ops(cmds):
+        tag = op[0]
+        if tag == "M":
+            tx, ty = _mat_apply(m, op[1], op[2])
             qpath.moveTo(tx, ty)
-            last_cmd = "M"
-            last_ctrl = None
-            continue
-
-        rel = c.islower()
-        base = c.upper()
-        if base == "L":
-            for k in range(0, len(args), 2):
-                x, y = args[k], args[k + 1]
-                if rel:
-                    x += cur[0]
-                    y += cur[1]
-                cur = [x, y]
-                tx, ty = _mat_apply(m, x, y)
-                qpath.lineTo(tx, ty)
-            last_cmd = "L"
-            last_ctrl = None
-        elif base == "H":
-            for k in range(len(args)):
-                x = args[k]
-                if rel:
-                    x += cur[0]
-                cur = [x, cur[1]]
-                tx, ty = _mat_apply(m, cur[0], cur[1])
-                qpath.lineTo(tx, ty)
-            last_cmd = "H"
-            last_ctrl = None
-        elif base == "V":
-            for k in range(len(args)):
-                y = args[k]
-                if rel:
-                    y += cur[1]
-                cur = [cur[0], y]
-                tx, ty = _mat_apply(m, cur[0], cur[1])
-                qpath.lineTo(tx, ty)
-            last_cmd = "V"
-            last_ctrl = None
-        elif base == "C":
-            for k in range(0, len(args), 6):
-                x1, y1, x2, y2, x, y = args[k:k + 6]
-                if rel:
-                    x1 += cur[0]; y1 += cur[1]; x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
-                p1 = _mat_apply(m, x1, y1)
-                p2 = _mat_apply(m, x2, y2)
-                p = _mat_apply(m, x, y)
-                qpath.cubicTo(p1[0], p1[1], p2[0], p2[1], p[0], p[1])
-                cur = [x, y]
-                last_ctrl = (x2, y2)
-            last_cmd = "C"
-        elif base == "S":
-            for k in range(0, len(args), 4):
-                x2, y2, x, y = args[k:k + 4]
-                if rel:
-                    x2 += cur[0]; y2 += cur[1]; x += cur[0]; y += cur[1]
-                if last_cmd in ("C", "S") and last_ctrl is not None:
-                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
-                else:
-                    x1, y1 = cur[0], cur[1]
-                p1 = _mat_apply(m, x1, y1)
-                p2 = _mat_apply(m, x2, y2)
-                p = _mat_apply(m, x, y)
-                qpath.cubicTo(p1[0], p1[1], p2[0], p2[1], p[0], p[1])
-                cur = [x, y]
-                last_ctrl = (x2, y2)
-            last_cmd = "S"
-        elif base == "Q":
-            for k in range(0, len(args), 4):
-                x1, y1, x, y = args[k:k + 4]
-                if rel:
-                    x1 += cur[0]; y1 += cur[1]; x += cur[0]; y += cur[1]
-                p1 = _mat_apply(m, x1, y1)
-                p = _mat_apply(m, x, y)
-                qpath.quadTo(p1[0], p1[1], p[0], p[1])
-                cur = [x, y]
-                last_ctrl = (x1, y1)
-            last_cmd = "Q"
-        elif base == "T":
-            for k in range(0, len(args), 2):
-                x, y = args[k], args[k + 1]
-                if rel:
-                    x += cur[0]; y += cur[1]
-                if last_cmd in ("Q", "T") and last_ctrl is not None:
-                    x1, y1 = 2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]
-                else:
-                    x1, y1 = cur[0], cur[1]
-                p1 = _mat_apply(m, x1, y1)
-                p = _mat_apply(m, x, y)
-                qpath.quadTo(p1[0], p1[1], p[0], p[1])
-                cur = [x, y]
-                last_ctrl = (x1, y1)
-            last_cmd = "T"
-        elif base == "A":
-            for k in range(0, len(args), 7):
-                rx, ry, rot, large, sweep, x, y = args[k:k + 7]
-                if rel:
-                    x += cur[0]; y += cur[1]
-                arc_pts = _arc_points(cur[0], cur[1], rx, ry, rot, large != 0, sweep != 0, x, y, step)
-                for pt in arc_pts:
-                    tp = _mat_apply(m, pt[0], pt[1])
-                    qpath.lineTo(tp[0], tp[1])
-                cur = [x, y]
-                last_ctrl = None
-            last_cmd = "A"
+        elif tag == "L":
+            tx, ty = _mat_apply(m, op[1], op[2])
+            qpath.lineTo(tx, ty)
+        elif tag == "C":
+            x1, y1, x2, y2, x, y = op[1:]
+            p1 = _mat_apply(m, x1, y1)
+            p2 = _mat_apply(m, x2, y2)
+            p = _mat_apply(m, x, y)
+            qpath.cubicTo(p1[0], p1[1], p2[0], p2[1], p[0], p[1])
+        elif tag == "Q":
+            x1, y1, x, y = op[1:]
+            p1 = _mat_apply(m, x1, y1)
+            p = _mat_apply(m, x, y)
+            qpath.quadTo(p1[0], p1[1], p[0], p[1])
+        elif tag == "A":
+            x0, y0, rx, ry, rot, large, sweep, x, y = op[1:]
+            arc_pts = _arc_points(x0, y0, rx, ry, rot, large != 0, sweep != 0, x, y, step)
+            for pt in arc_pts:
+                tp = _mat_apply(m, pt[0], pt[1])
+                qpath.lineTo(tp[0], tp[1])
+        elif tag == "Z":
+            qpath.closeSubpath()
 
     return qpath
 
