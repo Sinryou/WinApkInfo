@@ -16,6 +16,7 @@ import io
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -55,11 +56,44 @@ def app():
     return _APP
 
 
+def _signing_block_apk_bytes(pair_len: int) -> bytes:
+    """构造只含一个畸形 pair 的最小 APK Signing Block 假 APK（无真实签名）。
+
+    布局遵循 APK Signature Scheme v2：块 = [size(8)][pairs][size(8)][magic(16)]，
+    size 值 = pairs 总长 + 24；cd_offset 指向块尾 24 字节（size+magic）的起始，
+    使 extract_apk_signatures 的块探测能成功进入 pair 解析循环。
+    """
+    pairs = struct.pack("<QI", pair_len, 0x7109871A)
+    block_size = len(pairs) + 24
+    block = (struct.pack("<Q", block_size) + pairs
+             + struct.pack("<Q", block_size) + b"APK Sig Block 42")
+    eocd = bytearray(22)
+    eocd[0:4] = b"PK\x05\x06"
+    struct.pack_into("<I", eocd, 16, len(block))  # cd_offset
+    return block + bytes(eocd)
+
+
 class TestSignatureAndMeta(unittest.TestCase):
     """测试 APK 签名方案、证书解析与文件哈希元数据。"""
 
     def setUp(self):
         self.samples = glob.glob(os.path.join(ROOT_DIR, "testSample", "*.apk"))
+
+    def test_malformed_signing_block(self):
+        """pair_len 为 0/超大时不得把文件尾部整块读进内存，结果为未签名。
+
+        旧实现 pair_len=0 时 read(-4) 会"读到 EOF"把剩余文件全部载入，
+        超大 pair_len 则按给定长度整块预分配内存。
+        """
+        for pair_len in (0, 2 ** 63):
+            fd, path = tempfile.mkstemp(prefix="winapkinfo-badsig-", suffix=".apk")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(_signing_block_apk_bytes(pair_len))
+                sig = sig_mod.extract_apk_signatures(path)
+            finally:
+                os.remove(path)
+            self.assertEqual(sig, {"schemes": [], "certificates": []})
 
     def test_file_metadata_and_hashes(self):
         if not self.samples:

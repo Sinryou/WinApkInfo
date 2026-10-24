@@ -192,7 +192,17 @@ def extract_apk_signatures(apk_path: str) -> dict:
                         if block_size_start == block_size_end:
                             rem = block_size_end - 24
                             while rem > 8:
-                                pair_len, pair_id = struct.unpack("<QI", f.read(12))
+                                header = f.read(12)
+                                if len(header) < 12:
+                                    break  # 块在 pair 头部处被截断
+                                pair_len, pair_id = struct.unpack("<QI", header)
+                                # pair_len 是 pair 的总长（4 字节 id + 值），值必须
+                                # 留在块内。畸形/伪造的长度会让 read(负数) 变成
+                                # "读到 EOF"，或按给定长度整块预分配内存，把大段
+                                # 文件读进内存；此时 rem 核算已不可靠，无法定位
+                                # 下一对，只能放弃。
+                                if pair_len < 4 or pair_len > rem - 8:
+                                    break
                                 pair_val = f.read(pair_len - 4)
                                 rem -= (8 + pair_len)
                                 if pair_id == 0x7109871a:
