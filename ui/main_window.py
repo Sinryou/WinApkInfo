@@ -199,7 +199,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _parse_typed_path(self):
         """输入框回车：按框里的路径直接解析（手输/粘贴路径的入口）。"""
-        self.process_apk(self.apk_path_edit.text().strip())
+        raw = self.apk_path_edit.text().strip().strip('"').strip("'")
+        self.apk_path_edit.setText(raw)
+        self.process_apk(raw)
 
     def _current_apk_path(self) -> str:
         """当前解析结果对应的 APK 路径。
@@ -207,7 +209,8 @@ class MainWindow(QtWidgets.QMainWindow):
         优先用 process_apk 记录的路径：调用方（拖放、命令行等）不一定已经
         把路径同步到输入框，回读输入框会导致这类调用完全提取不到图标。
         """
-        return self._apk_path or self.apk_path_edit.text().strip()
+        raw = self._apk_path or self.apk_path_edit.text().strip()
+        return raw.strip('"').strip("'")
 
     def _clear_info_fields(self):
         """清空所有展示 APK 信息的控件（解析失败/开始新一轮解析时使用）。"""
@@ -243,10 +246,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._icon_worker.cancel()
 
     def process_apk(self, path: str):
+        path = (path or "").strip().strip('"').strip("'")
         if not path or not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(self, "提示", "请选择有效的 APK 文件。")
             return
         self._apk_path = path
+        edit_text = self.apk_path_edit.text().strip()
+        if edit_text.startswith(('"', "'")) or edit_text.endswith(('"', "'")):
+            self.apk_path_edit.setText(path)
         # 开始新一轮解析前清空上一轮状态：_reset_result_state 会作废上一
         # APK 的图标提取并终止其 resources/xmltree 子进程（文件都已换掉，
         # 旧图标结果没有再等待的价值）。
@@ -594,7 +601,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not old_path or not os.path.isfile(old_path):
             QtWidgets.QMessageBox.warning(self, "提示", "未选择有效的 APK 文件。")
             return
-        if self._parse_ok_path != old_path:
+        if not self._parse_ok_path or (
+            os.path.normcase(os.path.abspath(self._parse_ok_path))
+            != os.path.normcase(os.path.abspath(old_path))
+        ):
             # 解析失败或输入框被改成别的路径时，预览名仍可能来自上一个 APK，
             # 直接重命名会把错误的名字用到当前文件上。
             QtWidgets.QMessageBox.warning(
@@ -606,9 +616,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.rename_preview.setText(new_name)  # 回显净化后的名字
         new_path = str(Path(old_path).with_name(new_name))
-        if os.path.abspath(new_path) == os.path.abspath(old_path):
-            return
-        if os.path.exists(new_path):
+        norm_old = os.path.normcase(os.path.abspath(old_path))
+        norm_new = os.path.normcase(os.path.abspath(new_path))
+        if norm_old == norm_new:
+            if Path(old_path).name == new_name:
+                self.statusBar().showMessage("文件名未发生变化，无需重命名。", 3000)
+                QtWidgets.QMessageBox.information(self, "提示", "文件名未发生变化，无需重命名。")
+                return
+            # 仅文件名大小写变更（如 app.apk -> App.apk）：在 Windows 上同属一个文件，
+            # 不需要且不应该弹出"目标文件已存在，是否覆盖？"的确认框，直接执行原子重命名。
+        elif os.path.exists(new_path):
             ret = QtWidgets.QMessageBox.question(
                 self, "覆盖确认",
                 f"目标文件已存在：\n{new_path}\n\n是否覆盖？",
@@ -632,7 +649,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._parse_ok_path = new_path
             self.apk_path_edit.setText(new_path)
             self.rename_preview.setText(new_name)
-            QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_path}")
+            QtWidgets.QMessageBox.information(self, "完成", f"已重命名为:\n{new_name}")
             if icon_was_busy:
                 self._restart_icon_extraction()
         except Exception as e:

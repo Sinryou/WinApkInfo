@@ -817,6 +817,110 @@ def test_rename_cancels_busy_icon_worker(app, tmp_path):
         win.close()
 
 
+def test_process_apk_quoted_paths(app, tmp_path, monkeypatch):
+    """测试带有双引号或单引号的路径（如 Windows 复制文件地址）正常净化与解析。"""
+    win = MainWindow()
+    src = tmp_path / "sample.apk"
+    src.write_bytes(b"apk")
+
+    started = []
+    monkeypatch.setattr(win, "_start_apk_worker", lambda p: started.append(p))
+
+    try:
+        # 1. 模拟手输/粘贴带双引号的路径并回车
+        quoted_double = f'"{src}"'
+        win.apk_path_edit.setText(quoted_double)
+        win._parse_typed_path()
+        assert win.apk_path_edit.text() == str(src)
+        assert win._current_apk_path() == str(src)
+        assert started[-1] == str(src)
+
+        # 2. 模拟带单引号的路径直接调用 process_apk
+        quoted_single = f"'{src}'"
+        win.apk_path_edit.setText(quoted_single)
+        win.process_apk(quoted_single)
+        assert win.apk_path_edit.text() == str(src)
+        assert win._current_apk_path() == str(src)
+        assert started[-1] == str(src)
+    finally:
+        win.close()
+
+
+def test_rename_no_change_feedback(app, tmp_path, monkeypatch):
+    """文件名未发生变化时给出明确提示且不执行文件替换。"""
+    win = MainWindow()
+    src = tmp_path / "app.apk"
+    src.write_bytes(b"apk")
+    win._apk_path = str(src)
+    win._parse_ok_path = str(src)
+    win.rename_preview.setText("app.apk")
+
+    info_calls = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: info_calls.append(a))
+
+    try:
+        win.do_rename()
+        assert len(info_calls) == 1
+        assert "未发生变化" in str(info_calls[0])
+        assert src.exists()
+    finally:
+        win.close()
+
+
+def test_rename_case_only_change(app, tmp_path, monkeypatch):
+    """仅改变文件名大小写时不应误触发'目标文件已存在，是否覆盖'的确认框，直接原子重命名。"""
+    win = MainWindow()
+    src = tmp_path / "app.apk"
+    src.write_bytes(b"apk")
+    win._apk_path = str(src)
+    win._parse_ok_path = str(src)
+    win.rename_preview.setText("App.apk")
+
+    question_calls = []
+    info_calls = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *a, **k: question_calls.append(a))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: info_calls.append(a))
+
+    try:
+        win.do_rename()
+        assert len(question_calls) == 0
+        assert len(info_calls) == 1
+        assert "已重命名为" in str(info_calls[0])
+        target = tmp_path / "App.apk"
+        assert target.exists()
+        assert win._apk_path == str(target)
+        assert win._parse_ok_path == str(target)
+    finally:
+        win.close()
+
+
+def test_rename_existing_target_prompt(app, tmp_path, monkeypatch):
+    """重命名为另一个真实已存在的文件时，应正常弹出覆盖确认框。"""
+    win = MainWindow()
+    src1 = tmp_path / "app1.apk"
+    src2 = tmp_path / "app2.apk"
+    src1.write_bytes(b"apk1")
+    src2.write_bytes(b"apk2")
+    win._apk_path = str(src1)
+    win._parse_ok_path = str(src1)
+    win.rename_preview.setText("app2.apk")
+
+    question_calls = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "question",
+        lambda *a, **k: (question_calls.append(a), QtWidgets.QMessageBox.StandardButton.No)[1]
+    )
+
+    try:
+        win.do_rename()
+        assert len(question_calls) == 1
+        assert src1.read_bytes() == b"apk1"
+        assert src2.read_bytes() == b"apk2"
+        assert win._apk_path == str(src1)
+    finally:
+        win.close()
+
+
 class TestBadgingLabelParsing(unittest.TestCase):
     """badging 标签含 aapt2 转义字符（\\'）时的解析回归。
 

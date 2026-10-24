@@ -159,7 +159,9 @@ def main():
     w.show()
     # 命令行/拖放启动时带上了 APK 路径：窗口就绪后立即进入解析流程
     if args.apk:
-        w.process_apk(args.apk)
+        apk_arg = args.apk.strip().strip("\"").strip("\x27")
+        w.apk_path_edit.setText(apk_arg)
+        w.process_apk(apk_arg)
     code = app.exec()
     # 事件循环结束后必须确认后台线程已退出：QThread 运行中被析构会让进程崩溃
     w.shutdown_background()
