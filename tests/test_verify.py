@@ -433,6 +433,55 @@ class TestSmartIconExportNaming(unittest.TestCase):
             win.close()
 
 
+def test_parse_failure_clears_previous_info(app):
+    """解析失败后不能把上一个 APK 的名称/包名/权限继续留在界面上。
+
+    旧实现只清空图标与重命名预览，用户会误以为失败文件就是界面上显示的
+    APK，复制摘要也会带出旧值。这里直接走 on_apk_info_failed 的真实路径。
+    """
+    win = MainWindow()
+    try:
+        win.fill_info({
+            "app_name": "Old App",
+            "package_name": "com.example.old",
+            "version_name": "1.0",
+            "version_code": "1",
+            "min_sdk": "21",
+            "target_sdk": "33",
+            "compile_sdk_version": "33",
+            "launchable_activity": "com.example.old.Main",
+            "architectures": ["arm64-v8a"],
+            "permissions": ["android.permission.INTERNET"],
+            "features": ["android.hardware.faketouch"],
+            "implied_features": [],
+            "locales": ["zh-CN"],
+            "supports_screens": ["normal"],
+            "densities": ["160"],
+            "supports_any_density": "true",
+            "app_name_labels": {"zh-CN": "Old App"},
+            "icons": {},
+        }, refresh_icon=False)
+        assert win.le_app_name.text() == "Old App"
+        assert win.le_pkg.text() == "com.example.old"
+
+        win._apk_path = "old.apk"
+        win.on_apk_info_failed("boom", win._apk_gen)
+
+        for edit in (win.le_app_name, win.le_pkg, win.le_ver,
+                     win.le_sdk, win.le_launch, win.le_arch):
+            assert edit.text() == "", edit.text()
+        for name in ("te_permissions", "te_features", "te_locales", "te_other"):
+            assert getattr(win, name)["edit"].toPlainText() == "", name
+        assert win.rename_preview.text() == ""
+        assert win._raw_output == ""
+        assert win._parse_ok_path == ""
+        assert win._parsed_info == {}
+        assert win._current_icon_bytes is None
+        assert win._apk_path == ""
+    finally:
+        win.close()
+
+
 class TestBadgingLabelParsing(unittest.TestCase):
     """badging 标签含 aapt2 转义字符（\\'）时的解析回归。
 

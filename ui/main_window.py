@@ -190,12 +190,27 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return self._apk_path or self.apk_path_edit.text().strip()
 
+    def _clear_info_fields(self):
+        """清空所有展示 APK 信息的控件（解析失败/开始新一轮解析时使用）。"""
+        for edit in (
+            self.le_app_name, self.le_pkg, self.le_ver,
+            self.le_sdk, self.le_launch, self.le_arch,
+        ):
+            edit.clear()
+        for name in ("te_permissions", "te_features", "te_locales", "te_other"):
+            getattr(self, name)["edit"].clear()
+
     def _reset_result_state(self):
-        """清空上一轮的输出、图标、提示与重命名预览状态，并作废在途图标提取。"""
+        """清空上一轮的展示字段、输出、图标与重命名预览，并作废在途图标提取。
+
+        解析失败时控件里的旧值不能继续留在界面上：用户会把上一个 APK 的
+        名称/包名/权限当成当前文件的信息，复制摘要也会带出这些旧值。
+        """
         self._raw_output = ""
         self._parse_ok_path = ""
         self._parsed_info = {}
         self._current_icon_bytes = None
+        self._clear_info_fields()
         self.icon_label.clear()
         self.btn_export_icon.setVisible(False)
         self.lbl_icon_hint.clear()
