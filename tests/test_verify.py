@@ -12,6 +12,7 @@
     python -m pytest tests -q                # 含端到端（需 testSample/）
 """
 import glob
+import hashlib
 import io
 import math
 import os
@@ -133,6 +134,60 @@ class TestSignatureAndMeta(unittest.TestCase):
         self.assertEqual(
             sig_mod._pkcs7_certificates(bytes([0x30, 0x82, 0xFF, 0xFF]) + b"short"),
             [],
+        )
+
+    def test_x509_subject_parsing(self):
+        """证书 Subject/Issuer/有效期应由 cryptography 公开 API 解析。
+
+        cryptography 缺失时回退 _ssl._test_decode_cert 私有钩子（无兼容性
+        承诺），两者都失败时指纹仍可用、文本字段保留"(未知)"默认值。
+        """
+        pytest.importorskip("cryptography")
+        import datetime
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "WinApkInfo"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "Test Cert"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(0x1234)
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256())
+        )
+        der = cert.public_bytes(serialization.Encoding.DER)
+
+        info = sig_mod._parse_x509_der(der)
+        self.assertIn("commonName=Test Cert", info["subject"])
+        self.assertIn("organizationName=WinApkInfo", info["subject"])
+        self.assertEqual(info["subject"], info["issuer"])  # 自签名
+        self.assertEqual(info["serial_number"], "1234")
+        self.assertTrue(info["not_before"].endswith(" UTC"))
+        self.assertTrue(info["not_after"].endswith(" UTC"))
+
+        # 畸形 DER：文本字段保留默认值，指纹路径不受影响
+        bad = sig_mod._parse_x509_der(b"\x30\x03 garbage")
+        self.assertEqual(bad["subject"], "(未知)")
+        self.assertEqual(len(bad["sha256"]), 64 + 31)
+        # 空输入：文本字段保留默认值，指纹仍是对空字节的良定义哈希
+        empty = sig_mod._parse_x509_der(b"")
+        self.assertEqual(empty["subject"], "(未知)")
+        self.assertEqual(
+            empty["sha256"],
+            ":".join(hashlib.sha256(b"").hexdigest().upper()[i:i + 2]
+                     for i in range(0, 64, 2)),
         )
 
     def test_file_metadata_and_hashes(self):

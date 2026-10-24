@@ -8,11 +8,36 @@ import zipfile
 import datetime
 import tempfile
 import logging
+import warnings
 
 try:
     import _ssl
 except ImportError:
     _ssl = None
+
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+except ImportError:
+    x509 = None
+    NameOID = None
+
+# cryptography 的 Name OID → OpenSSL 风格短名，保持与 _ssl 兜底路径
+# （_test_decode_cert 即 OpenSSL 的解码）一致的显示格式；未收录的 OID
+# 退回点分数字形式。
+_DN_ATTR_NAMES = {
+    NameOID.COMMON_NAME: "commonName",
+    NameOID.COUNTRY_NAME: "countryName",
+    NameOID.STATE_OR_PROVINCE_NAME: "stateOrProvinceName",
+    NameOID.LOCALITY_NAME: "localityName",
+    NameOID.ORGANIZATION_NAME: "organizationName",
+    NameOID.ORGANIZATIONAL_UNIT_NAME: "organizationalUnitName",
+    NameOID.EMAIL_ADDRESS: "emailAddress",
+    NameOID.SERIAL_NUMBER: "serialNumber",
+    NameOID.DOMAIN_COMPONENT: "domainComponent",
+    NameOID.STREET_ADDRESS: "streetAddress",
+    NameOID.POSTAL_CODE: "postalCode",
+} if NameOID is not None else {}
 
 
 def get_file_meta_and_hashes(apk_path: str) -> dict:
@@ -152,8 +177,86 @@ def _pkcs7_certificates(data: bytes) -> list:
     return certs
 
 
+def _fmt_dn_cryptography(name) -> str:
+    """cryptography 的 Name → "key=value, …" 文本（OpenSSL 风格短名）。"""
+    parts = []
+    for attr in name:
+        key = _DN_ATTR_NAMES.get(attr.oid) or attr.oid.dotted_string
+        try:
+            value = attr.value
+        except Exception:
+            value = "?"
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def _fill_cert_subject_from_cryptography(info: dict, cert_der: bytes) -> None:
+    """用 cryptography 解析证书主体/签发者/序列号/有效期（公开 API 主路径）。"""
+    try:
+        # 真实证书常见不规范字段值（如 1 字符的 CountryName），cryptography
+        # 在 subject/issuer 惰性解析时只发 UserWarning、值仍可用；这类噪音
+        # 不必外溢到日志（字段级异常仍由外层 try 兜底）。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            cert = x509.load_der_x509_certificate(cert_der)
+            info["subject"] = _fmt_dn_cryptography(cert.subject) or "(未指定)"
+            info["issuer"] = _fmt_dn_cryptography(cert.issuer) or "(未指定)"
+            info["serial_number"] = f"{cert.serial_number:X}"
+            info["not_before"] = cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            info["not_after"] = cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception as e:
+        logging.debug("cryptography 解析 X.509 证书失败: %s", e)
+
+
+def _fill_cert_subject_from_ssl(info: dict, cert_der: bytes) -> None:
+    """_ssl._test_decode_cert 兜底路径（cryptography 缺失时才走）。
+
+    该函数是 CPython 的内部测试钩子，无兼容性承诺，且要为每张证书落一个
+    临时 PEM 文件；只作为降级路径保留。
+    """
+    if not (_ssl and hasattr(_ssl, "_test_decode_cert")):
+        return
+    try:
+        pem = ssl.DER_cert_to_PEM_cert(cert_der)
+    except Exception:
+        return
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="w", encoding="ascii") as tmp:
+            tmp.write(pem)
+            tmp_path = tmp.name
+        try:
+            decoded = _ssl._test_decode_cert(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        def _fmt_dn(dn_tuple):
+            if not dn_tuple:
+                return ""
+            parts = []
+            for rdn in dn_tuple:
+                for k, v in rdn:
+                    parts.append(f"{k}={v}")
+            return ", ".join(parts)
+
+        info["subject"] = _fmt_dn(decoded.get("subject", ())) or "(未指定)"
+        info["issuer"] = _fmt_dn(decoded.get("issuer", ())) or "(未指定)"
+        info["serial_number"] = str(decoded.get("serialNumber", ""))
+        info["not_before"] = str(decoded.get("notBefore", ""))
+        info["not_after"] = str(decoded.get("notAfter", ""))
+    except Exception as e:
+        logging.debug("解码 X.509 证书失败: %s", e)
+
+
 def _parse_x509_der(cert_der: bytes) -> dict:
-    """解析单个 DER 编码的 X.509 证书。"""
+    """解析单个 DER 编码的 X.509 证书。
+
+    主体/签发者等字段优先用 cryptography（受支持的公开 API）解析；
+    缺失时回退 _ssl._test_decode_cert 私有钩子。两种路径都失败时保留
+    "(未知)" 默认值，指纹不受影响（直接对 DER 计算）。
+    """
     info = {
         "subject": "(未知)",
         "issuer": "(未知)",
@@ -167,41 +270,10 @@ def _parse_x509_der(cert_der: bytes) -> dict:
     if not cert_der:
         return info
 
-    try:
-        pem = ssl.DER_cert_to_PEM_cert(cert_der)
-    except Exception:
-        return info
-
-    if _ssl and hasattr(_ssl, "_test_decode_cert"):
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="w", encoding="ascii") as tmp:
-                tmp.write(pem)
-                tmp_path = tmp.name
-            try:
-                decoded = _ssl._test_decode_cert(tmp_path)
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-
-            def _fmt_dn(dn_tuple):
-                if not dn_tuple:
-                    return ""
-                parts = []
-                for rdn in dn_tuple:
-                    for k, v in rdn:
-                        parts.append(f"{k}={v}")
-                return ", ".join(parts)
-
-            info["subject"] = _fmt_dn(decoded.get("subject", ())) or "(未指定)"
-            info["issuer"] = _fmt_dn(decoded.get("issuer", ())) or "(未指定)"
-            info["serial_number"] = str(decoded.get("serialNumber", ""))
-            info["not_before"] = str(decoded.get("notBefore", ""))
-            info["not_after"] = str(decoded.get("notAfter", ""))
-        except Exception as e:
-            logging.debug("解码 X.509 证书失败: %s", e)
-
+    if x509 is not None:
+        _fill_cert_subject_from_cryptography(info, cert_der)
+    else:
+        _fill_cert_subject_from_ssl(info, cert_der)
     return info
 
 

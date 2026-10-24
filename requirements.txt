@@ -1,2 +1,5 @@
 PyQt6>=6.7,<7
 Pillow>=11.3,<14
+# 签名证书 Subject/Issuer/有效期解析（not_valid_before_utc 需 42+）；
+# 缺失时自动回退 _ssl._test_decode_cert 私有钩子
+cryptography>=42
