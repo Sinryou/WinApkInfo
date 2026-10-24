@@ -4,6 +4,7 @@
 本项目已按职责解耦为以下子模块：
   - core.aapt: aapt2 进程调度、超时处理、输出解码与多级缓存；
   - core.colors: Android 框架预设颜色表与颜色解析；
+  - core.paths: 日志/磁盘缓存等标准应用目录解析；
   - core.resources: 资源索引表、AXML 解析、SDK 版本映射与文件探测；
   - core.vector: Android VectorDrawable 矢量图形解析与光栅化渲染引擎；
   - core.apk_parser: 自适应图标图层定位、合成、badging 信息结构化提取与文件名净化；
@@ -22,6 +23,7 @@ from PyQt6 import QtWidgets
 
 from core.aapt import _decode_output, _run_aapt2, find_aapt2, run_aapt2_dump_badging
 from core.apk_parser import parse_aapt2_output
+from core.paths import default_log_dir
 from core.resources import load_sdk_versions, local_resource_path
 from ui.main_window import MainWindow, install_excepthook
 from ui.workers import IconWorker
@@ -83,30 +85,9 @@ def _self_test(apk_path: str = None) -> int:
     return 0
 
 
-def _default_log_dir() -> str:
-    """返回标准日志目录（优先 %LOCALAPPDATA%/WinApkInfo）。"""
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return os.path.join(local_app_data, "WinApkInfo")
-
-    try:
-        from PyQt6.QtCore import QStandardPaths
-        base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
-        if base:
-            return os.path.join(base, "WinApkInfo") if "winapkinfo" not in base.lower() else base
-    except Exception:
-        pass
-
-    home = os.path.expanduser("~")
-    if os.path.isdir(os.path.join(home, ".local", "state")):
-        return os.path.join(home, ".local", "state", "WinApkInfo")
-
-    return tempfile.gettempdir()
-
-
 def _default_log_path() -> str:
     """返回日志文件的绝对路径（%LOCALAPPDATA%/WinApkInfo/winapkinfo.log），确保父目录存在。"""
-    log_dir = _default_log_dir()
+    log_dir = default_log_dir()
     try:
         os.makedirs(log_dir, exist_ok=True)
     except OSError:
